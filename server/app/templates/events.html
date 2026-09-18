@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}事件 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>事件</h1>
+<div class="sub">最近 200 条：上传、配置变更、登录、令牌轮换等</div>
+
+{% if events %}
+<div class="panel">
+  <div class="logbox" style="max-height:70vh">
+    {% for e in events %}
+    <div class="ln">
+[{{ e.at }}] {{ e.level|upper }} · {{ e.source }} · {{ e.message }}
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% else %}
+<div class="panel empty">还没有事件记录。</div>
+{% endif %}
+
+{% endblock %}

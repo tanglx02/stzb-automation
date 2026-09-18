@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block title %}待执行 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>待执行请求</h1>
+<div class="sub">
+  在这里排一个「下次跑什么」。脚本启动时会把它领走并执行，跑完自动回执。
+</div>
+
+{% if created %}<div class="banner ok">已新建请求 #{{ created }}。脚本下次启动会领走它。</div>{% endif %}
+{% if canceled == 1 %}<div class="banner ok">请求已取消。</div>{% endif %}
+{% if canceled == 0 and canceled is not none and canceled != 0 %}{% endif %}
+{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+
+{% if not allow %}
+<div class="banner warn">服务端已关闭「触发任务」功能（环境变量 STZB_ALLOW_RUN_REQUESTS=0）。</div>
+{% endif %}
+
+{% if allow %}
+<h2>新建请求</h2>
+<form method="post" action="/jobs">
+  <div class="panel">
+    <div class="grid2">
+      <label class="f">
+        <span class="name">档位</span>
+        <select name="slot">
+          <option value="auto">自动（按脚本运行时的钟点选档）</option>
+          <option value="00:00">00:00 档</option>
+          <option value="12:00">12:00 档（多一个「内政特性」）</option>
+        </select>
+      </label>
+      <label class="f">
+        <span class="name">任务范围</span>
+        <input type="text" name="only" placeholder="留空 = 按档位全部；也可填 yanwu 或 yanwu,recruit">
+        <div class="hint">可用：gongpin / shuishou / shijing / yanwu / texing / recruit，或 all</div>
+      </label>
+    </div>
+    <label class="f cbrow">
+      <input type="checkbox" name="dry_run">
+      <span class="name">预演模式（只识别不点击，用来试新改动）</span>
+    </label>
+    <label class="f">
+      <span class="name">备注（可选）</span>
+      <input type="text" name="note" placeholder="例如：验证演武扫荡奖励能不能领到">
+    </label>
+    <div class="actions"><button class="primary" type="submit">排入队列</button></div>
+  </div>
+</form>
+{% endif %}
+
+<h2>请求列表</h2>
+<table>
+  <thead><tr>
+    <th class="num">#</th><th>创建时间</th><th>档位</th><th>范围</th><th>状态</th>
+    <th>关联运行</th><th>备注</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% set st = {'pending':'待领取','taken':'已被领走','done':'已完成','failed':'失败','cancelled':'已取消'} %}
+  {% for j in jobs %}
+    <tr>
+      <td class="num">{{ j.id }}</td>
+      <td>{{ j.created_at }}</td>
+      <td>{{ j.slot }}{% if j.dry_run %} <span class="pill gray">预演</span>{% endif %}</td>
+      <td class="muted">{{ j.only_tasks or '按档位全部' }}</td>
+      <td>
+        {% if j.status == 'done' %}<span class="pill ok">已完成</span>
+        {% elif j.status == 'failed' %}<span class="pill fail">失败</span>
+        {% elif j.status == 'pending' %}<span class="pill skip">待领取</span>
+        {% elif j.status == 'taken' %}<span class="pill gray">已被领走</span>
+        {% else %}<span class="pill gray">已取消</span>{% endif %}
+      </td>
+      <td>{% if j.run_id %}<a href="/runs/{{ j.run_id }}">#{{ j.run_id }}</a>{% else %}—{% endif %}</td>
+      <td class="muted">{{ j.note or '' }}</td>
+      <td>
+        {% if j.status in ('pending', 'taken') %}
+        <form method="post" action="/jobs/{{ j.id }}/cancel">
+          <button class="lnk" type="submit">取消</button>
+        </form>
+        {% endif %}
+      </td>
+    </tr>
+  {% endfor %}
+  {% if not jobs %}
+    <tr><td colspan="8" class="muted">还没有任何请求。</td></tr>
+  {% endif %}
+  </tbody>
+</table>
+
+<p class="hint">
+  说明：脚本每次启动会先领走队列里最老的一条 <b>待领取</b> 请求，按它的档位和范围执行；
+  执行完把结果和报告上传后，这条请求会变成「已完成」并链接到那一轮记录。
+</p>
+
+{% endblock %}

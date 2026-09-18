@@ -1,0 +1,130 @@
+{% extends "base.html" %}
+{% block title %}运行 #{{ run.id }} · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>
+  {% if run.all_ok %}全部完成{% else %}有未完成项{% endif %}
+  {% if run.dry_run %}<span class="pill gray">预演</span>{% endif %}
+</h1>
+<div class="sub">
+  运行 #{{ run.id }} · 开始 {{ run.started_at }} · 档位 {{ run.slot or '—' }} ·
+  耗时 {{ '%.1f'|format(run.duration_seconds or 0) }} 秒
+  {% if run.host %} · 机器 {{ run.host }}{% endif %}
+</div>
+
+<div class="cards">
+  <div class="card"><div class="k">完成</div><div class="v" style="color:var(--ok)">{{ run.n_ok }}</div></div>
+  <div class="card"><div class="k">失败 / 异常</div>
+    <div class="v" style="color:{% if run.n_fail %}var(--fail){% else %}var(--muted){% endif %}">{{ run.n_fail }}</div></div>
+  <div class="card"><div class="k">跳过</div>
+    <div class="v" style="color:{% if run.n_skip %}var(--skip){% else %}var(--muted){% endif %}">{{ run.n_skip }}</div></div>
+  <div class="card"><div class="k">截图</div><div class="v">{{ total_shots }}</div></div>
+</div>
+
+<div class="actions" style="margin:0 0 14px">
+  {% if report %}<a class="btn primary" href="/runs/{{ run.id }}/report" target="_blank">在新窗口打开完整报告</a>{% endif %}
+  <a class="btn" href="/runs">← 回列表</a>
+  <form method="post" action="/runs/{{ run.id }}/delete"
+        onsubmit="return confirm('确定删除这一轮记录及它的报告和截图？')">
+    <button class="danger" type="submit">删除这一轮</button>
+  </form>
+</div>
+
+{% if env %}
+<h2>运行环境</h2>
+<div class="panel">
+  <div class="row">
+    {% for k, v in env.items() %}
+    <div class="kv"><div class="k">{{ k }}</div><div class="v">{{ v }}</div></div>
+    {% endfor %}
+    {% if run.runner_version %}
+    <div class="kv"><div class="k">脚本版本</div><div class="v">{{ run.runner_version }}</div></div>
+    {% endif %}
+    {% if run.exit_code is not none %}
+    <div class="kv"><div class="k">退出码</div><div class="v">{{ run.exit_code }}</div></div>
+    {% endif %}
+  </div>
+</div>
+{% endif %}
+
+<h2>任务明细</h2>
+<table>
+  <thead><tr><th>任务</th><th>结果</th><th class="num">耗时</th>
+    <th class="num">截图</th><th>说明</th></tr></thead>
+  <tbody>
+  {% for t in tasks %}
+    <tr>
+      <td><a href="#t_{{ t.key }}">{{ t.name }}</a></td>
+      <td><span class="pill {{ t.status }}">{{ status_label.get(t.status, t.status) }}</span></td>
+      <td class="num">{{ '%.1f'|format(t.seconds or 0) }}s</td>
+      <td class="num">{% if t.shots %}{{ t.shots|length }}{% else %}—{% endif %}</td>
+      <td class="muted">{{ t.reason or '' }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+{% if notes %}
+<h2>启动过程</h2>
+<div class="panel"><div class="logbox">
+  {% for n in notes %}<div class="ln">{{ n }}</div>{% endfor %}
+</div></div>
+{% endif %}
+
+{% if report %}
+<h2>完整报告</h2>
+<div class="sub" style="margin-top:-6px">
+  下面是脚本生成的原报告（截图已内嵌）。已用严格 CSP 沙箱化：脚本一律不执行。
+  <a href="/runs/{{ run.id }}/report" target="_blank">新窗口打开</a>
+</div>
+<iframe class="report" src="/runs/{{ run.id }}/report" sandbox referrerpolicy="no-referrer"></iframe>
+{% else %}
+<div class="panel empty">这一轮没有上传报告文件。</div>
+{% endif %}
+
+<h2>任务详情与截图</h2>
+{% for t in tasks %}
+<details class="task" id="t_{{ t.key }}" {% if t.status != 'ok' %}open{% endif %}>
+  <summary>
+    {{ t.name }}
+    <span class="pill {{ t.status }}">{{ status_label.get(t.status, t.status) }}</span>
+    <span class="meta">{{ '%.1f'|format(t.seconds or 0) }}s ·
+      {{ t.shots|length }} 张截图 · 日志 {{ t.notes|length }} 行</span>
+  </summary>
+  {% if t.reason %}<div class="reason">{{ t.reason }}</div>{% endif %}
+  {% if t.notes %}
+  <div class="logbox">
+    {% for n in t.notes %}<div class="ln">{{ n }}</div>{% endfor %}
+  </div>
+  {% else %}
+  <p class="hint">（无日志）</p>
+  {% endif %}
+  {% if t.shots %}
+  <div class="shots">
+    {% for s in t.shots %}
+    <figure>
+      <a href="/artifacts/{{ s.id }}" target="_blank">
+        <img src="/artifacts/{{ s.id }}" alt="{{ s.filename }}" loading="lazy">
+      </a>
+      <figcaption>{{ s.filename }} · {{ '%.0f'|format((s.size or 0)/1024) }}KB</figcaption>
+    </figure>
+    {% endfor %}
+  </div>
+  {% endif %}
+</details>
+{% endfor %}
+
+{% if orphan %}
+<h2>未归属截图</h2>
+<div class="panel">
+  <div class="shots">
+    {% for s in orphan %}
+    <figure><a href="/artifacts/{{ s.id }}" target="_blank">
+      <img src="/artifacts/{{ s.id }}" alt="{{ s.filename }}" loading="lazy"></a>
+      <figcaption>{{ s.filename }}</figcaption></figure>
+    {% endfor %}
+  </div>
+</div>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ app_name }}{% endblock %}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="top">
+  <span class="brand">{{ app_name }}</span>
+  <nav>
+    <a href="/" class="{% if nav=='dash' %}on{% endif %}">总览</a>
+    <a href="/runs" class="{% if nav=='runs' %}on{% endif %}">运行记录</a>
+    <a href="/config" class="{% if nav=='config' %}on{% endif %}">任务配置</a>
+    <a href="/jobs" class="{% if nav=='jobs' %}on{% endif %}">待执行</a>
+    <a href="/events" class="{% if nav=='events' %}on{% endif %}">事件</a>
+    <a href="/settings" class="{% if nav=='settings' %}on{% endif %}">设置</a>
+  </nav>
+  <span class="who">
+    {{ user }}
+    <form method="post" action="/logout"><button class="lnk" type="submit">退出</button></form>
+  </span>
+</header>
+<div class="wrap">
+{% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
+{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+{% block body %}{% endblock %}
+</div>
+</body>
+</html>

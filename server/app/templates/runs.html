@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}运行记录 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>运行记录</h1>
+<div class="sub">共 {{ total }} 轮{% if bad %} · 只看有未完成项的{% endif %}</div>
+
+{% if deleted %}<div class="banner ok">已删除该轮记录及其报告、截图。</div>{% endif %}
+
+<div class="actions" style="margin:0 0 14px">
+  {% if bad %}<a class="btn" href="/runs">显示全部</a>
+  {% else %}<a class="btn" href="/runs?bad=1">只看有未完成项的</a>{% endif %}
+</div>
+
+{% if runs %}
+<table>
+  <thead><tr>
+    <th class="num">#</th><th>开始时间</th><th>档位</th><th>结果</th>
+    <th class="num">成功</th><th class="num">失败</th><th class="num">跳过</th>
+    <th class="num">耗时</th><th>机器</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for r in runs %}
+    <tr>
+      <td class="num">{{ r.id }}</td>
+      <td>{{ r.started_at }}</td>
+      <td>{{ r.slot or '—' }}{% if r.dry_run %} <span class="pill gray">预演</span>{% endif %}</td>
+      <td>{% if r.all_ok %}<span class="pill ok">完成</span>
+          {% else %}<span class="pill fail">未完成</span>{% endif %}</td>
+      <td class="num">{{ r.n_ok }}</td>
+      <td class="num">{{ r.n_fail }}</td>
+      <td class="num">{{ r.n_skip }}</td>
+      <td class="num">{{ '%.0f'|format(r.duration_seconds or 0) }}s</td>
+      <td class="muted">{{ r.host or '—' }}</td>
+      <td><a href="/runs/{{ r.id }}">详情</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+
+<div class="pager">
+  {% if page > 1 %}<a class="btn" href="/runs?page={{ page-1 }}{% if bad %}&bad=1{% endif %}">上一页</a>{% endif %}
+  <span class="muted">第 {{ page }} 页</span>
+  {% if runs|length == per %}<a class="btn" href="/runs?page={{ page+1 }}{% if bad %}&bad=1{% endif %}">下一页</a>{% endif %}
+</div>
+{% else %}
+<div class="panel empty">还没有运行记录。</div>
+{% endif %}
+
+{% endblock %}

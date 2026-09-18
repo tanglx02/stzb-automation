@@ -1,0 +1,66 @@
+# Debian 上一条命令起全套：应用 + Caddy（自动 HTTPS）。
+#
+#   cd server && cp .env.example .env    # 改成你的域名，按需填初始口令
+#   docker compose up -d
+#
+# 首次启动会在日志里打印管理员口令与 agent 令牌（只打印一次）：
+#   docker compose logs app | head -30
+#
+services:
+  app:
+    build: .
+    image: stzb-console:1.0.0
+    restart: unless-stopped
+    environment:
+      # 不暴露端口到公网，只让 caddy 通过内部网络访问
+      - STZB_DATA_DIR=/data
+      - STZB_SECRET_KEY=${STZB_SECRET_KEY:-}
+      # 首次启动的初始凭据（不填就随机生成并打印一次）
+      - STZB_ADMIN_USER=${STZB_ADMIN_USER:-admin}
+      - STZB_ADMIN_PASSWORD=${STZB_ADMIN_PASSWORD:-}
+      - STZB_AGENT_TOKEN=${STZB_AGENT_TOKEN:-}
+      - STZB_MAX_UPLOAD_BYTES=${STZB_MAX_UPLOAD_BYTES:-25165824}
+      - STZB_MAX_SHOTS_PER_RUN=${STZB_MAX_SHOTS_PER_RUN:-60}
+      - STZB_KEEP_RUNS=${STZB_KEEP_RUNS:-120}
+      - STZB_ALLOW_RUN_REQUESTS=${STZB_ALLOW_RUN_REQUESTS:-1}
+      - TZ=Asia/Shanghai
+    volumes:
+      # 数据库 + 报告 + 截图都在这里，备份就备份这一个目录
+      - ./data:/data
+    expose:
+      - "8000"
+    networks: [web]
+    # 日志别无限涨
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on: [app]
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"          # HTTP/3，可选
+    environment:
+      - STZB_DOMAIN=${STZB_DOMAIN:?请在 .env 里设置 STZB_DOMAIN 为你的域名}
+      # 必填：Caddyfile 里全局 email 指令不能是空值，否则 Caddy 起不来。
+      # 用 :? 让它缺了就直接报错退出，比 Caddy 报一句难懂的语法错误强。
+      - ACME_EMAIL=${ACME_EMAIL:?请在 .env 里设置 ACME_EMAIL 为证书到期提醒邮箱}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # 证书与 Caddy 自身的状态，务必持久化，否则每次重启都要重新签
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [web]
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+
+volumes:
+  caddy_data:
+  caddy_config:
+
+networks:
+  web:

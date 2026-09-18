@@ -1,0 +1,42 @@
+# Caddy 反代 + 自动 HTTPS。域名填在 .env 的 STZB_DOMAIN 里。
+#
+# 它会自动向 Let's Encrypt 申请并续期证书，不用你手动管。
+# 前提：域名 A 记录已经指向这台服务器，且 80 / 443 端口对外开放
+#（Let's Encrypt 的 HTTP-01 校验要用 80）。
+
+{
+	email {$ACME_EMAIL}
+	# 上线稳定后建议打开，避免遇到问题反复触发签发限流
+	# acme_ca https://acme-v02.api.letsencrypt.org/directory
+}
+
+{$STZB_DOMAIN} {
+	encode zstd gzip
+
+	# 安全头。应用自己也会加一遍，这里再兜一层（反代层最外层生效）
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "SAMEORIGIN"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+
+	# 3MB 的报告 + 截图，放宽请求体上限（默认无限，这里显式收一下）
+	request_body {
+		max_size 32MB
+	}
+
+	# 把真实 IP 传给应用，登录限流才认得准
+	reverse_proxy app:8000 {
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output file /data/access.log {
+			roll_size 10MiB
+			roll_keep 3
+		}
+		format json
+	}
+}

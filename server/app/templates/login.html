@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>登录 · {{ app_name }}</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div style="max-width:380px;margin:12vh auto 0;padding:0 20px">
+  <div class="panel">
+    <h1>{{ app_name }}</h1>
+    <div class="sub">请登录后管理采集任务</div>
+    {% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+    <form method="post" action="/login">
+      <label class="f"><span class="name">用户名</span>
+        <input type="text" name="user" autocomplete="username" autofocus required>
+      </label>
+      <label class="f"><span class="name">口令</span>
+        <input type="password" name="password" autocomplete="current-password" required>
+      </label>
+      <div class="actions"><button class="primary" type="submit">登录</button></div>
+    </form>
+  </div>
+  <p class="hint" style="text-align:center">
+    忘了口令：在服务器上执行 <code>docker compose exec app python -m app.cli reset-password</code>
+  </p>
+</div>
+</body>
+</html>

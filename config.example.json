@@ -1,0 +1,104 @@
+{
+  "_说明": "率土之滨每日任务自动化配置。改完直接生效，不用重启模拟器。",
+  "device": {
+    "adb": "C:\\Program Files\\Netease\\MuMu\\nx_main\\adb.exe",
+    "serial_candidates": [
+      "127.0.0.1:7555",
+      "127.0.0.1:16384",
+      "127.0.0.1:5555",
+      "emulator-5554"
+    ],
+    "package": "com.netease.stzb.netease"
+  },
+  "emulator": {
+    "_说明": "模拟器开关。脚本默认会自动完成「没开就拉起模拟器 → 等 Android 就绪 → 打开游戏」这一串；已经在跑就直接复用。",
+    "manager": "C:\\Program Files\\Netease\\MuMu\\nx_main\\MuMuManager.exe",
+    "vmindex": 0,
+    "startup_timeout": 300,
+    "_shutdown_after说明": "跑完要不要关掉模拟器。auto=只在「本次是脚本自己启动的」时候关（推荐，不会打断你正在玩的游戏）；always=每次跑完都关；never=从不关。命令行 --shutdown-after / --keep-running 可临时覆盖。",
+    "shutdown_after": "auto",
+    "_cold说明": "想每轮都从「完全退出」开始，就把 run_daily.py 加上 --cold，或把这里改 true。代价是每轮多花 1~2 分钟冷启动，换来的是状态最干净。",
+    "cold_restart": false
+  },
+  "cloud": {
+    "_说明": "后端控制台（可选）。★ 不填就是「独立运行」：脚本不连任何外部服务，报告只留在本机 logs\\reports\\，拷到别的机器也能直接跑。填了并置 enabled=true 才是「后端托管」：启动时拉配置、领待执行任务，跑完上传结果与截图。",
+    "_模式": "想临时脱离后端跑一次，不用改这里，命令行加 --offline 就行（优先级最高）。反过来，临时连后端也可以用环境变量：STZB_CLOUD_ENABLED=1 / STZB_CLOUD_BASE_URL / STZB_CLOUD_TOKEN。",
+    "_安全": "enabled/base_url/token 属于本机凭据，永远不会被服务端下发覆盖；填错也只是上不了报，不影响本机跑任务。想看当前是什么模式：run_daily.py --status",
+    "enabled": false,
+    "base_url": "",
+    "token": "",
+    "timeout": 90,
+    "retries": 3,
+    "_pull_config说明": "是否允许服务端下发「业务开关」（任务开关、各任务的参数、安全阀）。device/emulator/cloud/logging 永远以本机为准。",
+    "pull_config": true,
+    "_pull_jobs说明": "是否在启动时领走服务端排的待执行任务（用它的档位/范围覆盖命令行）。",
+    "pull_jobs": true,
+    "upload_shots_per_task": 4
+  },
+  "tasks": {
+    "gongpin": true,
+    "shuishou": true,
+    "shijing": true,
+    "texing": true,
+    "yanwu": true,
+    "recruit": true
+  },
+  "yanwu": {
+    "_说明": "演武设置。daily_sweep=每天领一次右下角的「扫荡奖励」(纯领取，不花任何货币)。冷却中会显示「X后可领取」，脚本会自动跳过。wait_free_seconds=若打开时离可领取只剩这么多秒(00:00 档可能跑得比刷新早几秒)，就等一下再领。",
+    "daily_sweep": true,
+    "wait_free_seconds": 180
+  },
+  "recruit": {
+    "_说明": "招募设置。free=免费必抽；half_price=半价(100虎符)。刷新点：游戏每天 00:00 和 12:00 各刷一次免费+一次半价，所以每天能免费抽 2 次、半价抽 2 次（本任务挂在 00:00/12:00 两个档位，每档各抽一轮）。半价的安全阀有三道：按钮左边缘的红色「打折」丝带(竖排字 OCR 读不出，按颜色认) / 卡包列的「半价1次」字样 / 读到的价格必须 ≤ half_price_max_hufu(读到原价 200 直接拒抽)。auto_buy_hufu=虎符不够时允许用玉符按 1:1 兑换(每次最多 hufu_buy_max)。",
+    "free": true,
+    "half_price": true,
+    "half_price_max_hufu": 100,
+    "auto_buy_hufu": true,
+    "hufu_buy_max": 100
+  },
+  "texing": {
+    "_说明": "特性设置。只抽免费的那张；花玉符的一律不抽。wait_free_seconds=若打开面板时免费次数还剩不到这么多秒，就等一下再抽（兜住 12:00 档跑得比刷新早几分钟）。",
+    "free_only": true,
+    "wait_free_seconds": 600
+  },
+  "shijing": {
+    "_说明": "市井设置。free_item=点宝物商队的「免费」；buy_materials 里列的材料若能用铜钱买到就自动买。价格图标在「购买」按钮正上方：绿色=玉符(跳过)，不绿=铜钱(可买)。读不到价格就不买。",
+    "_材料名": "写游戏里的准确名字即可，脚本用的是模糊匹配，OCR 错字也能对上。",
+    "free_item": true,
+    "buy_materials": [
+      "赤珠山铁",
+      "小叶紫檀"
+    ],
+    "material_pay_copper_only": true,
+    "material_max_copper": 60000
+  },
+  "shuishou": {
+    "_说明": "税收征收次数上限，每天 3 次。",
+    "max_times": 3
+  },
+  "gongpin": {
+    "_说明": "贡品礼包(月卡)每日玉符。入口固定为 活动 → 充值好礼 → 贡品礼包。",
+    "enabled": true
+  },
+  "safety": {
+    "_说明": "安全阀。never_tap 里的词一旦出现在「要点的按钮名」里就放弃点击；max_task_seconds 到点就跳过该任务，不会卡死。注意：不要往里加「充值」「购买」这类词，它们会误伤「充值好礼」页签和市井购物这类正常操作。",
+    "never_tap": [
+      "批量购买",
+      "退出",
+      "退出游戏",
+      "确定退出",
+      "续期",
+      "¥",
+      "支付",
+      "购买礼包",
+      "立即购买"
+    ],
+    "max_task_seconds": 240,
+    "max_total_seconds": 900,
+    "tap_delay": 0.7
+  },
+  "logging": {
+    "keep_days": 14,
+    "save_screens": true
+  }
+}

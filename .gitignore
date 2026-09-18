@@ -1,0 +1,30 @@
+# ---- 运行时产物（不要提交）----
+logs/
+state/
+.tmp_testdata/
+
+# ---- 开发期产物 ----
+# recon/ 是最初摸界面时留下的上百张游戏截图（147MB），只对开发有用
+recon/
+# WorkBuddy 助手的工作笔记（内部，不是项目代码）
+.workbuddy/
+
+# ---- 本机环境 ----
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# ---- 本机配置（可能含后端令牌，绝不提交）----
+# 模板是 config.example.json（已提交，token 为空）；要改配置先复制成 config.json
+config.json
+
+# ---- 后端运行时数据与凭据（server/ 里另有一份 .gitignore 双保险）----
+server/data/
+server/.env
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

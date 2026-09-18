@@ -1,0 +1,15 @@
+* text=auto
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.py text
+*.md text
+*.json text
+*.yml text
+*.yaml text
+*.txt text
+*.css text
+*.html text
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.db binary

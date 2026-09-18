@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block title %}总览 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>总览</h1>
+<div class="sub">最近 14 天的采集情况</div>
+
+<div class="cards">
+  <div class="card"><div class="k">执行轮数</div><div class="v">{{ stats.total }}</div></div>
+  <div class="card"><div class="k">全部成功</div><div class="v" style="color:var(--ok)">{{ stats.ok_runs }}</div></div>
+  <div class="card"><div class="k">有未完成项</div>
+    <div class="v" style="color:{% if stats.bad_runs %}var(--fail){% else %}var(--muted){% endif %}">{{ stats.bad_runs }}</div></div>
+  <div class="card"><div class="k">待执行请求</div>
+    <div class="v" style="color:{% if pending %}var(--skip){% else %}var(--muted){% endif %}">{{ pending|length }}</div></div>
+</div>
+
+{% if stats.last %}
+<div class="panel">
+  <h3 style="margin-top:0">最近一次</h3>
+  <div class="row">
+    <div class="kv"><div class="k">开始时间</div><div class="v">{{ stats.last.started_at }}</div></div>
+    <div class="kv"><div class="k">档位</div><div class="v">{{ stats.last.slot or '—' }}</div></div>
+    <div class="kv"><div class="k">结果</div><div class="v">
+      {% if stats.last.all_ok %}<span class="pill ok">全部完成</span>
+      {% else %}<span class="pill fail">有未完成项</span>{% endif %}
+    </div></div>
+    <div class="kv"><div class="k">成功 / 失败 / 跳过</div><div class="v">
+      {{ stats.last.n_ok }} / {{ stats.last.n_fail }} / {{ stats.last.n_skip }}</div></div>
+    <div class="kv"><div class="k">耗时</div><div class="v">{{ '%.1f'|format(stats.last.duration_seconds or 0) }} 秒</div></div>
+    <div class="kv"><div class="k">详情</div><div class="v"><a href="/runs/{{ stats.last.id }}">查看报告与截图</a></div></div>
+  </div>
+</div>
+{% else %}
+<div class="panel empty">还没有任何运行记录。脚本跑完并上传后这里会出现数据。</div>
+{% endif %}
+
+<h2>采集端状态</h2>
+<div class="panel">
+  <div class="row">
+    <div class="kv"><div class="k">令牌（只显示头尾）</div><div class="v mono">{{ agent_hint }}</div></div>
+    <div class="kv"><div class="k">最近上报的机器</div><div class="v">{{ last_agent_host }}</div></div>
+    <div class="kv"><div class="k">配置版本</div><div class="v">v{{ config_version }}{% if config_updated %}
+      <span class="hint">（{{ config_updated }}）</span>{% endif %}</div></div>
+  </div>
+  <p class="hint">脚本端在 <code>config.json</code> 的 <code>cloud</code> 段填写地址与令牌后，
+     每轮跑完会自动把结果、报告和截图传到这里。</p>
+</div>
+
+<h2>最近运行</h2>
+{% if runs %}
+<table>
+  <thead><tr>
+    <th>开始时间</th><th>档位</th><th>结果</th>
+    <th class="num">成功</th><th class="num">失败</th><th class="num">跳过</th>
+    <th class="num">耗时</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for r in runs %}
+    <tr>
+      <td>{{ r.started_at }}</td>
+      <td>{{ r.slot or '—' }}{% if r.dry_run %} <span class="pill gray">预演</span>{% endif %}</td>
+      <td>{% if r.all_ok %}<span class="pill ok">完成</span>
+          {% else %}<span class="pill fail">未完成</span>{% endif %}</td>
+      <td class="num">{{ r.n_ok }}</td>
+      <td class="num">{{ r.n_fail }}</td>
+      <td class="num">{{ r.n_skip }}</td>
+      <td class="num">{{ '%.0f'|format(r.duration_seconds or 0) }}s</td>
+      <td><a href="/runs/{{ r.id }}">详情</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="hint"><a href="/runs">查看全部运行记录 →</a></p>
+{% else %}
+<div class="panel empty">暂无记录</div>
+{% endif %}
+
+<h2>待执行请求</h2>
+{% if pending %}
+<table>
+  <thead><tr><th>#</th><th>创建时间</th><th>档位</th><th>范围</th><th>创建人</th></tr></thead>
+  <tbody>
+  {% for j in pending %}
+    <tr><td>{{ j.id }}</td><td>{{ j.created_at }}</td><td>{{ j.slot }}</td>
+        <td>{{ j.only_tasks or '按档位全部' }}{% if j.dry_run %} <span class="pill gray">预演</span>{% endif %}</td>
+        <td class="muted">{{ j.created_by }}</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="hint">脚本下次启动时会把这些请求领走并执行。<a href="/jobs">管理待执行 →</a></p>
+{% else %}
+<div class="panel empty">没有待执行请求。到 <a href="/jobs">待执行</a> 页可以新建一个。</div>
+{% endif %}
+
+{% endblock %}

@@ -1,0 +1,25 @@
+# 率土之滨自动化 —— 客户端（本机采集脚本）依赖
+#
+# 安装方式（二选一）：
+#   1. 双击 setup.bat（自动建 venv 并装好，推荐）
+#   2. 手动：pip install -r requirements-client.txt
+#
+# 说明：
+#   · opencv-python 提供 cv2（截图处理 / 颜色识别 / 模板匹配）
+#   · winrt-* 提供 Windows 原生 OCR（识别游戏里的中文）
+#   · certifi 提供 HTTPS 根证书（上传到后端时做证书校验）
+#   · numpy 是 opencv 的依赖，显式列出便于固定行为
+
+numpy
+opencv-python
+certifi
+
+# winrt 按已实测可用的版本固定，避免不同小版本之间行为漂移
+winrt-runtime==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Globalization==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-Windows.Media.Ocr==3.2.1
+winrt-Windows.Storage==3.2.1
+winrt-Windows.Storage.Streams==3.2.1

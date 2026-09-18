@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block title %}设置 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>设置</h1>
+<div class="sub">采集端凭据与运维信息</div>
+
+{% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
+{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+
+{% if new_token %}
+<div class="tokenbox">
+  <b>新的采集端令牌（只显示这一次，请立刻填进脚本）：</b><br>
+  {{ new_token }}
+</div>
+{% endif %}
+
+<h2>采集端</h2>
+<div class="panel">
+  <div class="row">
+    <div class="kv"><div class="k">令牌（只显示头尾）</div><div class="v mono">{{ agent_hint }}</div></div>
+    <div class="kv"><div class="k">最近上报的机器</div><div class="v">{{ last_host }}</div></div>
+    <div class="kv"><div class="k">脚本版本</div><div class="v">{{ last_ver }}</div></div>
+  </div>
+  <div class="actions">
+    <form method="post" action="/settings/rotate-token"
+          onsubmit="return confirm('轮换后旧令牌立刻失效，脚本必须同步更新，否则上不了报。确定？')">
+      <button class="danger" type="submit">轮换 agent 令牌</button>
+    </form>
+  </div>
+  <p class="hint">
+    脚本侧在 <code>config.json</code> 里这样填：
+    <code>"cloud": {"enabled": true, "base_url": "https://你的域名", "token": "&lt;令牌&gt;"}</code>
+  </p>
+</div>
+
+<h2>修改管理端口令</h2>
+<div class="panel">
+  <form method="post" action="/settings/password">
+    <label class="f"><span class="name">当前口令</span>
+      <input type="password" name="current" autocomplete="current-password" required></label>
+    <div class="grid2">
+      <label class="f"><span class="name">新口令（至少 8 位）</span>
+        <input type="password" name="new1" autocomplete="new-password" required></label>
+      <label class="f"><span class="name">再输一次</span>
+        <input type="password" name="new2" autocomplete="new-password" required></label>
+    </div>
+    <div class="actions"><button class="primary" type="submit">更新口令</button></div>
+  </form>
+</div>
+
+<h2>服务端信息</h2>
+<div class="panel">
+  <div class="row">
+    <div class="kv"><div class="k">数据目录</div><div class="v mono">{{ data_dir }}</div></div>
+    <div class="kv"><div class="k">数据库</div><div class="v mono">{{ db_path }}</div></div>
+    <div class="kv"><div class="k">单文件上传上限</div><div class="v">{{ '%.0f'|format(max_upload_mb) }} MB</div></div>
+    <div class="kv"><div class="k">每轮截图上限</div><div class="v">{{ max_shots }} 张</div></div>
+    <div class="kv"><div class="k">保留最近多少轮</div><div class="v">{{ keep_runs }} 轮</div></div>
+    <div class="kv"><div class="k">版本</div><div class="v">{{ version }}</div></div>
+  </div>
+  <p class="hint">
+    忘了管理端口令：在服务器上执行
+    <code>docker compose exec app python -m app.cli reset-password</code>
+    会打印一个新口令。
+  </p>
+</div>
+
+<h2>安全说明</h2>
+<div class="panel">
+  <ul class="hint" style="line-height:1.9">
+    <li>口令与令牌都只存 <b>scrypt 哈希</b>，数据库泄露也拿不到明文；本页只显示令牌头尾。</li>
+    <li>上传的报告 HTML 用 <b>严格 CSP</b>（禁脚本、禁外链）沙箱化后放在 iframe 里渲染。</li>
+    <li>登录失败会按 IP 限流；所有响应带 <code>nosniff</code> / <code>X-Frame-Options</code>。</li>
+    <li>采集端令牌走 <code>X-Agent-Token</code> 头，服务端只接受哈希比对，不落明文。</li>
+  </ul>
+</div>
+
+{% endblock %}
