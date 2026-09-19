@@ -16,7 +16,8 @@ import time
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .core import (Device, Point, Templates, TextItem, find_all_text,
-                   find_text, match_score, merge_items, norm, ocr_image,
+                   find_login_button, find_masked, find_text, match_score,
+                   merge_items, norm, ocr_image, ocr_region_scaled, read_png,
                    wait_until)
 
 # --------------------------------------------------------------------------- 锚点坐标（1920x1080）
@@ -59,6 +60,13 @@ NZ_BACK = [(1835, 57), (1872, 57), (1810, 57)]                 # 内政/主界�
 # 弹窗
 BTN_CANCEL = (756, 743)        # 「确定退出率土之滨？」→「取消」
 BTN_START_GAME = (960, 876)    # 登录页「开始游戏」
+# 游戏**标题页**（冷启动必过的一屏）：整屏一张山水画，底部金字
+# 「点击以开始游戏」，**点哪儿都行**。实测中心点 (960,540) 可过。
+# 注意它和登录页的「开始游戏」是两回事：标题页在登录页之前，且没有按钮框。
+TITLE_TAP = (960, 540)
+# 网易统一登录页的「登录」按钮兜底坐标（与 stzb/account.py 的 NN_LOGIN_BTN 一致）。
+# 正常靠 core.find_login_button() 精确找；找不到才用这个。
+NN_LOGIN_BTN = (959, 683)
 # 「导致中途退出的原因是？」问卷里的「继续游戏」——实测 (427,837)。
 # 注意这个问卷的按钮布局：**「继续游戏」在左、「提交并退出」在右**，
 # 所以兜底坐标必须取左边那个，绝不能用「右下角 = 主按钮」的直觉。
@@ -128,6 +136,14 @@ KW = {
     "贡品礼包": ("贡品礼包", "贡品",),
     "每日领取": ("每日领取",),
     "开始游戏": ("开始游戏", "廾始游戏", "并始游戏", "开始游戒", "亓始游戏"),
+    # ★ 标题页（冷启动第一屏）。金底金字，全屏 OCR 读 0 行，必须裁底部条带放大才认得出，
+    #   实测读成「过`击以开：始：．戏》」。所以这里的别名要按**逐字误认**穷举，
+    #   并且判定时用宽松阈值（0.62 的两段式匹配扛不住这种脏结果）。
+    "点击以开始游戏": ("点击以开始游戏", "过击以开始游戏", "点击以开始", "以开始游戏"),
+    # ★ 网易统一登录页（冷启动第二屏，在标题页之后、「开始游戏」之前）。
+    #   它没有「开始游戏」四个字，只有「登录」和「其他账号登录」——
+    #   而这两个词都含「登录」，所以判定必须靠多种弱信号（详见 boot()）。
+    "网易登录页": ("其他账号登录", "其他帐号登录", "常用", "网易游戏"),
     # 「点击换区」：实测被读成「龙兴之地征服点击换区」整条，关键词是它的一段后缀，
     # 所以除了整词别名，还要能靠「换区」二字命中（下面 _kw_point 会按占比取中点）。
     "点击换区": ("点击换区", "换区"),
@@ -303,6 +319,73 @@ class Ui:
 
     # ------------------------------------------------------------------ 启动引导
 
+    def title_page_hit(self, path: str) -> Optional[TextItem]:
+        """识别「冷启动标题页」（山水画 + 底部金字「点击以开始游戏」）。
+
+        为什么需要专门的判据（2026-09-19 冷启动实测踩到）：
+          这一屏**全屏 OCR 读出 0 行**——金底金字、底图又是同一色系的山水画，
+          对比度极低。脚本认不出它 → 一直走「认不出的界面」分支 →
+          盲点右上角 ✕ 直到 300 秒启动超时，整轮任务全废。
+
+        为什么用**模板匹配**而不是 OCR（实测对比过）：
+          标题那行字是艺术字，区域放大后的 OCR 时好时坏——同一批 17 帧里，
+          覆盖度在 0.00~1.00 之间跳，只能认出 8 帧，不能用。
+          而模板匹配的区分度极干净：17 帧中标题页**全部 ≥0.85**，
+          非标题页（黑屏 / 网易开屏）**≤0.42**。所以主判据用模板，
+          阈值取 0.70，两边都留足余量。
+
+        返回命中项（中心用模板定位点），未命中返回 None。
+        """
+        img = read_png(path)
+        if img is None:
+            return None
+        hit = self.tpl.find(img, "title_page", roi=(0, 860, 1920, 200),
+                            threshold=0.70)
+        if hit is None:
+            return None
+        cx, cy, score = hit
+        self.log("    · 识别到标题页「点击以开始游戏」（模板命中 %.0f%%）" % (score * 100))
+        return TextItem("点击以开始游戏", (cx - 10, cy - 10, cx + 10, cy + 10), (cx, cy), score)
+
+    def is_netease_login_page(self, items: Sequence[TextItem]) -> bool:
+        """是不是**网易统一登录页**（冷启动第二屏，在标题页之后）。
+
+        为什么不能只看「登录」两个字：界面上「自动登录 / 上次登录 /
+        其他账号登录」全含「登录」，模糊匹配必然误判。
+        改用**多信号投票**（这也和 account.py 里 _tap_switch_account 的判据一致）：
+          · 有「其他账号登录」 → 铁证
+          · 有脱敏账号（159****4508） → 铁证
+          · 有「常用」页签 + 网易 logo → 够用
+        """
+        texts_ = [norm(it.text) for it in items]
+        if any(("其他账号登录" in t or "其他帐号登录" in t) for t in texts_):
+            return True
+        if find_masked(items) is not None:
+            return True
+        if any(t == "常用" for t in texts_) and any("网易" in t for t in texts_):
+            return True
+        return False
+
+    def leave_netease_login_page(self, items: Sequence[TextItem]) -> bool:
+        """在网易登录页上点「登录」，进入游戏。返回 True 表示已发出点击。
+
+        安全约束（与 account.py 完全一致，绝不能违反）：
+          · 只点 _find_login_button() 找到的那个精确「登录」，
+            **绝不点「其他账号登录」**（那会走去密码登录流程，脚本没有密码，必然卡死）。
+          · 登录页上**永不发 Android BACK**——会弹「中途退出」问卷，
+            里面有「提交并退出」，点错等于把游戏退了。
+        """
+        hit = find_login_button(items)
+        if hit is not None:
+            self.log("    · 网易登录页 → 点「登录」@%s" % (hit.center,))
+            self.tap(*hit.center)
+            time.sleep(4.0)
+            return True
+        self.log("    ! 网易登录页但没找到精确「登录」按钮 → 用固定坐标兜底")
+        self.tap(*NN_LOGIN_BTN)
+        time.sleep(4.0)
+        return True
+
     def boot(self, timeout: float = 300.0) -> bool:
         """把游戏带到主城：处理登录页、资源下载、公告、退出确认等。
 
@@ -317,11 +400,30 @@ class Ui:
             if self.is_home(items):
                 self.log("  ✓ 已进入主城")
                 return True
+            # ★ 标题页（冷启动第一屏）：山水画 + 底部金字「点击以开始游戏」。
+            #   它**全屏 OCR 读出 0 行**，所以只能在「几乎没有文字」时，
+            #   退一步做区域放大 OCR 才认得出。
+            #   实测后果：认不出 → 一直走「认不出的界面」分支 → 干等到 300 秒启动超时，
+            #   整轮任务全废（2026-09-19 冷启动实测踩到）。
+            if len(items) <= 2:
+                tp = self.title_page_hit(path)
+                if tp is not None:
+                    self.log("    · 标题页 → 点屏幕中央进游戏")
+                    self.tap(*TITLE_TAP)
+                    time.sleep(10)          # 这一下之后要加载登录页/资源，给足时间
+                    continue
             sig = self.guard(items)
             if sig in ("exit_confirm", "download", "ad", "login", "info_popup"):
                 continue
             if sig == "hufu_lack":
                 self.close_hufu_dialog(items)
+                continue
+            # ★ 网易统一登录页（冷启动第二屏）。必须在「开始游戏」判定之前处理：
+            #   这一屏上没有「开始游戏」，只有「登录」，而「登录」被
+            #   「自动登录/上次登录/其他账号登录」反复污染，所以走多信号判定。
+            #   实测后果（2026-09-19）：认不出 → 干等到 300 秒启动超时，整轮全废。
+            if self.is_netease_login_page(items):
+                self.leave_netease_login_page(items)
                 continue
             # 其它弹窗：右侧的「取消/跳过/关闭」优先
             for kw in ("取消", "跳过", "关闭"):
@@ -560,6 +662,19 @@ class Ui:
 
     # ------------------------------------------------------------------ 状态判定
 
+    def _short_has(self, items: Sequence[TextItem], kw: str,
+                   maxlen: int = 10) -> bool:
+        """只在**短标签**里匹配关键词（长度上限 maxlen 个字符）。
+
+        为什么要长度限制：主城顶栏是「势力值21」这种短标签，但活动面板的
+        说明长句「…每日登录和提升势力值可获得势力积分…」里也有「势力值」。
+        不加限制的话，子串匹配会给那句长文本 0.909 分，把活动面板误判成主城。
+        """
+        for it in items:
+            if match_score(it.text, kw) >= 0.62 and len(norm(it.text)) <= maxlen:
+                return True
+        return False
+
     def is_home(self, items: Sequence[TextItem]) -> bool:
         """主城地图：右下有「招募」按钮，同时能看到「出征/计略/土地/势力值」。
 
@@ -576,7 +691,15 @@ class Ui:
                     "宝物商队", "剩余特性", "获取1张",                  # 市井 / 特性
                     "已征收", "征收中", "加速获取"):                    # 税收
             return False
-        if not self.has(items, *KW["招募"]):
+        # ★ 右下角「招募」按钮**偶发漏读**（美术字 + 底图噪声）。
+        #   漏读时旧代码直接判「不是主城」→ open_neizheng() 以为还在外面 →
+        #   反复退主城、重进，最后报「打不开内政面板」。
+        #   实测（2026-09-19）：市井任务就这么失败过一次，而同一轮的演武/特性
+        #   都成功进去了 —— 是概率性问题，不是逻辑错。
+        #   兜底：顶栏那个**短的**「势力值」标签也是主城独有（子面板顶栏没有它），
+        #   拿它当第二判据。必须用 _short_has 排除长句里的同名词。
+        strong = self.has(items, *KW["招募"]) or self._short_has(items, "势力值")
+        if not strong:
             return False
         return any(self.has(items, k) for k in ("出征", "计略", "土地", "势力值"))
 

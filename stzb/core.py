@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import difflib
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -253,9 +254,54 @@ def texts(items: Sequence[TextItem]) -> List[str]:
     return [it.text for it in items]
 
 
+def find_login_button(items: Sequence[TextItem]) -> Optional[TextItem]:
+    """精确找网易登录页那个真正的「登录」按钮。
+
+    为什么不能直接 find_text(items, "登录")：界面上「自动登录 / 上次登录 /
+    其他账号登录」都含「登录」二字，模糊匹配会挑错——点「其他账号登录」
+    会走去密码登录流程（脚本没有密码，必然卡死）。
+
+    这是 ui.py 与 account.py 共用的实现，放在 core 里避免两处逻辑漂移。
+    找不到返回 None，调用方用固定坐标兜底。
+    """
+    for it in items:
+        if norm(it.text) == "登录":
+            return it
+    for it in items:
+        t = norm(it.text)
+        if "登录" not in t:
+            continue
+        if any(bad in t for bad in ("自动登录", "上次登录", "其他账号", "其他帐号")):
+            continue
+        if match_score(it.text, "登录") >= 0.8 and it.center[1] > 500:
+            return it
+    return None
+
+
 def dump_items(items: Sequence[TextItem], prefix: str = "      | ") -> str:
     return "\n".join("%s(%4d,%4d) %s" % (prefix, it.center[0], it.center[1], it.text)
                      for it in items)
+
+
+# 脱敏账号形如 159****4508 / a***@qq.com
+_MASK_RE = re.compile(r"(\d{3}\*{2,4}\d{3,4})|([A-Za-z0-9._-]{1,3}\*{2,6}@?[A-Za-z0-9._-]*)")
+
+
+def mask_of(text: str) -> Optional[str]:
+    """从一段 OCR 文字里抠出脱敏账号（159****4508）。"""
+    if not text:
+        return None
+    m = _MASK_RE.search(text)
+    return m.group(0) if m else None
+
+
+def find_masked(items: Sequence[TextItem]) -> Optional[str]:
+    """在当前屏幕的文字里找脱敏账号——它是「这是网易登录页」的铁证之一。"""
+    for it in items:
+        mk = mask_of(it.text)
+        if mk:
+            return mk
+    return None
 
 
 # --------------------------------------------------------------------------- 设备
@@ -547,6 +593,52 @@ def crop(img: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
     return img[y1:y2, x1:x2]
 
 
+def ocr_region_scaled(path: str, box: Tuple[int, int, int, int], *,
+                      factor: float = 2.5,
+                      tmp_path: Optional[str] = None) -> List[TextItem]:
+    """只 OCR 截图中的一个区域，并先放大再识别；坐标已还原到原图坐标系。
+
+    为什么需要它（2026-09-19 实测踩到）：
+      游戏**冷启动**后停在标题页，那行「点击以开始游戏」是**金底金字**，
+      全屏 OCR 直接返回 0 行 —— 脚本认不出这是要点的启动页，干等到超时，
+      整轮任务全废。把底部那条带裁出来放大 2.5 倍后，OCR 能读出
+      「过`击以开：始：．戏》」（脏但可模糊匹配）。
+      所以「整屏读不出」时，要能退一步到「按区域放大再读」。
+
+    与 ocr_image_scaled 的分工：
+      · ocr_image_scaled 放**整图**——用于按钮文字偏小（高度 ~20px）被漏读；
+      · 本函数放**局部**——用于整图对比度过低时，区域放大能显著提升信噪比。
+    注意别裁得太小：Windows 原生 OCR 对小于约 480x270 的图会静默返回 0 行，
+    裁完再放大也救不回来（ocr_image_scaled 的注释里也记了同一条）。
+    """
+    img = read_png(path)
+    if img is None:
+        return []
+    x1, y1, x2, y2 = box
+    h, w = img.shape[:2]
+    x1, y1 = max(0, int(x1)), max(0, int(y1))
+    x2, y2 = min(w, int(x2)), min(h, int(y2))
+    if x2 - x1 < 8 or y2 - y1 < 8:
+        return []
+    piece = img[y1:y2, x1:x2]
+    big = cv2.resize(piece, None, fx=factor, fy=factor,
+                     interpolation=cv2.INTER_CUBIC)
+    tmp = tmp_path or (path + ".r%.1f.png" % factor)
+    try:
+        write_png(tmp, big)
+    except Exception:
+        return []
+    items = ocr_image(tmp)
+    out: List[TextItem] = []
+    for it in items:
+        b = tuple(int(v / factor) for v in it.box)
+        # 平移回原图坐标系
+        b = (b[0] + x1, b[1] + y1, b[2] + x1, b[3] + y1)
+        c = (int((b[0] + b[2]) / 2), int((b[1] + b[3]) / 2))
+        out.append(TextItem(it.text, b, c))
+    return out
+
+
 class Templates:
     """从 templates/ 目录加载小图，用于在截图里定位固定 UI 元素（多尺度）。"""
 
@@ -564,13 +656,19 @@ class Templates:
         return self._cache[name]
 
     def find(self, screen: np.ndarray, name: str,
-             roi: Optional[Tuple[int, int, int, int]] = None
+             roi: Optional[Tuple[int, int, int, int]] = None,
+             threshold: Optional[float] = None
              ) -> Optional[Tuple[int, int, float]]:
-        """返回 (中心x, 中心y, 相似度) 或 None。roi = (x, y, w, h)。"""
+        """返回 (中心x, 中心y, 相似度) 或 None。roi = (x, y, w, h)。
+
+        threshold 传了就覆盖实例默认值——底图有噪声的模板（比如游戏标题页的
+        艺术字）用自己的实测阈值更稳，不必迁就全局的 0.82。
+        """
         _need_vision("模板匹配")
         tpl0 = self.load(name)
         if tpl0 is None:
             return None
+        thr = self.threshold if threshold is None else threshold
         sx, sy = 0, 0
         img = screen
         if roi:
@@ -591,7 +689,7 @@ class Templates:
                 best = (sx + maxloc[0] + tpl.shape[1] // 2,
                         sy + maxloc[1] + tpl.shape[0] // 2,
                         float(maxv))
-        if best is None or best[2] < self.threshold:
+        if best is None or best[2] < thr:
             return None
         return best
 

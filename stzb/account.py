@@ -30,7 +30,8 @@ import re
 import time
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from .core import TextItem, fix_ocr, match_score, norm
+from .core import (TextItem, find_login_button, find_masked as _core_find_masked,
+                   fix_ocr, match_score, mask_of as _core_mask_of, norm)
 
 # ------------------------------------------------------------------ 界面坐标
 # 全部来自 recon/switch4.json 的实测值。面板有 ±20px 的呼吸漂移，
@@ -86,22 +87,11 @@ _MASK_RE = re.compile(r"(\d{3}\*{2,4}\d{3,4})|([A-Za-z0-9._-]{1,3}\*{2,6}@?[A-Za
 
 
 # ------------------------------------------------------------------ 小工具
+# mask_of / find_masked 已提升到 stzb.core（ui.py 的启动引导也要用同一套），
+# 这里保留同名引用，避免两处正则漂移。
 
-def mask_of(text: str) -> Optional[str]:
-    """从一段 OCR 文字里抠出脱敏账号。"""
-    if not text:
-        return None
-    m = _MASK_RE.search(text)
-    return m.group(0) if m else None
-
-
-def find_masked(items: Sequence[TextItem]) -> Optional[str]:
-    """在当前屏幕的文字里找脱敏账号。"""
-    for it in items:
-        mk = mask_of(it.text)
-        if mk:
-            return mk
-    return None
+mask_of = _core_mask_of
+find_masked = _core_find_masked
 
 
 def _hit(items: Sequence[TextItem], *kws: str) -> Optional[TextItem]:
@@ -135,26 +125,10 @@ def _exact(items: Sequence[TextItem], *kws: str) -> bool:
 def _find_login_button(items: Sequence[TextItem]) -> Optional[TextItem]:
     """精确找网易登录页的「登录」按钮。
 
-    界面上的「自动登录 / 上次登录 / 其他账号登录」都含「登录」二字，
-    所以这里逐个排除，只留那个真正的按钮。找不到就返回 None（调用方用固定坐标兜底）。
+    实现已提升到 stzb.core.find_login_button（ui.py 的 boot() 也要用同一套），
+    这里保留薄封装，免得两处判定漂移。
     """
-    for it in items:
-        t = norm(it.text)
-        if not t:
-            continue
-        # 精确等值优先
-        if t == "登录":
-            return it
-    for it in items:
-        t = norm(it.text)
-        if "登录" not in t:
-            continue
-        if "自动登录" in t or "上次登录" in t or "其他账号" in t \
-                or "其他帐号" in t:
-            continue
-        if match_score(it.text, "登录") >= 0.8 and it.center[1] > 500:
-            return it
-    return None
+    return find_login_button(items)
 
 
 # ------------------------------------------------------------------ 切换结果

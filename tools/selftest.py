@@ -1703,6 +1703,124 @@ def test_config_autoresolve():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_title_page():
+    """冷启动标题页识别（2026-09-19 真机踩到的 bug）。
+
+    症状：游戏冷启动后停在标题页（山水画 + 底部金字「点击以开始游戏」），
+    这一屏**全屏 OCR 读 0 行**，脚本认不出 → 一直走「认不出的界面」分支 →
+    盲点右上角 ✕ 直到 300 秒启动超时，整轮任务全废。
+
+    修法：模板匹配（templates/title_page.png），阈值 0.70。
+    实测区分度：标题页 ≥0.85，非标题页（黑屏/网易开屏）≤0.42。
+    """
+    print("\n[N] 标题页识别（冷启动第一屏）")
+    import os
+    import numpy as np
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    tpl_path = os.path.join(root, "templates", "title_page.png")
+    check("模板文件存在", os.path.exists(tpl_path), tpl_path)
+    if not os.path.exists(tpl_path):
+        return
+
+    # 用一张真机标题页截图当「正样本」，一张纯色图当「负样本」。
+    shots = os.path.join(root, "logs", "shots")
+    pos = None
+    if os.path.isdir(shots):
+        import glob
+        cands = sorted(glob.glob(os.path.join(shots, "boot_*.png")))
+        # 找一张能命中模板的（真机残留截图，存在就顺带验证）
+        for c in cands:
+            try:
+                from stzb.core import read_png
+                img = read_png(c)
+                if img is None:
+                    continue
+                tpl = read_png(tpl_path)
+                if tpl is not None and img.shape[0] >= tpl.shape[0]:
+                    import cv2
+                    r = cv2.matchTemplate(img, tpl, cv2.TM_CCOEFF_NORMED)
+                    if float(r.max()) >= 0.85:
+                        pos = c
+                        break
+            except Exception:
+                continue
+
+    from stzb.core import Templates, read_png
+    tpl = Templates(os.path.join(root, "templates"))
+
+    # 负样本：纯色图不该命中（阈值 0.70 必须在噪声上不误报）
+    blank = _blank()
+    hit_blank = tpl.find(blank, "title_page", roi=(0, 860, 1920, 200), threshold=0.70)
+    check("纯色图不误报为标题页", hit_blank is None,
+          "命中=%s" % (hit_blank,))
+
+    # 负样本：白底（网易开屏）也不该命中
+    white = np.full((1080, 1920, 3), 255, dtype=np.uint8)
+    hit_white = tpl.find(white, "title_page", roi=(0, 860, 1920, 200), threshold=0.70)
+    check("白底开屏不误报为标题页", hit_white is None, "命中=%s" % (hit_white,))
+
+    # 正样本：有真机截图就验证能命中
+    if pos:
+        img = read_png(pos)
+        hit = tpl.find(img, "title_page", roi=(0, 860, 1920, 200), threshold=0.70)
+        check("真机标题页截图能命中", hit is not None,
+              "%s -> %s" % (os.path.basename(pos), hit))
+        if hit:
+            check("命中的 y 坐标落在标题文字带内（900~1045）",
+                  900 <= hit[1] <= 1045, "y=%s" % hit[1])
+    else:
+        print("  [SKIP] 本机没有可用的真机标题页截图，跳过正样本验证")
+
+    # 阈值余量：确认模板与自身完全匹配时分数接近 1.0
+    selfimg = read_png(tpl_path)
+    if selfimg is not None:
+        h = tpl.find(selfimg, "title_page", threshold=0.70)
+        check("模板对自身命中且分数 ≥0.99", h is not None and h[2] >= 0.99,
+              "hit=%s" % (h,))
+
+
+def test_home_recruit_missed():
+    """「招募」按钮偶发漏读时，主城仍要被认出来。
+
+    真机症状（2026-09-19 12:00 档）：市井任务报「打不开内政面板」，
+    同一轮的演武/特性却都成功进去了 —— 因为那一帧右下角「招募」
+    漏读了，is_home 判 False，open_neizheng() 以为人还在外面，
+    反复退回主城重进，最后放弃。
+    """
+    print("\n[O] 主城判定：招募漏读时的兜底")
+    from stzb.ui import Ui
+    ui = Ui.__new__(Ui)
+    ui.log = lambda m: None
+    ui.dry_run = True
+    ui.never_tap = ()
+    ui.shots = []
+    ui._tpl = None
+
+    # 招募漏读，但有短「势力值」标签 + 主城导航词 → 必须判成主城
+    missed = [itc("云魇丨奈子", 200, 60), itc("势力值21", 210, 120),
+              itc("任务", 60, 105), itc("活动", 296, 175), itc("出征", 700, 900),
+              itc("计略", 900, 900)]
+    check("招募漏读但有短「势力值」→ 判为主城", ui.is_home(missed),
+          [x.text for x in missed])
+
+    # 长句里出现「势力值」不能当主城（活动面板的说明文字）
+    longtext = [itc("世崛起，每日登录和提升势力值可获得势力积分，提升等级获得大量奖励",
+                    900, 500)]
+    check("长句里的「势力值」不算主城证据", not ui.is_home(longtext),
+          [x.text for x in longtext])
+
+    # _short_has 长度闸门
+    check("_short_has 拒绝超长文本", not ui._short_has(longtext, "势力值"),
+          "maxlen=10 应拦下这句长文本")
+    check("_short_has 接受短标签", ui._short_has(missed, "势力值"), "势力值21")
+
+    # 子面板特征词仍然优先排除（哪怕同时有 势力值）
+    panel = [itc("势力值21", 210, 120), itc("宝物商队", 755, 143)]
+    check("子面板（宝物商队）不被判成主城", not ui.is_home(panel),
+          [x.text for x in panel])
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -1736,6 +1854,8 @@ if __name__ == "__main__":
     test_config_tool()
     test_bat_files()
     test_config_autoresolve()
+    test_title_page()
+    test_home_recruit_missed()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)

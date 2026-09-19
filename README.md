@@ -243,6 +243,9 @@ stzb-automation/
 ├─ config.example.json 配置模板（复制成 config.json 再改）
 ├─ requirements-client.txt  客户端依赖
 │
+├─ templates\          模板匹配用小图（OCR 读不出的界面靠它认）
+│   └─ title_page.png  游戏标题页「点击以开始游戏」（金底金字，OCR 读 0 行）
+│
 ├─ stzb\               采集端代码
 │   ├─ core.py         ADB + Windows 原生 OCR + 模糊匹配 + 模板匹配
 │   ├─ emulator.py     MuMu 12 启停（MuMuManager 封装）
@@ -259,7 +262,7 @@ stzb-automation/
 ├─ tools\
 │   ├─ config.py       本机配置工具（交互菜单 + 命令行）
 │   ├─ emu.py          手动开关模拟器
-│   ├─ selftest.py     离线自检（332 项断言）
+│   ├─ selftest.py     离线自检（343 项断言）
 │   ├─ probe_switch*.py 账号/角色切换界面的侦察脚本
 │   └─ ...             侦察 / 排查小工具
 │
@@ -306,7 +309,7 @@ venv\Scripts\python.exe run_daily.py --only all --force   rem 真机全量
   定向任务过滤、运行归属。**它抓到过一个真漏洞**：未注册客户端能领走别人的定向任务（已修）。
 
 自检（`tools\selftest.py`）覆盖：OCR 误认修正、界面判定互斥、颜色/几何判据、安全黑名单、
-模拟器状态解析、报告生成、后端配置下发边界、bat 启动器卫生等 332 项。
+模拟器状态解析、报告生成、后端配置下发边界、bat 启动器卫生、冷启动标题页识别等 343 项。
 
 这个项目的真 bug 一半是自检/联调抓的、一半是真机抓的，**几条腿缺一不可**。
 
