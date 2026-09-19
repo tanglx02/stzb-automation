@@ -8,6 +8,10 @@
   · `emulator` —— MuMuManager 路径、虚拟机索引
   · `cloud`    —— 后端地址和 token（服务端把自己的凭据下发给自己，荒谬且危险）
   · `logging`  —— 本地磁盘保留策略
+  · `account`  —— 账号/角色切换开关。后端能「指派切到哪个账号」（那是数据，不是配置），
+                  但**不能把切换功能本身关掉** —— 否则服务端被误改后，
+                  客户端会停在别人的账号上跑任务，而本机毫无察觉。
+                  开关的本机控制权不给服务端。
 
 所以服务端只允许下发下面这些「业务开关」，其余键一律过滤掉。
 脚本侧 `stzb/remote_config.py` 有一份**内容相同**的白名单做二次过滤 ——
@@ -146,7 +150,7 @@ FIELD_LABELS = {
 }
 
 # 绝对不能由服务端下发的段（脚本侧也再拦一遍）。仅用于界面提示。
-LOCAL_ONLY_SECTIONS = ["device", "emulator", "cloud", "logging"]
+LOCAL_ONLY_SECTIONS = ["device", "emulator", "cloud", "logging", "account"]
 
 SECTION_LABEL = {
     "tasks": "总开关（哪些任务要跑）",

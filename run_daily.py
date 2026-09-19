@@ -38,10 +38,13 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
+from stzb.account import ensure_target, describe_screen
 from stzb.cloud import upload_run, load_last_report, CloudClient, CloudError, hostname
 from stzb.config import load                      # noqa: E402
 from stzb.core import DEFAULT_ADB, GAME_PKG, Device   # noqa: E402
 from stzb.emulator import MuMu                    # noqa: E402
+from stzb.heartbeat import Heartbeat, StatusBox   # noqa: E402
+from stzb.identity import Identity, read_assignment_cache, write_assignment_cache
 from stzb.remote_config import apply_remote, pick_job   # noqa: E402
 from stzb.report import RunReport                 # noqa: E402
 from stzb.tasks import TASKS, run_all             # noqa: E402
@@ -49,6 +52,8 @@ from stzb.ui import Ui                            # noqa: E402
 
 STATE = os.path.join(ROOT, "state", "last_run.json")
 REMOTE_STATE = os.path.join(ROOT, "state", "remote_config.json")   # 远端配置落地记录
+CLIENT_STATE = os.path.join(ROOT, "state", "client.json")          # 客户端稳定标识
+ASSIGN_CACHE = os.path.join(ROOT, "state", "assignment.json")      # 后端指派缓存
 LOCK = os.path.join(ROOT, "state", "run.lock")
 LOG_DIR = os.path.join(ROOT, "logs")
 SHOT_DIR = os.path.join(ROOT, "logs", "shots")
@@ -314,6 +319,133 @@ def _cloud_ready(cfg, log) -> bool:
     return True
 
 
+# ---------------------------------------------------------------- 心跳 / 在线探测
+
+class HeartbeatSession:
+    """后台心跳的一条龙封装。
+
+    服务端在公网、客户端在内网，服务端连不上客户端 —— 所以「后台看到客户端在线」
+    全靠这个线程主动上报。它同时承担两个职责：
+      1. 让后台知道「我在线、我在干什么、我现在是哪个账号」
+      2. 把后台点在界面上的「探测」「强制切换」等指令取回来执行
+
+    刻意做成「用完就丢」的上下文管理器：主流程跑任务期间它在后台转，
+    任务一结束就停掉，不给长期驻留留隐患（定时任务每天跑两次，不是常驻服务）。
+    """
+
+    def __init__(self, client, identity, mode: str, logger):
+        self.client = client
+        self.identity = identity
+        self.log = logger
+        self.box = StatusBox(mode=mode)
+        self.hb: Optional[Heartbeat] = None
+        self.assignment: Dict[str, Any] = {}
+        self._ui = None            # 需要时才建（探测指令要用它截屏 OCR）
+        self._make_ui = None
+
+    def bind_ui_factory(self, fn) -> None:
+        """挂一个「怎么造 Ui 对象」的工厂。收到探测指令时才用它。"""
+        self._make_ui = fn
+
+    def start(self, interval: Optional[int] = None) -> "HeartbeatSession":
+        self.hb = Heartbeat(
+            self.client, self.identity,
+            state_fn=self.box.get,
+            on_assignment=self._on_assignment,
+            on_command=self._on_command,
+            logger=self.log,
+            interval=interval,
+        ).start()
+        self.box.set(state="idle")
+        return self
+
+    def stop(self) -> None:
+        if self.hb:
+            self.hb.stop()
+            self.hb = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.stop()
+        return False
+
+    # ---------------------------------------------------------- 回调
+
+    def _on_assignment(self, assignment, switch_needed, reason) -> None:
+        """心跳带回来的指派。存到内存 + 落盘，供本轮/下轮使用。"""
+        if assignment:
+            self.assignment = assignment
+            write_assignment_cache(assignment, ASSIGN_CACHE)
+        if switch_needed and reason:
+            self.log("  · 后台要求切换账号/角色：%s" % reason)
+            self.box.set(note="待切换：%s" % reason)
+
+    def _on_command(self, cmd: Dict[str, Any]):
+        """执行后台下发的一次性指令，返回 (ok, message, data)。"""
+        kind = cmd.get("kind") or "probe"
+        self.log("  · 收到后台指令：%s" % kind)
+
+        if kind == "probe":
+            ui = self._ui_obj()
+            if ui is None:
+                return False, "本机还没连上模拟器/ADB，探测不了", {}
+            info = describe_screen(ui)
+            masked = None
+            try:
+                from stzb.account import find_masked
+                items, _ = ui.ocr("probe_acct")
+                masked = find_masked(items)
+            except Exception:
+                pass
+            msg = "读到 %d 行文字" % info.get("text_count", 0)
+            if masked:
+                msg += "，当前账号 %s" % masked
+            return True, msg, info
+
+        if kind == "switch":
+            ui = self._ui_obj()
+            if ui is None:
+                return False, "本机还没连上模拟器/ADB，切换不了", {}
+            target = self.assignment or read_assignment_cache(ASSIGN_CACHE)
+            if not target:
+                return False, "后台还没给这台客户端指派账号/角色", {}
+            r = ensure_target(ui, target, log=self.log)
+            self.box.patch_current(masked=r.masked or None, role=r.role or None,
+                                   switched_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+            return r.ok, ("切换成功：%s" % r.reason) if r.ok else ("切换失败：%s" % r.reason), \
+                r.to_dict()
+
+        return False, "不认识的指令：%s" % kind, {}
+
+    # ---------------------------------------------------------- Ui 工厂
+
+    def _ui_obj(self):
+        if self._ui is not None:
+            return self._ui
+        if self._make_ui is None:
+            return None
+        try:
+            self._ui = self._make_ui()
+        except Exception as e:
+            self.log("  ! 创建 Ui 失败：%r" % (e,))
+            return None
+        return self._ui
+
+
+def _state_reporter(client, cfg, slot: str, dry_run: bool, identity) -> Callable[[], Dict[str, Any]]:
+    """拼一个「当前状态」函数给心跳线程调用。"""
+    cloud = cfg.get("cloud") or {}
+    base_extra = {"slot": slot, "dry_run": dry_run,
+                  "base_url": cloud.get("base_url") or ""}
+
+    def fn() -> Dict[str, Any]:
+        return {"mode": "managed", "extra": base_extra}
+
+    return fn
+
+
 def cmd_upload_last(cfg, offline: bool = False) -> int:
     """只补传本地最近一份报告，不跑任务。网络恢复后用它兜底。"""
     print("· 补传本地最近一份报告…")
@@ -343,7 +475,8 @@ def cmd_upload_last(cfg, offline: bool = False) -> int:
     return 0
 
 
-def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason=""):
+def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason="",
+               identity=None):
     """上传结果 + 给待执行任务回执。**任何失败都不抛异常**，也不影响本机报告。
 
     这是刻意的：上报告是尽力而为。网络断了、服务器挂了，已经跑完的任务不能白跑 ——
@@ -360,7 +493,8 @@ def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason=""):
     try:
         res = upload_run(cfg, report, paths, logger=log,
                          shots_per_task=int((cfg.get("cloud") or {})
-                                            .get("upload_shots_per_task", 4)))
+                                            .get("upload_shots_per_task", 4)),
+                         identity=identity)
     except Exception as e:                      # 上传模块自身的 bug 也不能拖垮收尾
         log("  × 上传过程异常：%r（本机报告不受影响）" % (e,))
         res = {"ok": False, "error": repr(e), "run_id": None}
@@ -391,11 +525,15 @@ def main():
     ap.add_argument("--open-report", action="store_true", help="跑完自动打开报告")
     ap.add_argument("--no-upload", action="store_true", help="本轮不上传到后端")
     ap.add_argument("--no-remote-config", action="store_true", help="不从后端拉配置，只用本地")
+    ap.add_argument("--no-switch", action="store_true",
+                    help="不做账号/角色切换，用当前已经在线的账号直接跑")
     ap.add_argument("--offline", "--standalone", dest="offline", action="store_true",
                     help="独立运行：完全不连后端（不拉配置、不领任务、不上传），"
                          "优先级高于 config.json")
     ap.add_argument("--upload-last", action="store_true",
                     help="不跑任务，只把本地最近的报告补传到后端")
+    ap.add_argument("--whoami", action="store_true",
+                    help="打印本机的客户端标识（后台靠它认机器）")
     args = ap.parse_args()
 
     if args.list:
@@ -411,6 +549,17 @@ def main():
 
     if args.status:
         return cmd_status(cfg, offline=args.offline)
+
+    if args.whoami:
+        ident = Identity.load(CLIENT_STATE)
+        print("客户端标识（uid）: %s" % ident.uid)
+        print("机器名            : %s" % ident.host)
+        print("首次登记时间      : %s" % (ident.created_at or "—"))
+        print("")
+        print("后台「客户端」页上显示的就是这台机器。")
+        print("标识文件：%s" % CLIENT_STATE)
+        print("想重新登记（比如换了台机器、要复用旧记录）：删掉上面这个文件即可。")
+        return 0
 
     if args.upload_last:
         return cmd_upload_last(cfg, offline=args.offline)
@@ -442,23 +591,64 @@ def main():
 
     client = None
     job = None
+    identity = Identity.load(CLIENT_STATE)
+    hb_session: Optional[HeartbeatSession] = None
+    assignment: Dict[str, Any] = {}
     if managed:
         try:
             client = CloudClient(base_url=cfg["cloud"]["base_url"],
                                  token=cfg["cloud"]["token"],
                                  timeout=int(cfg["cloud"].get("timeout", 90)),
                                  retries=int(cfg["cloud"].get("retries", 3)),
-                                 logger=log)
+                                 logger=log, uid=identity.uid)
         except CloudError as e:
             log("  ! 后端客户端初始化失败：%s" % e)
 
     if client is not None:
+        log("· 本机客户端标识：%s（%s）" % (identity.uid, identity.host))
+
+        # 第一次心跳：同时把「我上线了」和「后台给我派了哪个账号」一次拿到
         ok, info = client.ping()
         if ok:
             log("· 后端已连接：%s（远端配置版本 v%s）"
                 % (cfg["cloud"]["base_url"], (info or {}).get("config_version", "?")))
+            if (info or {}).get("task_paused"):
+                log("  ! 后台把这台客户端设为「暂停派发」，本轮只跑命令行的任务")
         else:
             log("  ! 后端探活失败：%s（继续跑，跑完再试上传）" % info)
+
+        # 起后台心跳线程：跑任务期间持续上报在线状态，并接收后台指令
+        hb_session = HeartbeatSession(client, identity, mode, log)
+        hb_session.bind_ui_factory(lambda: Ui(
+            Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
+                   serial_candidates=cfg.get("device.serial_candidates"),
+                   shot_dir=SHOT_DIR),
+            cfg, logger=log, dry_run=True))
+        try:
+            hb_session.start()
+            log("· 已开始后台心跳（每 %d 秒一次，后台可据此看到本机在线）"
+                % (hb_session.hb.interval if hb_session.hb else 30))
+        except Exception as e:
+            log("  ! 心跳线程启动失败：%r（不影响任务）" % (e,))
+            hb_session = None
+
+        # 心跳响应里带的指派：这是「后端设置账号角色 → 客户端自动切换」的数据来源
+        if isinstance(info, dict) and info.get("assignment"):
+            assignment = info["assignment"]
+            write_assignment_cache(assignment, ASSIGN_CACHE)
+            log("· 后台指派：%s%s"
+                % (assignment.get("label") or assignment.get("masked") or "?",
+                   (" / " + assignment["role"]) if assignment.get("role") else ""))
+            if info.get("switch_needed"):
+                log("  · 后台要求切换：%s" % info.get("switch_reason") or "")
+        else:
+            # 后端没指派（或连不上）→ 用上次缓存的目标，保证断网也知道该用哪个账号
+            cached = read_assignment_cache(ASSIGN_CACHE)
+            if cached:
+                assignment = cached
+                log("· 使用上次缓存的指派：%s%s"
+                    % (cached.get("label") or cached.get("masked") or "?",
+                       (" / " + cached["role"]) if cached.get("role") else ""))
 
         if cfg["cloud"].get("pull_config", True) and not args.no_remote_config:
             apply_remote(cfg, client, REMOTE_STATE, logger=log)
@@ -512,12 +702,21 @@ def main():
     pkg = cfg.get("device.package") or GAME_PKG
     emu = make_emulator(cfg, rlog)
 
+    if assignment:
+        report.account_label = assignment.get("label") or assignment.get("masked") or ""
+        report.role_label = assignment.get("role") or ""
+
     report.env_info(模拟器="MuMu 12（vmindex=%s）" % emu_cfg.get("vmindex", 0),
                     启动时间=report.started_at.strftime("%Y-%m-%d %H:%M:%S"),
                     运行模式=describe_mode(cfg, mode),
                     档位=slot,
                     模式="预演（不点击）" if dry_run else "实际执行",
                     任务范围=only_label),
+    if assignment:
+        report.env_info(**{"目标账号": assignment.get("label") or assignment.get("masked") or "—",
+                           "目标角色": assignment.get("role") or "（不限）"})
+    if identity.uid:
+        report.env_info(客户端标识=identity.uid)
 
     emu_started_by_us = False
     shutdown_after = (args.shutdown_after
@@ -536,10 +735,14 @@ def main():
         report.env_info(结果=reason)
         p = report.write_all(REPORT_DIR, cfg.get("logging.keep_days", 14))
         rlog("· 报告：%s" % p["html"])
-        _do_upload(cfg, report, p, client, job, rlog, disabled=(args.no_upload or not managed), reason=upload_skip_reason)
+        _do_upload(cfg, report, p, client, job, rlog,
+                   disabled=(args.no_upload or not managed), reason=upload_skip_reason,
+                   identity=identity)
         return code
 
     # ---------------------------------------------------------------- 1. 模拟器
+    if hb_session:
+        hb_session.box.set(state="starting", busy=True, note="正在准备模拟器")
     if args.no_emulator:
         rlog("· 按 --no-emulator 跳过模拟器管理，直接连 ADB")
     else:
@@ -567,6 +770,9 @@ def main():
         return _bail(3, "ADB 连接失败")
     rlog("· ADB 已连接：%s" % dev.serial)
     report.env_info(ADB设备=dev.serial)
+    if hb_session:
+        hb_session.box.set(state="starting", note="ADB 已连接，准备打开游戏")
+        hb_session.box.patch_device(emulator_running=True, adb_serial=dev.serial)
 
     # ---------------------------------------------------------------- 3. 游戏
     if dev.game_running(pkg):
@@ -579,15 +785,69 @@ def main():
         if not wait_game_ready(dev, pkg, timeout=120, log=rlog):
             return _bail(4, "游戏启动失败")
         report.env_info(游戏启动耗时="%.0f 秒" % (time.time() - t0))
+    if hb_session:
+        hb_session.box.set(state="starting", note="游戏已启动")
+        hb_session.box.patch_device(game_running=True)
 
     ui = Ui(dev, cfg, logger=rlog, dry_run=dry_run)
+    if hb_session:
+        hb_session._ui = ui          # 后台探测指令直接复用这个 Ui，不用另建
 
+    # ---------------------------------------------------------------- 3.5 账号/角色切换
+    # 放在 boot() 之前：切换必须在**登录页**完成（「点击换区」是登录页的入口），
+    # 一旦 boot() 点了「开始游戏」进了主城，就得先退出来才能切。
+    #
+    # 开关优先级：命令行 --no-switch（临时）> config.account.* （本机长期设置）。
+    # account 段是**本机独占**的（不进后端可下发白名单），见 stzb/remote_config.py。
+    acct_cfg = cfg.get("account") or {}
+    want_switch = bool(assignment) and not args.no_switch \
+        and acct_cfg.get("enabled", True) is not False
+    if want_switch:
+        # 细粒度开关：只切角色（比如多开但共用账号）时能省掉一次登录跳转
+        if not acct_cfg.get("switch_account", True):
+            assignment = {k: v for k, v in assignment.items() if k != "masked"}
+            rlog("· 本机设置：不切账号，只校验角色")
+        if not acct_cfg.get("switch_role", True):
+            assignment = {k: v for k, v in assignment.items() if k != "role"}
+            rlog("· 本机设置：不切角色，只校验账号")
+
+    if want_switch and (assignment.get("masked") or assignment.get("role")):
+        if hb_session:
+            hb_session.box.set(state="switching", note="正在按后台指派切换账号/角色")
+        rlog("· 按后台指派校验账号 / 角色…")
+        t_sw = time.time()
+        sw = ensure_target(ui, assignment, log=rlog, dry_run=dry_run)
+        report.env_info(切换结果="%s（%.0f 秒）" % (
+            "✓ " + sw.reason if sw.ok else "× " + sw.reason, time.time() - t_sw))
+        if not sw.ok:
+            # 切换失败**不能硬着头皮跑** —— 那是别人的账号，跑出来的任务全错。
+            rlog("!! 账号/角色切换失败，本轮中止（避免跑错账号）")
+            if hb_session:
+                hb_session.box.set(state="error",
+                                   note="切换失败：%s" % sw.reason)
+                hb_session.box.patch_current(switched_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+            return _bail(5, "账号/角色切换失败：%s" % sw.reason)
+        if hb_session:
+            hb_session.box.patch_current(
+                masked=sw.masked or assignment.get("masked"),
+                role=sw.role or assignment.get("role"),
+                account_label=assignment.get("label"),
+                switched_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    elif assignment and (assignment.get("masked") or assignment.get("role")):
+        rlog("· 已按本机设置跳过账号/角色切换（--no-switch 或 config.account.enabled=false）")
+
+    # ---------------------------------------------------------------- 4. 进主城
     t0 = time.time()
+    if hb_session:
+        hb_session.box.set(state="starting", note="正在进入主城")
     if not ui.boot():
         return _bail(4, "进主城失败")
     report.env_info(进入主城耗时="%.0f 秒" % (time.time() - t0))
 
-    # ---------------------------------------------------------------- 4. 任务
+    # ---------------------------------------------------------------- 5. 任务
+    if hb_session:
+        hb_session.box.set(state="running", busy=True,
+                           note="正在跑 %s 档任务" % slot)
     started = time.time()
     res = run_all(ui, cfg, slot, only=only, logger=log, report=report)
 
@@ -595,6 +855,11 @@ def main():
     for k, v in res.items():
         log("  %-10s %s" % (k, "OK" if v else "失败/跳过"))
     log("耗时 %.1f 秒；截图存于 %s" % (time.time() - started, SHOT_DIR))
+    if hb_session:
+        hb_session.box.set(state="idle", busy=False,
+                           note="%s 档跑完，成功 %d / 共 %d"
+                                % (slot, sum(1 for v in res.values() if v), len(res)),
+                           last_run_at=dt.datetime.now().isoformat(timespec="seconds"))
 
     # ---------------------------------------------------------------- 5. 报告
     report.env_info(总耗时="%.1f 秒" % (time.time() - t_run0))
@@ -623,7 +888,9 @@ def main():
 
     # ---------------------------------------------------------------- 7. 上传后端
     # 放在关模拟器之后：先把占内存的虚拟机放掉，再慢慢传。
-    _do_upload(cfg, report, paths, client, job, log, disabled=(args.no_upload or not managed), reason=upload_skip_reason)
+    _do_upload(cfg, report, paths, client, job, log,
+               disabled=(args.no_upload or not managed), reason=upload_skip_reason,
+               identity=identity)
 
     if not only:
         if st.get("date") != today:
@@ -633,6 +900,19 @@ def main():
         st["last_finish"] = dt.datetime.now().isoformat(timespec="seconds")
         st["last_report"] = paths["html"]
         save_state(st)
+
+    # 收尾前把「跑完了」这个状态刷上去，再停心跳 ——
+    # 否则后台看到的最后一拍还停在「正在跑」，要等 90 秒才判离线。
+    if hb_session:
+        hb_session.box.set(state="idle", busy=False,
+                           note="本轮结束（%s 档）" % slot,
+                           last_run_at=dt.datetime.now().isoformat(timespec="seconds"))
+        try:
+            hb_session.hb.beat()        # 立刻补一拍，后台马上就看到「空闲了」
+        except Exception:
+            pass
+        hb_session.stop()
+        log("· 后台心跳已停止。")
 
     if args.open_report:
         try:

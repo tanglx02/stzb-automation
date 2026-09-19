@@ -35,6 +35,14 @@
     "pull_jobs": true,
     "upload_shots_per_task": 4
   },
+  "account": {
+    "_说明": "账号/角色自动切换（后端托管下生效）。后端在「账号角色」页登记账号与角色、在「客户端」页指派给某台机器，脚本下次心跳领到指派就会自动免密切换。enabled=false 或 run_daily.py --no-switch 可整体关掉；switch_account / switch_role 可单独关掉（比如多开共用账号时省掉一次登录跳转）。",
+    "_本机独占": "这一段服务端下发不了。服务端能指派「切到哪个账号」（那是数据），但不能关掉「要不要切」这个开关 —— 否则服务端被误改后，客户端会停在别人的账号上跑任务，而本机毫无察觉。",
+    "_前提": "要切的账号必须已经在这台机器的模拟器里手动登录过一次（网易登录页的「常用」列表里有的才能免密切换）。系统不保存任何密码，也不会去点「其他账号登录」。",
+    "enabled": true,
+    "switch_account": true,
+    "switch_role": true
+  },
   "tasks": {
     "gongpin": true,
     "shuishou": true,

@@ -12,7 +12,43 @@
     <div class="v" style="color:{% if stats.bad_runs %}var(--fail){% else %}var(--muted){% endif %}">{{ stats.bad_runs }}</div></div>
   <div class="card"><div class="k">待执行请求</div>
     <div class="v" style="color:{% if pending %}var(--skip){% else %}var(--muted){% endif %}">{{ pending|length }}</div></div>
+  <div class="card"><div class="k">客户端在线</div>
+    <div class="v" style="color:{% if online.online %}var(--ok){% else %}var(--muted){% endif %}">
+      {{ online.online }}<span class="hint" style="font-size:13px"> / {{ online.total }}</span></div></div>
 </div>
+
+<h2>客户端</h2>
+{% if clients %}
+<table>
+  <thead><tr><th>客户端</th><th>状态</th><th>当前账号 / 角色</th><th>最近心跳</th><th></th></tr></thead>
+  <tbody>
+  {% for c in clients %}
+    <tr>
+      <td>{{ c.name or c.host or c.uid }}</td>
+      <td>
+        {% if not c.enabled %}<span class="pill skip">已暂停</span>
+        {% elif c.online %}<span class="pill ok">在线</span>
+        {% elif c.stale %}<span class="pill skip">心跳中断</span>
+        {% else %}<span class="pill gray">离线</span>{% endif %}
+      </td>
+      <td class="muted">
+        {% if c.status.current %}{{ c.status.current.masked or '—' }}
+          {% if c.status.current.role %} / {{ c.status.current.role }}{% endif %}
+        {% else %}—{% endif %}
+      </td>
+      <td class="muted">{{ c.last_seen or '—' }}
+        {% if c.age_seconds is not none %}<span class="hint">（{{ c.age_seconds }} 秒前）</span>{% endif %}</td>
+      <td><a href="/clients?hl={{ c.id }}">管理</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+<p class="hint">在线是按客户端心跳（每 {{ heartbeat_interval }} 秒一次，超过 {{ offline_after }} 秒算离线）判定的。
+  <a href="/clients">客户端管理 →</a></p>
+{% else %}
+<div class="panel empty">还没有客户端上报过心跳。在要跑的机器上启动脚本即可自动登记。
+  <a href="/clients">客户端页 →</a></div>
+{% endif %}
 
 {% if stats.last %}
 <div class="panel">

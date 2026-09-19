@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
 """采集端（脚本）用的 API。整个路由组统一挂 agent 令牌校验，不可能漏。
+
+**拓扑前提（决定了这里所有接口的形状）：**
+服务端跑在公网，采集端跑在内网。服务端**永远连不上**采集端 —— 不是配置问题，
+是 NAT 决定的。所以：
+  · 「客户端是否在线」= 客户端主动上报心跳，服务端记 last_seen（见 /ping）
+  · 「探测客户端当前界面」= 服务端把指令挂在客户端那一行上，客户端下次心跳
+    带回去执行，再通过 /probe 回报（见 db.client_request_probe）
+  · 「给某台客户端派任务」= 写进 run_requests.client_id，心跳时按 uid 过滤着领
 """
 from __future__ import annotations
 
@@ -7,13 +15,13 @@ import hashlib
 import os
 import re
 import secrets
-from typing import Optional
+from typing import Any, Dict, Optional
 
 from fastapi import (APIRouter, Depends, File, Form, Header, HTTPException,
-                     UploadFile)
+                     Request, UploadFile)
 
 from . import db, managed, security, settings
-from .schemas import AckIn, RunIn
+from .schemas import AckIn, HeartbeatIn, ProbeResultIn, RunIn
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -32,6 +40,22 @@ def require_agent(x_agent_token: Optional[str] = Header(default=None),
 # 整组路由统一鉴权：以后新增接口忘了加，也不会裸奔
 router = APIRouter(prefix="/api/agent", tags=["agent"],
                    dependencies=[Depends(require_agent)])
+
+
+def _client_ip(request: Request) -> str:
+    fwd = request.headers.get("x-forwarded-for", "")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    return request.client.host if request.client else ""
+
+
+def _ident(request: Request) -> Dict[str, Any]:
+    """从请求头里取客户端身份（老客户端只发头、不发 body 也能用）。"""
+    return {
+        "uid": (request.headers.get("x_agent_uid") or "").strip(),
+        "host": (request.headers.get("x_agent_host") or "").strip(),
+        "version": (request.headers.get("x_agent_version") or "").strip(),
+    }
 
 
 def _safe_name(name: str, fallback: str = "file.bin") -> str:
@@ -107,22 +131,173 @@ def _save_upload(run_id: int, up: UploadFile, *, kind: str, label: str,
 # ------------------------------------------------------------------ 基础
 
 @router.get("/ping")
-def ping(x_agent_version: Optional[str] = Header(default=None),
-         x_agent_host: Optional[str] = Header(default=None)):
-    cur = db.config_current()
-    if x_agent_host:
-        db.kv_set("last_agent_host", x_agent_host)
-    if x_agent_version:
-        db.kv_set("last_agent_version", x_agent_version)
+def ping(request: Request,
+         x_agent_version: Optional[str] = Header(default=None),
+         x_agent_host: Optional[str] = Header(default=None),
+         x_agent_uid: Optional[str] = Header(default=None)):
+    """探活 / 心跳。GET 版（不带负载），老客户端兼容。
+
+    只做「我还在」这一件事：登记客户端、刷新 last_seen。返回值里的
+    `assignment` 让客户端启动时就知道自己该用哪个账号/角色。
+    """
+    return _heartbeat(request, None, x_agent_version, x_agent_host, x_agent_uid)
+
+
+@router.post("/ping")
+def ping_post(request: Request, body: HeartbeatIn):
+    """带负载的心跳。客户端后台线程每隔 N 秒发一次，附带当前状态。
+
+    返回值是**服务端对客户端的指令通道**，包含：
+      · config_version 变了没（客户端可据此决定要不要重拉配置）
+      · assignment     该用哪个账号 / 哪个角色（换了指派客户端会自动切）
+      · switch_needed  true 表示「你当前跑的账号/角色和目标不一致，切一下」
+      · command        一次性指令（人工点的「探测」「强制切换」「立刻跑一轮」）
+    """
+    return _heartbeat(request, body, body.host and None, None, None)
+
+
+def _heartbeat(request: Request, body: Optional[HeartbeatIn],
+               hdr_version: Optional[str], hdr_host: Optional[str],
+               hdr_uid: Optional[str]) -> Dict[str, Any]:
+    ident = _ident(request)
+    uid = (body.uid if body and body.uid else None) or ident["uid"] or hdr_uid or ""
+    host = (body.host if body and body.host else None) or ident["host"] or hdr_host or ""
+    version = (body and None) or ident["version"] or hdr_version or ""
+
+    # 老客户端（只发头、连 uid 都没有）拿 host 当标识，至少还能被看见
+    uid = uid or host
+    if not uid:
+        # 实在没有标识就退化：不发 token 的探活不该污染客户端列表
+        cur = db.config_current()
+        return {"ok": True, "app": settings.APP_NAME, "version": settings.APP_VERSION,
+                "config_version": cur["version"],
+                "allow_run_requests": settings.ALLOW_RUN_REQUESTS,
+                "server_time": db.now(),
+                "heartbeat_interval": settings.HEARTBEAT_INTERVAL,
+                "registered": False,
+                "note": "本次心跳没带 uid，未登记为客户端"}
+
+    status: Optional[Dict[str, Any]] = None
+    if body is not None:
+        status = {
+            "mode": body.mode or "",
+            "state": body.state or "",
+            "busy": bool(body.busy),
+            "note": (body.note or "")[:300],
+            "current": (body.current.model_dump() if body.current else {}),
+            "device": (body.device.model_dump() if body.device else {}),
+            "last_run_at": body.last_run_at or "",
+            "extra": body.extra or {},
+        }
+
+    if hdr_host:
+        db.kv_set("last_agent_host", hdr_host)
+    if hdr_version:
+        db.kv_set("last_agent_version", hdr_version)
+
+    cli = db.client_upsert(uid, host=host, agent_version=version,
+                           ip=_client_ip(request), status=status)
+    if not cli:
+        raise HTTPException(status_code=400, detail="无法登记客户端")
+
+    # ---- 该用哪个账号/角色 ----
+    aid = cli.get("account_id")
+    rid = cli.get("role_id")
+    acc = db.account_get(int(aid)) if aid else None
+    role = db.role_get(int(rid)) if rid else None
+
+    # 账号要没停用，否则相当于没指派
+    if acc and not acc.get("enabled"):
+        acc, role = None, None
+    if role and not role.get("enabled"):
+        role = None
+    # 角色必须挂在被指派的账号下，否则这种脏数据直接忽略
+    if role and acc and int(role["account_id"]) != int(acc["id"]):
+        role = None
+
+    target = None
+    if acc:
+        target = {
+            "account_id": acc["id"],
+            "label": acc["label"],
+            "login_name": acc.get("login_name") or "",
+            "masked": acc.get("masked") or "",
+            "role_id": (role or {}).get("id"),
+            "role": (role or {}).get("name") or "",
+            "server": (role or {}).get("server") or "",
+            "season": (role or {}).get("season") or "",
+            "tab": (role or {}).get("tab") or "",
+        }
+
+    # ---- 需不需要切？----
+    # 判定规则很保守：只要客户端报上来的「脱敏账号」或「角色名」和目标对不上，
+    # 就让它切。客户端那边还会自己再比一次（它知道自己当前真实状态）。
+    switch_needed = False
+    reason = ""
+    if target:
+        cur = (status or {}).get("current") or {}
+        if cli.get("probe", {}).get("force_switch"):
+            switch_needed = True
+            reason = "管理端要求强制切换"
+        elif not cur.get("masked") and not cur.get("role"):
+            # 客户端还没进游戏、状态未知 —— 不算「不一致」，让它照常启动
+            switch_needed = False
+            reason = "客户端尚未上报当前账号/角色"
+        else:
+            if target.get("masked") and cur.get("masked") \
+                    and str(target["masked"]) != str(cur["masked"]):
+                switch_needed = True
+                reason = "账号不一致（目标 %s，当前 %s）" % (target["masked"], cur["masked"])
+            elif target.get("role") and cur.get("role") \
+                    and str(target["role"]) != str(cur["role"]):
+                switch_needed = True
+                reason = "角色不一致（目标 %s，当前 %s）" % (target["role"], cur["role"])
+
+    # ---- 一次性指令 ----
+    command = db.client_probe_take(int(cli["id"])) or None
+
+    # 强制切换这条指令要顺带把「切换意图」传给客户端
+    if command and command.get("kind") == "switch":
+        switch_needed = True
+        reason = reason or "管理端要求强制切换"
+
+    cur_cfg = db.config_current()
+    jobs = len(db.request_pending_for(limit=99, client_id=int(cli["id"])))
+
     return {
         "ok": True,
         "app": settings.APP_NAME,
         "version": settings.APP_VERSION,
-        "config_version": cur["version"],
+        "server_time": db.now(),
+        # 心跳节奏由服务端定，方便以后统一调；客户端照它 sleep
+        "heartbeat_interval": settings.HEARTBEAT_INTERVAL,
+        "offline_after": settings.CLIENT_OFFLINE_AFTER,
+        "client": {"id": cli["id"], "name": cli.get("name"),
+                   "enabled": bool(cli.get("enabled"))},
+        "config_version": cur_cfg["version"],
         "allow_run_requests": settings.ALLOW_RUN_REQUESTS,
-        "agent_version": x_agent_version,
-        "host": x_agent_host,
+        "registered": True,
+        "task_paused": not bool(cli.get("enabled")),
+        "pending_jobs": jobs,
+        "assignment": target,
+        "switch_needed": switch_needed,
+        "switch_reason": reason,
+        "command": command,
     }
+
+
+@router.post("/probe")
+def probe_result(request: Request, body: ProbeResultIn,
+                 x_agent_uid: Optional[str] = Header(default=None),
+                 x_agent_host: Optional[str] = Header(default=None)):
+    """客户端上报人工探测的结果（界面文字、截图摘要、切换成败）。"""
+    ident = _ident(request)
+    uid = body.uid or ident["uid"] or x_agent_uid or ident["host"] or x_agent_host or ""
+    cli = db.client_by_uid(uid)
+    if not cli:
+        raise HTTPException(status_code=404, detail="这台客户端还没登记过（先发一次心跳）")
+    db.client_probe_finish(int(cli["id"]), bool(body.ok), body.message, body.data)
+    return {"ok": True}
 
 
 # ------------------------------------------------------------------ 配置
@@ -142,23 +317,56 @@ def get_config(version: int = 0):
 # ------------------------------------------------------------------ 待执行任务
 
 @router.get("/jobs")
-def jobs(limit: int = 10):
+def jobs(request: Request, limit: int = 10,
+         x_agent_uid: Optional[str] = Header(default=None),
+         x_agent_host: Optional[str] = Header(default=None),
+         uid: str = ""):
+    """待领取任务。**按客户端过滤**：公共任务（没指定客户端）谁都能领，
+    定向任务只有被点名的那台能领到。
+
+    这是多客户端分发的核心 —— 客户端不需要在本地做任何筛选逻辑。
+    """
     if not settings.ALLOW_RUN_REQUESTS:
         return {"jobs": []}
-    rows = db.request_pending(limit=max(1, min(limit, 50)))
+    ident = _ident(request)
+    key = uid or ident["uid"] or x_agent_uid or ident["host"] or x_agent_host or ""
+    cli = db.client_by_uid(key) if key else None
+    if cli and not cli.get("enabled"):
+        return {"jobs": [], "paused": True,
+                "note": "这台客户端在管理端被暂停了派发"}
+    cid = int(cli["id"]) if cli else None
+    # 未登记的客户端只拿得到公共任务 —— 定向任务不能漏给它
+    rows = db.request_pending_for(limit=max(1, min(limit, 50)), client_id=cid)
     return {"jobs": [
         {"id": r["id"], "slot": r["slot"], "only": r["only_tasks"] or "",
          "dry_run": bool(r["dry_run"]), "created_at": r["created_at"],
-         "created_by": r["created_by"], "note": r["note"] or ""}
-        for r in rows]}
+         "created_by": r["created_by"], "note": r["note"] or "",
+         "client_id": r["client_id"]}
+        for r in rows], "client_id": cid, "registered": cli is not None}
 
 
 @router.post("/jobs/{req_id}/take")
-def job_take(req_id: int, host: str = ""):
-    if not db.request_take(req_id, host or "unknown"):
+def job_take(req_id: int, request: Request, host: str = "",
+             uid: str = "", x_agent_uid: Optional[str] = Header(default=None)):
+    """领取任务。这里要再验一次归属 —— 否则 A 客户端猜到 id 就能抢走 B 的定向任务。"""
+    ident = _ident(request)
+    key = uid or ident["uid"] or x_agent_uid or host or ident["host"] or ""
+    cli = db.client_by_uid(key) if key else None
+
+    with db.tx() as c:
+        row = c.execute("SELECT client_id, status FROM run_requests WHERE id=?",
+                        (req_id,)).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="没有这条任务")
+    owner = row["client_id"]
+    if owner is not None and (not cli or int(cli["id"]) != int(owner)):
+        raise HTTPException(status_code=403, detail="这条任务是派给别的客户端的")
+
+    if not db.request_take(req_id, (cli or {}).get("name") or host or "unknown"):
         raise HTTPException(status_code=409, detail="该任务已被领取或已取消")
-    db.event("info", "agent", "领取待执行任务 #%d（%s）" % (req_id, host))
-    return {"ok": True, "id": req_id}
+    db.event("info", "agent", "领取待执行任务 #%d（%s）"
+             % (req_id, (cli or {}).get("name") or host or "unknown"))
+    return {"ok": True, "id": req_id, "client_id": (cli or {}).get("id")}
 
 
 @router.post("/jobs/{req_id}/ack")
@@ -172,7 +380,9 @@ def job_ack(req_id: int, body: AckIn):
 # ------------------------------------------------------------------ 上传运行结果
 
 @router.post("/run")
-def create_run(body: RunIn, x_agent_host: Optional[str] = Header(default=None)):
+def create_run(request: Request, body: RunIn,
+               x_agent_host: Optional[str] = Header(default=None),
+               x_agent_uid: Optional[str] = Header(default=None)):
     counts = body.counts or {}
     if counts:
         n_ok = int(counts.get("ok") or 0)
@@ -183,19 +393,39 @@ def create_run(body: RunIn, x_agent_host: Optional[str] = Header(default=None)):
         n_fail = sum(1 for t in body.tasks if t.status in ("fail", "error"))
         n_skip = sum(1 for t in body.tasks if t.status == "skip")
 
-    rid = db.run_create({
+    # 归属到客户端与账号：优先用上报的 uid，退回 host。
+    # 账号/角色以**服务端当时的指派**为准（比客户端自报的可信），
+    # 但同时存一份客户端自报的标签，用于人工核对切换是否真的生效。
+    ident = _ident(request)
+    key = body.uid or ident["uid"] or x_agent_uid or body.host or ident["host"] \
+        or x_agent_host or ""
+    cli = db.client_by_uid(key) if key else None
+    aid = int(cli["account_id"]) if cli and cli.get("account_id") else None
+    rid = int(cli["role_id"]) if cli and cli.get("role_id") else None
+    acc = db.account_get(aid) if aid else None
+    role = db.role_get(rid) if rid else None
+
+    rid_run = db.run_create({
         "client_run_id": body.client_run_id,
-        "host": body.host or x_agent_host, "slot": body.slot, "dry_run": body.dry_run,
+        "host": body.host or x_agent_host or (cli or {}).get("host"),
+        "client_id": (cli or {}).get("id"),
+        "account_id": (acc or {}).get("id"),
+        "role_id": (role or {}).get("id"),
+        "account_label": (acc or {}).get("label") or body.account_label or "",
+        "role_label": (role or {}).get("name") or body.role_label or "",
+        "slot": body.slot, "dry_run": body.dry_run,
         "started_at": body.started_at, "finished_at": body.finished_at,
         "duration_seconds": body.duration_seconds,
         "n_ok": n_ok, "n_fail": n_fail, "n_skip": n_skip,
         "all_ok": body.all_ok, "env": body.env, "notes": body.notes,
         "runner_version": body.runner_version, "exit_code": body.exit_code,
     })
-    db.run_replace_tasks(rid, [t.model_dump() for t in body.tasks])
-    db.event("info", "agent", "收到运行记录 #%d（%s 档，成功%d 失败%d 跳过%d）"
-             % (rid, body.slot or "-", n_ok, n_fail, n_skip))
-    return {"ok": True, "run_id": rid, "url": "/runs/%d" % rid}
+    db.run_replace_tasks(rid_run, [t.model_dump() for t in body.tasks])
+    db.event("info", "agent", "收到运行记录 #%d（%s 档，成功%d 失败%d 跳过%d，%s%s）"
+             % (rid_run, body.slot or "-", n_ok, n_fail, n_skip,
+                (cli or {}).get("name") or body.host or "未知客户端",
+                (" / " + str((acc or {}).get("label"))) if acc else ""))
+    return {"ok": True, "run_id": rid_run, "url": "/runs/%d" % rid_run}
 
 
 @router.post("/run/{run_id}/report")

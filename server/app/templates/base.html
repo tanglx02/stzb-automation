@@ -11,6 +11,9 @@
   <span class="brand">{{ app_name }}</span>
   <nav>
     <a href="/" class="{% if nav=='dash' %}on{% endif %}">总览</a>
+    <a href="/clients" class="{% if nav=='clients' %}on{% endif %}">客户端{% if nav_badge.online %}
+      <span class="badge on">{{ nav_badge.online }}</span>{% endif %}</a>
+    <a href="/accounts" class="{% if nav=='accounts' %}on{% endif %}">账号角色</a>
     <a href="/runs" class="{% if nav=='runs' %}on{% endif %}">运行记录</a>
     <a href="/config" class="{% if nav=='config' %}on{% endif %}">任务配置</a>
     <a href="/jobs" class="{% if nav=='jobs' %}on{% endif %}">待执行</a>

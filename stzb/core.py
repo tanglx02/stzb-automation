@@ -22,14 +22,37 @@ import time
 from dataclasses import dataclass
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
-import cv2
-import numpy as np
+# ---------------------------------------------------------------------------
+# 重依赖（OpenCV / numpy / WinRT）**容错导入**。
+#
+# 这样拆开是有意的：本模块上半部分是**纯文本决策逻辑**（OCR 结果归一化、
+# 关键词模糊匹配），下半部分才真正碰图像和系统 OCR。把重依赖做成容错的，
+# 纯逻辑就能在没有装 opencv / winrt 的机器上单独跑测试和复用，
+# 而不是一 import 就炸。
+#
+# 真要用到图像/OCR 能力时，下面这些名字一定存在（否则那台机器本来也跑不了
+# 抓屏/识别），所以调用点不需要额外判空。
+# ---------------------------------------------------------------------------
 
-from winrt.windows.globalization import Language
-from winrt.windows.graphics.imaging import BitmapDecoder
-from winrt.windows.media.ocr import OcrEngine
-from winrt.windows.storage import FileAccessMode
-from winrt.windows.storage.streams import FileRandomAccessStream
+np = None                                       # type: ignore
+cv2 = None                                      # type: ignore
+Language = BitmapDecoder = OcrEngine = None     # type: ignore
+FileAccessMode = FileRandomAccessStream = None  # type: ignore
+
+try:
+    import numpy as np                                        # noqa: F811
+    import cv2                                                # noqa: F811
+except Exception:                               # pragma: no cover
+    pass
+
+try:
+    from winrt.windows.globalization import Language                          # noqa: F811
+    from winrt.windows.graphics.imaging import BitmapDecoder                   # noqa: F811
+    from winrt.windows.media.ocr import OcrEngine                              # noqa: F811
+    from winrt.windows.storage import FileAccessMode                           # noqa: F811
+    from winrt.windows.storage.streams import FileRandomAccessStream           # noqa: F811
+except Exception:                               # pragma: no cover
+    pass
 
 # --------------------------------------------------------------------------- 常量
 
@@ -42,6 +65,18 @@ Point = Tuple[int, int]
 
 
 # --------------------------------------------------------------------------- OCR
+
+def _need_vision(what: str) -> None:
+    """图像/OCR 能力缺依赖时给出可操作的报错，而不是莫名的 AttributeError。"""
+    if cv2 is None or np is None:
+        raise RuntimeError(
+            "%s 需要 OpenCV/numpy，但当前 Python 环境里没装。\n"
+            "  装依赖：pip install -r requirements-client.txt" % what)
+    if OcrEngine is None:
+        raise RuntimeError(
+            "%s 需要 WinRT 的 Windows.Media.Ocr，但当前环境里没装。\n"
+            "  装依赖：pip install -r requirements-client.txt" % what)
+
 
 @dataclass
 class TextItem:
@@ -67,6 +102,8 @@ _ocr_engine: Optional[OcrEngine] = None
 
 def _get_ocr_engine(lang_tag: str = "zh-Hans-CN") -> Optional[OcrEngine]:
     global _ocr_engine
+    if OcrEngine is None:
+        _need_vision("Windows OCR")
     if _ocr_engine is None:
         try:
             _ocr_engine = OcrEngine.try_create_from_language(Language(lang_tag))
@@ -331,6 +368,7 @@ class Device:
              （个别 adb 版本 exec-out 会失败，但 pull/cat 一直好使）
         """
         last = ""
+        _need_vision("截图")
         for attempt in (1, 2, 3):
             try:
                 if attempt == 1:
@@ -466,6 +504,7 @@ class Device:
 
 def write_png(path: str, img: np.ndarray) -> None:
     """写 PNG。cv2.imwrite 在含中文的路径上会静默失败，必须走 imencode。"""
+    _need_vision("写 PNG")
     ok, buf = cv2.imencode(".png", img)
     if not ok:
         raise AdbError("PNG 编码失败")
@@ -475,6 +514,7 @@ def write_png(path: str, img: np.ndarray) -> None:
 def read_png(path: str) -> Optional[np.ndarray]:
     if not os.path.exists(path):
         return None
+    _need_vision("读 PNG")
     return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
 
 
@@ -527,6 +567,7 @@ class Templates:
              roi: Optional[Tuple[int, int, int, int]] = None
              ) -> Optional[Tuple[int, int, float]]:
         """返回 (中心x, 中心y, 相似度) 或 None。roi = (x, y, w, h)。"""
+        _need_vision("模板匹配")
         tpl0 = self.load(name)
         if tpl0 is None:
             return None
@@ -603,6 +644,7 @@ def find_colored_buttons(img: np.ndarray, roi: Tuple[int, int, int, int],
                          lower: Sequence[int], upper: Sequence[int],
                          min_area: int = 400) -> List[Point]:
     """在 roi 里找指定颜色的连通块中心（用于「绿色免费按钮」这类颜色特征兜底）。"""
+    _need_vision("颜色识别")
     x, y, w, h = roi
     sub = img[y:y + h, x:x + w]
     hsv = cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)

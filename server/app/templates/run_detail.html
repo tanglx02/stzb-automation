@@ -9,7 +9,8 @@
 <div class="sub">
   运行 #{{ run.id }} · 开始 {{ run.started_at }} · 档位 {{ run.slot or '—' }} ·
   耗时 {{ '%.1f'|format(run.duration_seconds or 0) }} 秒
-  {% if run.host %} · 机器 {{ run.host }}{% endif %}
+  {% if run.client_name or run.host %} · 客户端 {{ run.client_name or run.host }}{% endif %}
+  {% if run.account_label %} · 账号 {{ run.account_label }}{% if run.role_label %} / {{ run.role_label }}{% endif %}{% endif %}
 </div>
 
 <div class="cards">
@@ -30,10 +31,19 @@
   </form>
 </div>
 
-{% if env %}
+{% if env or run.client_id or run.account_label %}
 <h2>运行环境</h2>
 <div class="panel">
   <div class="row">
+    {% if run.client_name or run.host %}
+    <div class="kv"><div class="k">客户端</div><div class="v">
+      {% if run.client_id %}<a href="/clients?hl={{ run.client_id }}">{{ run.client_name or run.host }}</a>
+      {% else %}{{ run.host }}{% endif %}</div></div>
+    {% endif %}
+    {% if run.account_label %}
+    <div class="kv"><div class="k">游戏账号 / 角色</div><div class="v">
+      {{ run.account_label }}{% if run.role_label %} / {{ run.role_label }}{% endif %}</div></div>
+    {% endif %}
     {% for k, v in env.items() %}
     <div class="kv"><div class="k">{{ k }}</div><div class="v">{{ v }}</div></div>
     {% endfor %}

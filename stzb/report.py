@@ -23,8 +23,16 @@ import shutil
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
-import cv2
-import numpy as np
+# 重依赖容错导入（理由同 core.py）：报告里只有「嵌缩略图」这一步真的需要 OpenCV，
+# 其余（拼 HTML、写文件）是纯字符串活。这样报告模块在没装 opencv 的机器上
+# 也能导入，只是不出缩略图 —— 而不是一 import 就整个崩。
+np = None      # type: ignore
+cv2 = None     # type: ignore
+try:
+    import numpy as np      # noqa: F811
+    import cv2              # noqa: F811
+except Exception:           # pragma: no cover
+    pass
 
 # 截图文件名末尾的全局序号：`sj_panel_01.png` -> 1、`tx_panel_3_106.png` -> 106
 _SHOT_SEQ_RE = re.compile(r"_(\d+)(?:\.[A-Za-z0-9]+)*$")
@@ -51,8 +59,10 @@ def _now() -> str:
     return dt.datetime.now().strftime("%H:%M:%S")
 
 
-def _read_image(path: str) -> Optional[np.ndarray]:
+def _read_image(path: str) -> "Optional[np.ndarray]":
     """读图。cv2.imread 在中文路径上会静默失败，必须走 imdecode。"""
+    if cv2 is None or np is None:
+        return None
     try:
         return cv2.imdecode(np.fromfile(path, dtype=np.uint8), cv2.IMREAD_COLOR)
     except Exception:
@@ -148,6 +158,10 @@ class RunReport:
         self.entries: List[TaskEntry] = []
         self.notes: List[str] = []
         self.env: Dict[str, str] = {}
+        # 这一轮跑的是哪个账号/角色。由 run_daily 按后端的指派填进来，
+        # 上传时一起带上，服务端拿它核对「切换到底生效了没」。
+        self.account_label: str = ""
+        self.role_label: str = ""
         self._before: set = set()
 
     # ------------------------------------------------------------ 运行级信息
@@ -245,7 +259,7 @@ class RunReport:
         return "\n".join(lines)
 
     def to_dict(self) -> Dict:
-        return {
+        d = {
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "finished_at": (self.finished_at or dt.datetime.now()).isoformat(timespec="seconds"),
             "slot": self.slot,
@@ -265,6 +279,12 @@ class RunReport:
                 "shots": e.shots,
             } for e in self.entries],
         }
+        # 账号/角色只在真有值时才带上，老版本服务端读不到这两个键也不会出问题
+        if self.account_label:
+            d["account_label"] = self.account_label
+        if self.role_label:
+            d["role_label"] = self.role_label
+        return d
 
     # ------------------------------------------------------------ 落盘
 

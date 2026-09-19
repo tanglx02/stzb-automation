@@ -3,27 +3,62 @@
 {% block body %}
 
 <h1>运行记录</h1>
-<div class="sub">共 {{ total }} 轮{% if bad %} · 只看有未完成项的{% endif %}</div>
+<div class="sub">共 {{ total }} 轮{% if bad %} · 只看有未完成项的{% endif %}
+  {% if client_id or account_id %} · 已按
+    {% if client_id %}{{ (clients | selectattr('id','equalto',client_id) | list | first or {}).get('name') or ('客户端#' ~ client_id) }}{% endif %}
+    {% if account_id %}{% if client_id %} / {% endif %}{{ (accounts | selectattr('id','equalto',account_id) | list | first or {}).get('label') or ('账号#' ~ account_id) }}{% endif %}
+  筛选{% endif %}
+</div>
 
 {% if deleted %}<div class="banner ok">已删除该轮记录及其报告、截图。</div>{% endif %}
 
-<div class="actions" style="margin:0 0 14px">
-  {% if bad %}<a class="btn" href="/runs">显示全部</a>
-  {% else %}<a class="btn" href="/runs?bad=1">只看有未完成项的</a>{% endif %}
-</div>
+<form method="get" action="/runs" class="filters">
+  <label class="f inline">
+    <span class="name">客户端</span>
+    <select name="client">
+      <option value="">全部</option>
+      {% for c in clients or [] %}
+        <option value="{{ c.id }}" {% if client_id == c.id %}selected{% endif %}>
+          {{ c.name or c.host or c.uid }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label class="f inline">
+    <span class="name">游戏账号</span>
+    <select name="account">
+      <option value="">全部</option>
+      {% for a in accounts or [] %}
+        <option value="{{ a.id }}" {% if account_id == a.id %}selected{% endif %}>
+          {{ a.label }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% if bad %}<input type="hidden" name="bad" value="1">{% endif %}
+  <button class="btn" type="submit">筛选</button>
+  {% if client_id or account_id %}<a class="btn" href="/runs{% if bad %}?bad=1{% endif %}">清空筛选</a>{% endif %}
+  <span class="spacer"></span>
+  {% if bad %}<a class="btn" href="/runs{% if client_id or account_id %}?client={{ client }}&account={{ account }}{% endif %}">显示全部</a>
+  {% else %}<a class="btn" href="/runs?bad=1{% if client_id %}&client={{ client_id }}{% endif %}{% if account_id %}&account={{ account_id }}{% endif %}">只看有未完成项的</a>{% endif %}
+</form>
 
 {% if runs %}
 <table>
   <thead><tr>
-    <th class="num">#</th><th>开始时间</th><th>档位</th><th>结果</th>
+    <th class="num">#</th><th>开始时间</th><th>客户端</th><th>账号 / 角色</th><th>档位</th><th>结果</th>
     <th class="num">成功</th><th class="num">失败</th><th class="num">跳过</th>
-    <th class="num">耗时</th><th>机器</th><th></th>
+    <th class="num">耗时</th><th></th>
   </tr></thead>
   <tbody>
   {% for r in runs %}
     <tr>
       <td class="num">{{ r.id }}</td>
       <td>{{ r.started_at }}</td>
+      <td class="muted">{{ r.client_name or r.host or '—' }}</td>
+      <td>
+        {% if r.account_label or r.role_label %}
+          {{ r.account_label or '—' }}{% if r.role_label %} <span class="hint">/ {{ r.role_label }}</span>{% endif %}
+        {% else %}<span class="muted">—</span>{% endif %}
+      </td>
       <td>{{ r.slot or '—' }}{% if r.dry_run %} <span class="pill gray">预演</span>{% endif %}</td>
       <td>{% if r.all_ok %}<span class="pill ok">完成</span>
           {% else %}<span class="pill fail">未完成</span>{% endif %}</td>
@@ -31,7 +66,6 @@
       <td class="num">{{ r.n_fail }}</td>
       <td class="num">{{ r.n_skip }}</td>
       <td class="num">{{ '%.0f'|format(r.duration_seconds or 0) }}s</td>
-      <td class="muted">{{ r.host or '—' }}</td>
       <td><a href="/runs/{{ r.id }}">详情</a></td>
     </tr>
   {% endfor %}
@@ -39,9 +73,13 @@
 </table>
 
 <div class="pager">
-  {% if page > 1 %}<a class="btn" href="/runs?page={{ page-1 }}{% if bad %}&bad=1{% endif %}">上一页</a>{% endif %}
+  {% set qs = [] %}
+  {% if bad %}{% set _ = qs.append('bad=1') %}{% endif %}
+  {% if client_id %}{% set _ = qs.append('client=' ~ client_id) %}{% endif %}
+  {% if account_id %}{% set _ = qs.append('account=' ~ account_id) %}{% endif %}
+  {% if page > 1 %}<a class="btn" href="/runs?page={{ page-1 }}{% if qs %}&{{ qs|join('&') }}{% endif %}">上一页</a>{% endif %}
   <span class="muted">第 {{ page }} 页</span>
-  {% if runs|length == per %}<a class="btn" href="/runs?page={{ page+1 }}{% if bad %}&bad=1{% endif %}">下一页</a>{% endif %}
+  {% if runs|length == per %}<a class="btn" href="/runs?page={{ page+1 }}{% if qs %}&{{ qs|join('&') }}{% endif %}">下一页</a>{% endif %}
 </div>
 {% else %}
 <div class="panel empty">还没有运行记录。</div>

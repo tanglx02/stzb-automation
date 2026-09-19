@@ -3,12 +3,15 @@
 
 **安全边界（和 server/app/managed.py 一一对应）：**
 只允许覆盖下面白名单里的「业务段」。下面这些段永远以本机为准：
-    device / emulator / cloud / logging
+    device / emulator / cloud / logging / account
 理由：
   · device   改错了 → 连不上模拟器，且你人在外面根本没法修
   · emulator 同上，MuMuManager 路径、虚拟机索引
   · cloud    后端地址与令牌是本机凭据，不能由服务端下发（否则服务器一挂全都失联）
   · logging  本机磁盘策略
+  · account  账号/角色切换开关。后端能「指派切到哪个账号」，但**不能把切换功能本身
+             关掉** —— 否则服务端一旦被误改，客户端就会停在别人的账号上跑任务，
+             而你在本机还没有任何办法发现。开关属于本机控制权。
 两边各有一份同样的白名单，任何一边写错都不会把本地配置搞坏。
 
 合并方式是**深合并**：只覆盖远端确实带了的键，本地多出来的键（比如 `_说明` 注释）
@@ -33,7 +36,7 @@ MANAGED_SECTIONS: Dict[str, Any] = {
     "safety": None,
 }
 
-LOCAL_ONLY_SECTIONS = ("device", "emulator", "cloud", "logging")
+LOCAL_ONLY_SECTIONS = ("device", "emulator", "cloud", "logging", "account")
 
 
 def filter_payload(payload: Any) -> Dict[str, Any]:

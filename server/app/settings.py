@@ -74,8 +74,15 @@ BOOTSTRAP_AGENT_TOKEN = _env("STZB_AGENT_TOKEN")
 # 是否允许管理端触发任务（下一步让脚本领走）
 ALLOW_RUN_REQUESTS = _env("STZB_ALLOW_RUN_REQUESTS", "1") not in ("0", "false", "False")
 
+# ---- 客户端在线探测 ----
+# 服务端在公网、客户端在内网，服务端无法主动连客户端，所以「在线」完全由
+# 客户端主动上报的心跳决定：客户端每 HEARTBEAT_INTERVAL 秒 POST 一次
+# /api/agent/heartbeat，服务端记 last_seen；距今超过 CLIENT_OFFLINE_AFTER 秒视为掉线。
+HEARTBEAT_INTERVAL = int(_env("STZB_HEARTBEAT_INTERVAL", "30"))
+CLIENT_OFFLINE_AFTER = int(_env("STZB_CLIENT_OFFLINE_AFTER", "90"))
+
 APP_NAME = "率土之滨自动化 · 控制台"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 
 def ensure_dirs() -> None:

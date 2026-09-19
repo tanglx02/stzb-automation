@@ -26,11 +26,14 @@ import datetime as dt
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-RUNNER_VERSION = "1.0.0"
+RUNNER_VERSION = "1.1.0"
 
 # 单次请求超时（秒）。报告 3MB 左右，60 秒够；上传成功与否不该拖垮整轮任务
 DEFAULT_TIMEOUT = 90
 DEFAULT_RETRIES = 3
+
+# 心跳短超时：心跳是高频小请求，卡 90 秒没意义，也不该阻塞心跳线程
+HEARTBEAT_TIMEOUT = 12
 
 
 class CloudError(RuntimeError):
@@ -93,6 +96,7 @@ class CloudClient:
     retries: int = DEFAULT_RETRIES
     logger: Callable[[str], None] = print
     ctx: Optional[ssl.SSLContext] = None
+    uid: str = ""                     # 客户端稳定标识，随每个请求头发上去
     stats: Dict[str, int] = field(default_factory=lambda: {"up": 0, "down": 0, "fail": 0})
 
     def __post_init__(self):
@@ -115,9 +119,13 @@ class CloudClient:
     def request(self, method: str, path: str, *, body: Optional[bytes] = None,
                 content_type: str = "application/json",
                 params: Optional[Dict[str, Any]] = None,
-                want_json: bool = True, timeout: Optional[int] = None
+                want_json: bool = True, timeout: Optional[int] = None,
+                retries: Optional[int] = None
                 ) -> Tuple[bool, Any]:
-        """返回 (成功?, 解析后的 JSON 或错误文本)。网络类错误会重试。"""
+        """返回 (成功?, 解析后的 JSON 或错误文本)。网络类错误会重试。
+
+        retries 默认用实例级配置；高频小请求（心跳）会显式传 1，重试反而拖慢下一拍。
+        """
         url = self._url(path, params)
         headers = {
             "X-Agent-Token": self.token,
@@ -125,11 +133,15 @@ class CloudClient:
             "X-Agent-Version": RUNNER_VERSION,
             "User-Agent": "stzb-runner/%s" % RUNNER_VERSION,
         }
+        if self.uid:
+            # 服务端靠这个头把请求归属到具体客户端；没有它就只能退回用机器名
+            headers["X-Agent-Uid"] = self.uid
         if body is not None:
             headers["Content-Type"] = content_type
 
+        tries = max(1, int(retries if retries is not None else self.retries))
         last = ""
-        for attempt in range(1, max(1, self.retries) + 1):
+        for attempt in range(1, tries + 1):
             req = urllib.request.Request(url, data=body, headers=headers, method=method)
             try:
                 with urllib.request.urlopen(req, timeout=timeout or self.timeout,
@@ -160,15 +172,36 @@ class CloudClient:
                                "或装上 certifi：pip install certifi）" % e)
             except Exception as e:
                 last = "%s: %s" % (type(e).__name__, e)
-            if attempt < self.retries:
+            if attempt < tries:
                 time.sleep(min(2 ** attempt, 6))
         self.stats["fail"] += 1
         return False, last or "未知错误"
 
-    # -------------------------------------------------------------- 探活
+    # -------------------------------------------------------------- 探活 / 心跳
 
     def ping(self) -> Tuple[bool, Any]:
+        """兼容老接口的 GET 探活（不带负载）。"""
         return self.request("GET", "/api/agent/ping")
+
+    def heartbeat(self, payload: Dict[str, Any],
+                  timeout: int = HEARTBEAT_TIMEOUT) -> Tuple[bool, Any]:
+        """带负载的心跳。只重试 1 次 —— 高频小请求，重试反而拖慢下一拍。
+
+        响应里除了常规字段，还可能带着服务端对客户端的指令：
+        指派（assignment）、是否需要切换（switch_needed）、一次性指令（command）。
+        """
+        return self.request("POST", "/api/agent/ping",
+                            body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                            timeout=timeout, retries=1)
+
+    def probe_result(self, uid: str, ok: bool, message: str = "",
+                     data: Optional[Dict[str, Any]] = None) -> Tuple[bool, Any]:
+        """回报人工探测的结果。"""
+        payload = {"uid": uid, "ok": bool(ok), "message": str(message or "")[:600],
+                   "data": data or {}}
+        return self.request("POST", "/api/agent/probe",
+                            body=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                            timeout=HEARTBEAT_TIMEOUT, retries=1)
 
     # -------------------------------------------------------------- 配置
 
@@ -177,12 +210,12 @@ class CloudClient:
 
     # -------------------------------------------------------------- 任务队列
 
-    def list_jobs(self) -> Tuple[bool, Any]:
-        return self.request("GET", "/api/agent/jobs")
+    def list_jobs(self, uid: str = "") -> Tuple[bool, Any]:
+        return self.request("GET", "/api/agent/jobs", params={"uid": uid or self.uid})
 
     def take_job(self, job_id: int) -> bool:
         ok, _ = self.request("POST", "/api/agent/jobs/%d/take" % job_id,
-                             params={"host": hostname()},
+                             params={"host": hostname(), "uid": self.uid},
                              body=b"{}")
         return ok
 
@@ -318,7 +351,8 @@ def shrink_to_jpeg(path: str, width: int = 1000, quality: int = 76) -> Optional[
 
 def upload_run(cfg: Dict[str, Any], report, paths: Dict[str, str],
                logger: Callable[[str], None] = print,
-               shots_per_task: int = 4) -> Dict[str, Any]:
+               shots_per_task: int = 4,
+               identity: Any = None) -> Dict[str, Any]:
     """把一轮结果整体推上去。**任何失败都不抛异常**，只记录到返回值里。
 
     设计原则：上报告是「尽力而为」。网络断了、服务器挂了，也不能让已经跑完的
@@ -339,19 +373,25 @@ def upload_run(cfg: Dict[str, Any], report, paths: Dict[str, str],
                              token=cloud.get("token", ""),
                              timeout=int(cloud.get("timeout", DEFAULT_TIMEOUT)),
                              retries=int(cloud.get("retries", DEFAULT_RETRIES)),
-                             logger=logger)
+                             logger=logger,
+                             uid=getattr(identity, "uid", "") or "")
     except CloudError as e:
         result["error"] = str(e)
         logger("!! 后台上传未启用：%s" % e)
         return result
 
     payload = report.to_dict()
-    payload["host"] = hostname()
+    payload["host"] = getattr(identity, "host", "") or hostname()
+    payload["uid"] = getattr(identity, "uid", "") or ""
     payload["runner_version"] = RUNNER_VERSION
     payload["client_run_id"] = "%s-%s-%s" % (
-        hostname(),
+        payload["host"],
         report.started_at.strftime("%Y%m%dT%H%M%S"),
         report.slot or "auto")
+    # 客户端自报的账号/角色标签：服务端以自己当时的指派为准入库，
+    # 但会拿这份标签去核对「切换到底生效了没」，所以必须如实上报。
+    payload["account_label"] = getattr(report, "account_label", "") or ""
+    payload["role_label"] = getattr(report, "role_label", "") or ""
 
     ok, rid, err = client.create_run(payload)
     if not ok or not rid:

@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}账号角色 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>游戏账号与角色</h1>
+<div class="sub">
+  把你有多少个账号、每个账号下有哪些角色登记在这里，然后在「客户端」页把
+  <b>哪台机器负责哪个账号/角色</b> 指派下去。客户端跑任务前会自动切过去。
+</div>
+
+{% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
+{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+
+<div class="note">
+  <b>关于「切换」的能力边界（实测结论）：</b>
+  <ul>
+    <li><b>换角色 / 换区服 —— 免密</b>：登录页「点击换区」→「选择服务器」→ 选角色 → 确定。
+      所以下面登记的角色名要和游戏里显示的一致，客户端靠它来定位。</li>
+    <li><b>换账号 —— 免密但有限制</b>：走「用户中心 → 切换账号」会进网易统一登录页，
+      能直接点的是<b>「常用」列表里已经登录过的账号</b>。
+      也就是说：<b>每个账号至少要在这台机器的模拟器里手动登录过一次</b>，
+      之后就能被自动切换。系统不保存任何密码。</li>
+    <li>因此「脱敏账号」这一栏建议填成游戏登录页显示的样子（如 <code>159****4508</code>），
+      客户端就是拿它跟当前登录页上的文字比对来判断「账号对不对」。</li>
+  </ul>
+</div>
+
+<h2>新增账号</h2>
+<form method="post" action="/accounts">
+  <div class="panel">
+    <div class="grid2">
+      <label class="f">
+        <span class="name">账号名（你自己认得出的名字）</span>
+        <input type="text" name="label" placeholder="例如：主号 / 小号A" required>
+      </label>
+      <label class="f">
+        <span class="name">登录页显示的脱敏账号</span>
+        <input type="text" name="masked" placeholder="例如：159****4508">
+        <div class="hint">游戏登录页读到的那个。客户端拿它判断当前是不是目标账号。</div>
+      </label>
+    </div>
+    <div class="grid2">
+      <label class="f">
+        <span class="name">完整账号（选填，仅用于你自己对账）</span>
+        <input type="text" name="login_name" placeholder="例如：15900004508">
+      </label>
+      <label class="f">
+        <span class="name">分组（选填）</span>
+        <input type="text" name="tag" placeholder="例如：一组 / 测试服">
+      </label>
+    </div>
+    <label class="f">
+      <span class="name">备注（选填）</span>
+      <input type="text" name="note" placeholder="例如：主力账号，别乱切">
+    </label>
+    <div class="actions"><button class="primary" type="submit">添加账号</button></div>
+  </div>
+</form>
+
+<h2>账号列表</h2>
+
+{% if not accounts %}
+<div class="panel empty">还没有登记任何账号。先用上面的表单加一个。</div>
+{% endif %}
+
+{% for a in accounts %}
+<div class="panel acc {% if hl == a.id %}hl{% endif %}">
+  <div class="acc-head">
+    <span class="acc-name">{{ a.label }}</span>
+    {% if a.masked %}<span class="mono">{{ a.masked }}</span>{% endif %}
+    {% if a.tag %}<span class="pill gray">{{ a.tag }}</span>{% endif %}
+    {% if not a.enabled %}<span class="pill skip">已停用</span>{% endif %}
+    <span class="hint">{{ a.roles|length }} 个角色</span>
+    {% if users.get(a.id) %}
+    <span class="pill ok">被 {{ users[a.id]|length }} 台客户端使用</span>
+    {% endif %}
+    <span class="spacer"></span>
+    <span class="hint">#{{ a.id }}</span>
+  </div>
+
+  <!-- 角色表 -->
+  <table class="tight">
+    <thead><tr>
+      <th>角色名</th><th>区服</th><th>赛季 / 剧本</th><th>页签</th><th>状态</th><th></th>
+    </tr></thead>
+    <tbody>
+    {% for r in a.roles %}
+      <tr>
+        <td>
+          <form method="post" action="/roles/{{ r.id }}/update" class="inline-form">
+            <input type="hidden" name="_has_enabled" value="1">
+            <input type="text" name="name" value="{{ r.name }}" class="mini" style="width:150px">
+            <input type="text" name="server" value="{{ r.server or '' }}" class="mini"
+                   style="width:80px" placeholder="区服">
+            <input type="text" name="season" value="{{ r.season or '' }}" class="mini"
+                   style="width:100px" placeholder="赛季">
+            <select name="tab" class="mini">
+              {% for t in ('已有角色', '经典服', '青春服', '最近登录', '') %}
+                <option value="{{ t }}" {% if (r.tab or '') == t %}selected{% endif %}>
+                  {{ t or '（未分类）' }}</option>
+              {% endfor %}
+            </select>
+            <label class="mini-cb">
+              <input type="checkbox" name="enabled" value="1" {% if r.enabled %}checked{% endif %}>
+              启用
+            </label>
+            <button class="lnk" type="submit">保存</button>
+          </form>
+        </td>
+        <td class="muted">{{ r.server or '—' }}</td>
+        <td class="muted">{{ r.season or '—' }}</td>
+        <td class="muted">{{ r.tab or '—' }}</td>
+        <td>{% if r.enabled %}<span class="pill ok">启用</span>
+            {% else %}<span class="pill gray">停用</span>{% endif %}</td>
+        <td>
+          <form method="post" action="/roles/{{ r.id }}/delete" class="inline"
+                onsubmit="return confirm('删除角色「{{ r.name }}」？\n用它的客户端会被改成「不限角色」。')">
+            <button class="lnk danger" type="submit">删除</button>
+          </form>
+        </td>
+      </tr>
+    {% endfor %}
+    {% if not a.roles %}
+      <tr><td colspan="6" class="muted">这个账号下还没有登记角色。</td></tr>
+    {% endif %}
+    </tbody>
+  </table>
+
+  <form method="post" action="/accounts/{{ a.id }}/roles" class="role-add">
+    <span class="name">新增角色</span>
+    <input type="text" name="name" placeholder="角色名（游戏里显示的，如 X6014龙兴之）" style="width:230px" required>
+    <input type="text" name="server" placeholder="区服" style="width:90px">
+    <input type="text" name="season" placeholder="赛季" style="width:110px">
+    <select name="tab">
+      <option value="已有角色">已有角色</option>
+      <option value="最近登录">最近登录</option>
+      <option value="经典服">经典服</option>
+      <option value="青春服">青春服</option>
+    </select>
+    <button type="submit">添加</button>
+  </form>
+
+  <details class="more">
+    <summary>编辑账号信息 / 删除账号</summary>
+    <form method="post" action="/accounts/{{ a.id }}/update">
+      <input type="hidden" name="_has_enabled" value="1">
+      <div class="grid2">
+        <label class="f"><span class="name">账号名</span>
+          <input type="text" name="label" value="{{ a.label }}"></label>
+        <label class="f"><span class="name">脱敏账号</span>
+          <input type="text" name="masked" value="{{ a.masked or '' }}"></label>
+      </div>
+      <div class="grid2">
+        <label class="f"><span class="name">完整账号</span>
+          <input type="text" name="login_name" value="{{ a.login_name or '' }}"></label>
+        <label class="f"><span class="name">分组</span>
+          <input type="text" name="tag" value="{{ a.tag or '' }}"></label>
+      </div>
+      <label class="f"><span class="name">备注</span>
+        <input type="text" name="note" value="{{ a.note or '' }}"></label>
+      <label class="f cbrow">
+        <input type="checkbox" name="enabled" value="1" {% if a.enabled %}checked{% endif %}>
+        <span class="name">启用（停用后不会被指派、也不会派任务）</span>
+      </label>
+      <div class="actions"><button type="submit">保存账号</button></div>
+    </form>
+
+    <form method="post" action="/accounts/{{ a.id }}/delete"
+          onsubmit="return confirm('删除账号「{{ a.label }}」及其全部 {{ a.roles|length }} 个角色？\n{% if users.get(a.id) %}注意：有 {{ users[a.id]|length }} 台客户端正在用它，删除后这些客户端会被改成「不指派」。{% endif %}')">
+      <div class="actions"><button class="danger" type="submit">删除账号</button></div>
+    </form>
+  </details>
+</div>
+{% endfor %}
+
+{% if clients %}
+<h2>客户端指派一览</h2>
+<table>
+  <thead><tr><th>客户端</th><th>在线</th><th>指派账号</th><th>指派角色</th><th>客户端当前</th><th></th></tr></thead>
+  <tbody>
+  {% for c in clients %}
+    {% set acc = (accounts | selectattr('id', 'equalto', c.account_id) | list | first) %}
+    <tr>
+      <td>{{ c.name or c.host or c.uid }}</td>
+      <td>{% if c.online %}<span class="pill ok">在线</span>
+          {% else %}<span class="pill gray">离线</span>{% endif %}</td>
+      <td>{% if acc %}{{ acc.label }}{% if acc.masked %} <span class="hint">{{ acc.masked }}</span>{% endif %}
+          {% else %}<span class="muted">未指派</span>{% endif %}</td>
+      <td>{% if c.role_id %}
+            {% set r = (role_list | selectattr('id', 'equalto', c.role_id) | list | first) %}
+            {{ r.name if r else '（已删除）' }}
+          {% else %}<span class="muted">不限</span>{% endif %}</td>
+      <td class="muted">
+        {% if c.status.current %}{{ c.status.current.masked or '—' }}
+          {% if c.status.current.role %} / {{ c.status.current.role }}{% endif %}
+        {% else %}未上报{% endif %}
+      </td>
+      <td><a href="/clients?hl={{ c.id }}">去指派 →</a></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+{% endblock %}

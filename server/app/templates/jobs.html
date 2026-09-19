@@ -30,11 +30,23 @@
         </select>
       </label>
       <label class="f">
-        <span class="name">任务范围</span>
-        <input type="text" name="only" placeholder="留空 = 按档位全部；也可填 yanwu 或 yanwu,recruit">
-        <div class="hint">可用：gongpin / shuishou / shijing / yanwu / texing / recruit，或 all</div>
+        <span class="name">执行客户端</span>
+        <select name="client_id">
+          <option value="">任意客户端（谁先领到谁跑）</option>
+          {% for c in clients or [] %}
+            <option value="{{ c.id }}">
+              {{ c.name or c.host or c.uid }}{% if c.online %} · 在线{% else %} · 离线{% endif %}
+            </option>
+          {% endfor %}
+        </select>
+        <div class="hint">选具体某台 = 定向任务，只有那台能领到；不选 = 公共任务，谁先心跳谁领走。</div>
       </label>
     </div>
+    <label class="f">
+      <span class="name">任务范围</span>
+      <input type="text" name="only" placeholder="留空 = 按档位全部；也可填 yanwu 或 yanwu,recruit">
+      <div class="hint">可用：gongpin / shuishou / shijing / yanwu / texing / recruit，或 all</div>
+    </label>
     <label class="f cbrow">
       <input type="checkbox" name="dry_run">
       <span class="name">预演模式（只识别不点击，用来试新改动）</span>
@@ -51,7 +63,7 @@
 <h2>请求列表</h2>
 <table>
   <thead><tr>
-    <th class="num">#</th><th>创建时间</th><th>档位</th><th>范围</th><th>状态</th>
+    <th class="num">#</th><th>创建时间</th><th>执行客户端</th><th>档位</th><th>范围</th><th>状态</th>
     <th>关联运行</th><th>备注</th><th></th>
   </tr></thead>
   <tbody>
@@ -60,6 +72,8 @@
     <tr>
       <td class="num">{{ j.id }}</td>
       <td>{{ j.created_at }}</td>
+      <td>{% if j.client_id %}<span class="pill skip">{{ j.client_name or j.client_host or ('#' ~ j.client_id) }}</span>
+          {% else %}<span class="muted">任意</span>{% endif %}</td>
       <td>{{ j.slot }}{% if j.dry_run %} <span class="pill gray">预演</span>{% endif %}</td>
       <td class="muted">{{ j.only_tasks or '按档位全部' }}</td>
       <td>
@@ -81,14 +95,16 @@
     </tr>
   {% endfor %}
   {% if not jobs %}
-    <tr><td colspan="8" class="muted">还没有任何请求。</td></tr>
+    <tr><td colspan="9" class="muted">还没有任何请求。</td></tr>
   {% endif %}
   </tbody>
 </table>
 
 <p class="hint">
   说明：脚本每次启动会先领走队列里最老的一条 <b>待领取</b> 请求，按它的档位和范围执行；
-  执行完把结果和报告上传后，这条请求会变成「已完成」并链接到那一轮记录。
+  执行完把结果和报告上传后，这条请求会变成「已完成」并链接到那一轮记录。<br>
+  <b>定向 vs 公共：</b>指定了「执行客户端」的任务只有那台机器能领到，适合「这台机器专门跑那个小号」；
+  不指定的就是公共任务，哪台先来心跳哪台领走。
 </p>
 
 {% endblock %}
