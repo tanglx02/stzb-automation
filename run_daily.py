@@ -33,12 +33,14 @@ import io
 import json
 import os
 import sys
+import tempfile
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
 
 from stzb.account import ensure_target, describe_screen
+from stzb.cleanup import cleanup_by_days, parse_cfg as parse_cleanup_cfg, summary_line
 from stzb.cloud import upload_run, load_last_report, CloudClient, CloudError, hostname
 from stzb.config import load                      # noqa: E402
 from stzb.core import DEFAULT_ADB, GAME_PKG, Device   # noqa: E402
@@ -475,6 +477,44 @@ def cmd_upload_last(cfg, offline: bool = False) -> int:
     return 0
 
 
+def _do_cleanup(cfg, log, *, skip: bool = False, force: bool = False) -> dict:
+    """按配置清理过期日志/截图。**任何异常都不抛**，绝不影响任务本身。
+
+    · skip  —— `--no-cleanup`：本轮不清理
+    · force —— `--cleanup-only`：无视 `logging.cleanup_enabled` 开关强制执行
+
+    为什么放在「写报告之后」：报告是自包含 HTML（截图已 base64 内嵌），
+    先写报告再删源图，绝不可能把刚跑完这轮的证据删掉。
+    """
+    if skip:
+        log("· 按 --no-cleanup 跳过清理（%s）" % summary_line(ROOT))
+        return {}
+    enabled = True
+    try:
+        enabled = bool(cfg.get("logging.cleanup_enabled", True))
+    except Exception:
+        enabled = True
+    if not (enabled or force):
+        log("· 配置里关闭了自动清理（logging.cleanup_enabled=false），跳过")
+        return {}
+    try:
+        p = parse_cleanup_cfg(cfg, ROOT)
+        keep = p["keep_days"]
+        log("· 清理策略：报告/日志保留 %s 天，截图保留 %s 天，截图上限 %s MB"
+            % (keep if keep > 0 else "不限",
+               (p["shots_keep_days"] if p["shots_keep_days"] is not None
+                else (keep if keep > 0 else "不限")),
+               p["shots_max_mb"] if p["shots_max_mb"] > 0 else "不限"))
+        return cleanup_by_days(ROOT, keep_days=keep,
+                               shots_keep_days=p["shots_keep_days"],
+                               shots_max_mb=p["shots_max_mb"],
+                               log_keep_days=p["log_keep_days"],
+                               diag=p["diag"], logger=log)
+    except Exception as e:
+        log("  ! 清理过程异常：%r（不影响本轮结果）" % (e,))
+        return {}
+
+
 def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason="",
                identity=None):
     """上传结果 + 给待执行任务回执。**任何失败都不抛异常**，也不影响本机报告。
@@ -524,6 +564,10 @@ def main():
     ap.add_argument("--no-emulator", action="store_true", help="不动模拟器（自己已开好）")
     ap.add_argument("--open-report", action="store_true", help="跑完自动打开报告")
     ap.add_argument("--no-upload", action="store_true", help="本轮不上传到后端")
+    ap.add_argument("--no-cleanup", action="store_true",
+                    help="本轮跑完不清理过期日志/截图（默认会按配置自动清理）")
+    ap.add_argument("--cleanup-only", action="store_true",
+                    help="只做一次清理然后退出，不跑任务")
     ap.add_argument("--no-remote-config", action="store_true", help="不从后端拉配置，只用本地")
     ap.add_argument("--no-switch", action="store_true",
                     help="不做账号/角色切换，用当前已经在线的账号直接跑")
@@ -541,14 +585,29 @@ def main():
             print("  %-10s %-28s 档位=%s" % (k, m["name"], ",".join(m["at"])))
         return 0
 
-    os.makedirs(SHOT_DIR, exist_ok=True)
     os.makedirs(LOG_DIR, exist_ok=True)
     os.makedirs(REPORT_DIR, exist_ok=True)
     cfg = load()
     _apply_cloud_env(cfg)          # 允许用环境变量覆盖后端地址/令牌（敏感值不必落盘）
 
+    # 截图存哪儿：`logging.save_screens=false` 时改存系统临时目录 ——
+    # 报告仍照常内嵌（它读的是内存里的图），但不再往 logs/shots 里堆。
+    # 这样「不想留源图」的人也有得选，而不用为此关掉整个截图能力。
+    shot_dir = SHOT_DIR
+    if not bool(cfg.get("logging.save_screens", True)):
+        shot_dir = os.path.join(tempfile.gettempdir(), "stzb_shots_tmp")
+        print("· 配置 logging.save_screens=false：截图只存临时目录（%s），报告不受影响"
+              % shot_dir)
+    os.makedirs(shot_dir, exist_ok=True)
+
     if args.status:
         return cmd_status(cfg, offline=args.offline)
+
+    if args.cleanup_only:
+        print("清理前：%s" % summary_line(ROOT))
+        _do_cleanup(cfg, print, force=True)
+        print("清理后：%s" % summary_line(ROOT))
+        return 0
 
     if args.whoami:
         ident = Identity.load(CLIENT_STATE)
@@ -622,7 +681,7 @@ def main():
         hb_session.bind_ui_factory(lambda: Ui(
             Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
                    serial_candidates=cfg.get("device.serial_candidates"),
-                   shot_dir=SHOT_DIR),
+                   shot_dir=shot_dir),
             cfg, logger=log, dry_run=True))
         try:
             hb_session.start()
@@ -696,7 +755,7 @@ def main():
         return 2
 
     # ---------------------------------------------------------------- 报告 + 环境
-    report = RunReport(ROOT, SHOT_DIR, slot=slot, dry_run=dry_run, logger=log)
+    report = RunReport(ROOT, shot_dir, slot=slot, dry_run=dry_run, logger=log)
     rlog = Tee(log, report.note)          # 启动阶段的日志同时进报告
     emu_cfg = cfg.get("emulator", {}) or {}
     pkg = cfg.get("device.package") or GAME_PKG
@@ -735,6 +794,7 @@ def main():
         report.env_info(结果=reason)
         p = report.write_all(REPORT_DIR, cfg.get("logging.keep_days", 14))
         rlog("· 报告：%s" % p["html"])
+        _do_cleanup(cfg, rlog, skip=args.no_cleanup)
         _do_upload(cfg, report, p, client, job, rlog,
                    disabled=(args.no_upload or not managed), reason=upload_skip_reason,
                    identity=identity)
@@ -765,7 +825,7 @@ def main():
     # ---------------------------------------------------------------- 2. ADB
     dev = Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
                  serial_candidates=cfg.get("device.serial_candidates"),
-                 shot_dir=SHOT_DIR)
+                 shot_dir=shot_dir)
     if not dev.connect(retries=6, wait=2.0):
         return _bail(3, "ADB 连接失败")
     rlog("· ADB 已连接：%s" % dev.serial)
@@ -854,7 +914,7 @@ def main():
     log("-" * 70)
     for k, v in res.items():
         log("  %-10s %s" % (k, "OK" if v else "失败/跳过"))
-    log("耗时 %.1f 秒；截图存于 %s" % (time.time() - started, SHOT_DIR))
+    log("耗时 %.1f 秒；源截图存于 %s" % (time.time() - started, shot_dir))
     if hb_session:
         hb_session.box.set(state="idle", busy=False,
                            note="%s 档跑完，成功 %d / 共 %d"
@@ -870,6 +930,12 @@ def main():
         log("  " + line)
     log("报告（含截图）：%s" % paths["html"])
     log("结构化结果：%s" % paths["latest_json"])
+
+    # ------------------------------------------------------- 5.5 清理过期文件
+    # 放在写报告之后：报告已把本轮截图内嵌进去，再删源图不会丢证据。
+    report.env_info(磁盘占用=summary_line(ROOT))
+    _do_cleanup(cfg, log, skip=args.no_cleanup)
+    log("· 清理后占用：%s" % summary_line(ROOT))
 
     # ---------------------------------------------------------------- 6. 收尾
     if not args.no_emulator:

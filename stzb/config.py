@@ -63,7 +63,15 @@ DEFAULTS: Dict[str, Any] = {
         "max_total_seconds": 900,
         "tap_delay": 0.7,
     },
-    "logging": {"keep_days": 14, "save_screens": True},
+    "logging": {
+        "save_screens": True,     # 是否保存每一步的截图
+        "cleanup_enabled": True,  # 总开关：跑完是否自动清理过期文件
+        "keep_days": 14,          # 报告与文本日志保留天数（0 = 不清理）
+        "shots_keep_days": -1,    # 截图保留天数；-1 = 跟随 keep_days
+        "shots_max_mb": 3000,     # 截图目录体积上限（MB），0 = 不限
+        "log_keep_days": -1,      # 文本日志保留天数；-1 = 跟随 keep_days
+        "cleanup_diag": True,     # 是否顺带清理 diag/ 里的过期图片
+    },
 }
 
 

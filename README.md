@@ -262,7 +262,7 @@ stzb-automation/
 ├─ tools\
 │   ├─ config.py       本机配置工具（交互菜单 + 命令行）
 │   ├─ emu.py          手动开关模拟器
-│   ├─ selftest.py     离线自检（359 项断言）
+│   ├─ selftest.py     离线自检（394 项断言）
 │   ├─ probe_switch*.py 账号/角色切换界面的侦察脚本
 │   └─ ...             侦察 / 排查小工具
 │
@@ -310,7 +310,7 @@ venv\Scripts\python.exe run_daily.py --only all --force   rem 真机全量
 
 自检（`tools\selftest.py`）覆盖：OCR 误认修正、界面判定互斥、颜色/几何判据、安全黑名单、
 模拟器状态解析、报告生成、后端配置下发边界、bat 启动器卫生、冷启动标题页识别、
-前台包名把关（dumpsys mCurrentFocus）等 359 项。
+前台包名把关（dumpsys mCurrentFocus）等 394 项。
 
 这个项目的真 bug 一半是自检/联调抓的、一半是真机抓的，**几条腿缺一不可**。
 

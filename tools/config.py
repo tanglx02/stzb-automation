@@ -53,6 +53,32 @@ REMOTE_STATE = os.path.join(STATE_DIR, "remote_config.json")
 BACKUP_DIR = os.path.join(STATE_DIR, "config_backup")
 KEEP_BACKUPS = 10
 
+
+def project_root() -> str:
+    """当前配置所属的项目根目录 = config.json 所在的目录。
+
+    ⚠️ **清理逻辑必须用这个，不能用模块级 ROOT。**
+    原因（2026-09-19 真踩过，代价是 471 张截图）：测试会把 `CONFIG_PATH`
+    指向临时目录来隔离，如果清理还盯着模块级 `ROOT`（永远指向真实项目根），
+    测试里一次「立即清理」就会**删到真实的 logs/**。改成跟着 CONFIG_PATH 走之后，
+    CONFIG_PATH 被指到哪儿，清理就只作用于那儿的 logs/，测试天然安全。
+    """
+    return os.path.dirname(os.path.abspath(CONFIG_PATH)) or ROOT
+
+
+# 真实项目根（模块加载时定死，不随 CONFIG_PATH 变化）
+_REAL_ROOT = ROOT
+
+
+def in_sandboxed_root() -> bool:
+    """当前 CONFIG_PATH 是否被指到了真实项目根**以外**的地方（测试/演练环境）。
+
+    用途：清理是**破坏性操作**，绝不能在「测试把 CONFIG_PATH 指到临时目录、
+    但某个代码路径又拿着真实 ROOT 去清」这种错配下执行。
+    2026-09-19 就是这么删掉 471 张截图的。
+    """
+    return os.path.abspath(project_root()) != os.path.abspath(_REAL_ROOT)
+
 LINE = "=" * 66
 THIN = "-" * 66
 
@@ -189,10 +215,21 @@ GROUPS: List[Tuple[str, str, List[Field]]] = [
         Field("safety.tap_delay", "每次点击后的等待（秒）", "float", lo=0, hi=5),
     ]),
 
-    ("logging", "日志与报告", [
+    ("logging", "日志与报告（自动清理，防磁盘堆积）", [
         Field("logging.save_screens", "保存每一步的截图", "bool",
               "关掉能省磁盘，但出问题时没法从截图倒查，建议保持开启"),
-        Field("logging.keep_days", "本机报告保留天数", "int", "0 = 不清理", lo=0, hi=365),
+        Field("logging.cleanup_enabled", "跑完自动清理过期文件", "bool",
+              "每次跑完任务后自动清理。关掉则永久累积（截图单张 2~4MB，很容易堆到几 GB）"),
+        Field("logging.keep_days", "报告与文本日志保留天数", "int",
+              "0 = 不清理。报告是自包含 HTML（截图已内嵌，删源图不影响看报告）", lo=0, hi=365),
+        Field("logging.shots_keep_days", "截图保留天数（-1 = 跟随上面）", "int",
+              "截图最占空间，可以设得比报告短。填 -1 表示跟「报告保留天数」一样", lo=-1, hi=365),
+        Field("logging.shots_max_mb", "截图目录体积上限（MB）", "int",
+              "兜底阀：超过就按最老优先删。0 = 不限。当天拍的截图永远不动", lo=0, hi=200000),
+        Field("logging.log_keep_days", "文本日志保留天数（-1 = 跟随）", "int",
+              "logs/run_日期.log。填 -1 表示跟「报告保留天数」一样", lo=-1, hi=365),
+        Field("logging.cleanup_diag", "顺带清理 diag 里的过期图片", "bool",
+              "只删图片；侦察脚本(.py)和子目录永远不会被碰"),
     ]),
 ]
 
@@ -727,6 +764,50 @@ def cmd_verify(args) -> int:
     return 1
 
 
+def cmd_disk(args) -> int:
+    """看磁盘占用；`--clean` 按当前策略清理一次；`--dry-run` 只预览不删。"""
+    from stzb import cleanup as cl
+
+    root = project_root()          # ★ 跟着 CONFIG_PATH 走，别用模块级 ROOT
+    logs = os.path.join(root, "logs")
+    p = cl.parse_cfg(effective(), root)
+
+    if args.clean or args.dry_run:
+        dry = bool(args.dry_run) and not args.clean
+        print("%s：%s" % ("预览（不会真删）" if dry else "清理前", cl.summary_line(root)))
+        res = cl.cleanup_by_days(root, keep_days=p["keep_days"],
+                                 shots_keep_days=p["shots_keep_days"],
+                                 shots_max_mb=p["shots_max_mb"],
+                                 log_keep_days=p["log_keep_days"],
+                                 diag=p["diag"], logger=print, dry_run=dry)
+        print("%s %d 个文件，%s %s"
+              % ("将会删除" if dry else "共删除", res["deleted"],
+                 "预计释放" if dry else "释放", res["freed_human"]))
+        if dry:
+            print("确认无误后执行：%s disk --clean" % os.path.basename(__file__))
+        else:
+            print("清理后：%s" % cl.summary_line(root))
+        return 0
+
+    total = 0
+    for name, folder, exts in (("截图", os.path.join(logs, "shots"), cl.IMG_EXT),
+                               ("报告", os.path.join(logs, "reports"), None),
+                               ("文本日志", logs, (".log",)),
+                               ("诊断图片", os.path.join(logs, "diag"), cl.DIAG_EXT)):
+        st = cl.usage(folder, exts)
+        total += st["bytes"]
+        print("  %-6s %5d 个 / %s" % (name, st["count"], st["human"]))
+    print("  %-6s ——— %s" % ("合计", cl._human(total)))
+    print()
+    print("  策略：报告/日志保留 %s 天；截图保留 %s 天；截图上限 %s"
+          % (p["keep_days"] if p["keep_days"] > 0 else "不限",
+             p["shots_keep_days"] if p["shots_keep_days"] is not None else "跟随",
+             "%d MB" % p["shots_max_mb"] if p["shots_max_mb"] > 0 else "不限"))
+    print("  先看会删什么：%s disk --dry-run" % os.path.basename(__file__))
+    print("  确认后执行　：%s disk --clean" % os.path.basename(__file__))
+    return 0
+
+
 def cmd_backup(args) -> int:
     p = backup()
     if not p:
@@ -934,12 +1015,18 @@ def menu_main() -> int:
             print("  " + note.replace("\n", "\n  "))
         print()
         print("  1) 后端托管        绑定 / 验证 / 解绑（不做就默认独立运行）")
-        for i, (sec, title, _) in enumerate(GROUPS, start=2):
-            if sec == "cloud":
-                continue
+        # 编号必须连续：cloud 段不单独列菜单，所以「段菜单」的编号要按
+        # **实际列出的段数**排，不能按 GROUPS 总长算 —— 否则段菜单和后面的
+        # 「查看全部配置」会撞号（实测撞过：两者都是 12）。
+        secs = [g for g in GROUPS if g[0] != "cloud"]
+        n_view = len(secs) + 2          # 查看全部配置
+        n_disk = len(secs) + 3          # 磁盘占用与清理
+        n_bak = len(secs) + 4           # 备份与恢复
+        for i, (sec, title, _) in enumerate(secs, start=2):
             print("  %2d) %s" % (i, title))
-        print("  %2d) 查看全部配置（标注来源与是否被服务端接管）" % (len(GROUPS) + 1))
-        print("  %2d) 备份与恢复" % (len(GROUPS) + 2))
+        print("  %2d) 查看全部配置（标注来源与是否被服务端接管）" % n_view)
+        print("  %2d) 磁盘占用与清理（看体积 / 立即清）" % n_disk)
+        print("  %2d) 备份与恢复" % n_bak)
         print("   0) 退出")
         c = ask("选择")
         if c is None or c == "0":
@@ -950,14 +1037,13 @@ def menu_main() -> int:
         if c == "1":
             menu_backend()
             continue
-        secs = [g for g in GROUPS if g[0] != "cloud"]
         if c.isdigit():
             n = int(c)
             if 2 <= n < 2 + len(secs):
                 sec, title, fields = secs[n - 2]
                 menu_group(sec, title, fields)
                 continue
-            if n == len(GROUPS) + 1:
+            if n == n_view:
                 print()
                 for gsec, gtitle, gfields in GROUPS:
                     print("%s" % gtitle)
@@ -969,10 +1055,108 @@ def menu_main() -> int:
                     print()
                 input("  按回车继续…")
                 continue
-            if n == len(GROUPS) + 2:
+            if n == n_disk:
+                menu_storage()
+                continue
+            if n == n_bak:
                 menu_backup()
                 continue
         print("  ! 没有这个编号")
+
+
+def menu_storage() -> None:
+    """磁盘占用与清理。直接调 stzb/cleanup.py，和脚本跑完用的是同一套逻辑。
+
+    ⚠️ **一切路径都从 `project_root()` 派生**（= config.json 所在目录），
+    绝不能用模块级 `ROOT`。这条是血的教训：测试把 CONFIG_PATH 指到临时目录做隔离，
+    但清理如果还盯着真实 ROOT，一次「立即清理」就会删到真实 logs/
+    （2026-09-19 真删掉 471 张 09-18 截图）。
+    """
+    from stzb import cleanup as cl
+
+    while True:
+        root = project_root()               # ★ 关键：每次循环重新取，跟随 CONFIG_PATH
+        logs = os.path.join(root, "logs")
+        print()
+        print(LINE)
+        print("  磁盘占用与清理")
+        print(LINE)
+        print("  影响目录：%s" % logs)
+        areas = [
+            ("截图", os.path.join(logs, "shots"), cl.IMG_EXT),
+            ("报告", os.path.join(logs, "reports"), None),
+            ("文本日志", logs, (".log",)),
+            ("诊断图片", os.path.join(logs, "diag"), cl.DIAG_EXT),
+        ]
+        total = 0
+        for name, folder, exts in areas:
+            st = cl.usage(folder, exts)
+            total += st["bytes"]
+            print("  %-8s %-44s %5d 个 / %s"
+                  % (name, folder.replace(root, "."), st["count"], st["human"]))
+        print(THIN)
+        print("  合计：%s" % cl._human(total))
+        print()
+        p = cl.parse_cfg(effective(), root)
+        shot_days = p["shots_keep_days"]
+        if shot_days is None:
+            shot_days = p["keep_days"]
+        print("  当前策略：报告/日志保留 %s 天；截图保留 %s 天；截图上限 %s"
+              % (p["keep_days"] if p["keep_days"] > 0 else "不限",
+                 shot_days if shot_days and shot_days > 0 else "不限",
+                 "%d MB" % p["shots_max_mb"] if p["shots_max_mb"] > 0 else "不限"))
+        print("  （改策略：返回主菜单 → 日志与报告）")
+        print()
+        print("  1) 立即清理（按上面的策略）")
+        print("  2) 清空全部截图（保留当天）")
+        print("  3) 清空全部截图（含当天）")
+        print("  0) 返回")
+        c = ask("选择")
+        if c is None or c == "0":
+            return
+        if c == "1":
+            # 破坏性操作：先把「将影响哪个目录、要删多少」摆出来，让人看清再按回车。
+            # 之前这里直接开删，测试一不小心就清了真实目录（471 张截图）。
+            pv = cl.cleanup_by_days(root, keep_days=p["keep_days"],
+                                    shots_keep_days=p["shots_keep_days"],
+                                    shots_max_mb=p["shots_max_mb"],
+                                    log_keep_days=p["log_keep_days"],
+                                    diag=p["diag"], logger=lambda m: None,
+                                    dry_run=True)
+            print()
+            print("  将影响：%s" % logs)
+            print("  按当前策略会删除 %d 个文件，预计释放 %s"
+                  % (pv["deleted"], pv["freed_human"]))
+            if pv["deleted"] == 0:
+                print("  （没有需要清理的）")
+                input("  按回车继续…")
+                continue
+            if ask("  确认执行请输入 yes") != "yes":
+                print("  已取消。")
+                continue
+            res = cl.cleanup_by_days(root, keep_days=p["keep_days"],
+                                     shots_keep_days=p["shots_keep_days"],
+                                     shots_max_mb=p["shots_max_mb"],
+                                     log_keep_days=p["log_keep_days"],
+                                     diag=p["diag"], logger=print)
+            print("  共删除 %d 个文件，释放 %s" % (res["deleted"], res["freed_human"]))
+            input("  按回车继续…")
+        elif c in ("2", "3"):
+            keep_today = (c == "2")
+            print()
+            print("  ⚠️  这会删除 %s 下的截图，删了不可恢复（报告里内嵌的不受影响）。"
+                  % os.path.join(logs, "shots"))
+            if not keep_today:
+                print("  ⚠️  含「当天」的截图！刚跑的这轮源图也会没。")
+            if ask("  确定请输入 yes") != "yes":
+                print("  已取消。")
+                continue
+            # max_mb 极小 = 「压到几乎为 0」；protect_today 决定当天是否豁免
+            res = cl._prune_folder(os.path.join(logs, "shots"), exts=cl.IMG_EXT,
+                                   prefix=None, keep_days=0, max_mb=0.000001,
+                                   protect_today_for_size=keep_today, label="截图")
+            print("  已删除 %d 个，释放 %s" % (res["deleted"], res["freed_human"]))
+            input("  按回车继续…")
 
 
 def menu_backup() -> None:
@@ -1090,6 +1274,11 @@ def main() -> int:
     p.add_argument("--token", default="")
     p.add_argument("--timeout", type=int, default=20)
     p.set_defaults(fn=cmd_verify)
+
+    p = sub.add_parser("disk", help="看日志/截图占用；--clean 清理；--dry-run 只预览")
+    p.add_argument("--clean", action="store_true", help="按当前策略真正清理")
+    p.add_argument("--dry-run", action="store_true", help="只算会删多少，不真删")
+    p.set_defaults(fn=cmd_disk)
 
     p = sub.add_parser("backup", help="备份 config.json")
     p.set_defaults(fn=cmd_backup)

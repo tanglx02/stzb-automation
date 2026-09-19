@@ -7,11 +7,15 @@
   · `device`   —— adb 路径、要连的端口。改错了脚本直接连不上模拟器
   · `emulator` —— MuMuManager 路径、虚拟机索引
   · `cloud`    —— 后端地址和 token（服务端把自己的凭据下发给自己，荒谬且危险）
-  · `logging`  —— 本地磁盘保留策略
   · `account`  —— 账号/角色切换开关。后端能「指派切到哪个账号」（那是数据，不是配置），
                   但**不能把切换功能本身关掉** —— 否则服务端被误改后，
                   客户端会停在别人的账号上跑任务，而本机毫无察觉。
                   开关的本机控制权不给服务端。
+
+`logging`（日志/截图的保留与清理策略）**允许下发** —— 它是「运维策略」，
+服务端统一调配很合理；改错了最多是磁盘占用不合预期，**不会让脚本跑不起来**
+（对比 device/emulator 改错就直接连不上模拟器）。本机 config.json 仍是底，
+远端只做覆盖，所以本地配置工具照常可用。
 
 所以服务端只允许下发下面这些「业务开关」，其余键一律过滤掉。
 脚本侧 `stzb/remote_config.py` 有一份**内容相同**的白名单做二次过滤 ——
@@ -31,6 +35,9 @@ MANAGED_SECTIONS: Dict[str, Any] = {
     "yanwu": None,
     "gongpin": None,
     "safety": None,
+    # 日志/截图保留与清理策略：服务端可统一调配（属运维策略，改错不影响能否跑起来）
+    "logging": ("keep_days", "shots_keep_days", "shots_max_mb",
+                "log_keep_days", "cleanup_diag", "cleanup_enabled", "save_screens"),
 }
 
 # 明确禁止下发（即使上面写成 None 也拦掉）
@@ -101,6 +108,15 @@ DEFAULT_MANAGED_CONFIG: Dict[str, Any] = {
         "max_total_seconds": 900,
         "tap_delay": 0.7,
     },
+    "logging": {
+        "save_screens": True,
+        "cleanup_enabled": True,
+        "keep_days": 14,
+        "shots_keep_days": -1,
+        "shots_max_mb": 3000,
+        "log_keep_days": -1,
+        "cleanup_diag": True,
+    },
 }
 
 # 任务清单（用于界面展示中文名与适用档位）。与脚本侧 stzb/tasks.py 的 TASKS 对应。
@@ -147,10 +163,17 @@ FIELD_LABELS = {
     "safety.max_task_seconds": "单个任务超时上限（秒）",
     "safety.max_total_seconds": "一轮总超时上限（秒）",
     "safety.tap_delay": "每次点击后的等待（秒）",
+    "logging.save_screens": "保存每一步的截图",
+    "logging.cleanup_enabled": "跑完自动清理过期文件",
+    "logging.keep_days": "报告与文本日志保留天数（0 = 不清理）",
+    "logging.shots_keep_days": "截图保留天数（-1 = 跟随报告天数）",
+    "logging.shots_max_mb": "截图目录体积上限 MB（0 = 不限）",
+    "logging.log_keep_days": "文本日志保留天数（-1 = 跟随报告天数）",
+    "logging.cleanup_diag": "顺带清理 diag 里的过期图片（只删图片）",
 }
 
 # 绝对不能由服务端下发的段（脚本侧也再拦一遍）。仅用于界面提示。
-LOCAL_ONLY_SECTIONS = ["device", "emulator", "cloud", "logging", "account"]
+LOCAL_ONLY_SECTIONS = ["device", "emulator", "cloud", "account"]
 
 SECTION_LABEL = {
     "tasks": "总开关（哪些任务要跑）",
@@ -161,6 +184,7 @@ SECTION_LABEL = {
     "yanwu": "演武",
     "gongpin": "贡品礼包",
     "safety": "安全阀",
+    "logging": "日志与磁盘（保留天数 / 自动清理）",
 }
 
 

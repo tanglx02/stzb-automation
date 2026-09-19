@@ -106,7 +106,12 @@
     "tap_delay": 0.7
   },
   "logging": {
+    "save_screens": true,
+    "cleanup_enabled": true,
     "keep_days": 14,
-    "save_screens": true
+    "shots_keep_days": -1,
+    "shots_max_mb": 3000,
+    "log_keep_days": -1,
+    "cleanup_diag": true
   }
 }

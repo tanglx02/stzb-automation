@@ -995,14 +995,20 @@ def test_remote_config():
         "device": {"adb": r"D:\evil\adb.exe", "serial_candidates": ["1.2.3.4:1"]},
         "emulator": {"manager": r"D:\evil\MuMuManager.exe", "vmindex": 7},
         "cloud": {"base_url": "https://attacker.example", "token": "stolen"},
-        "logging": {"keep_days": 0},
+        # logging 现在**允许**下发（运维策略：保留天数/自动清理），
+        # 但只放行白名单内的键 —— 段里的其它键必须被切掉。
+        "logging": {"keep_days": 7, "shots_keep_days": 3, "shots_max_mb": 1500,
+                    "adb_path": r"D:\evil\adb.exe"},
     }
     f = filter_payload(payload)
-    check("只留下白名单段（tasks）", set(f.keys()) == {"tasks"}, str(sorted(f.keys())))
+    check("只留下白名单段（tasks + logging）",
+          set(f.keys()) == {"tasks", "logging"}, str(sorted(f.keys())))
     check("device 段被拦掉", "device" not in f)
     check("emulator 段被拦掉", "emulator" not in f)
     check("cloud 段被拦掉（后端不能给自己下发凭据）", "cloud" not in f)
-    check("logging 段被拦掉", "logging" not in f)
+    check("logging 段可下发（保留策略属运维，服务端可统一调配）", "logging" in f)
+    check("logging 白名单内的键传过来了", f["logging"]["keep_days"] == 7)
+    check("logging 段里白名单外的键被切掉", "adb_path" not in f["logging"])
     check("白名单内的值原样保留", f["tasks"]["yanwu"] is False)
 
     # 深合并：本地多出来的键（注释、本机段）不能被抹掉
@@ -1592,11 +1598,27 @@ def test_config_tool():
         check("后端子菜单能进能出（选解绑时提示本来就是独立运行）",
               "独立运行" in out and "本来就是独立运行" in out, out[-200:])
 
-        # 「查看全部配置」与「备份与恢复」两个菜单项可达
-        out = run_menu(cfg2, "12\n\n13\n1\n\n0\n0\n", os.path.join(tmp2, "bak"))
+        # 「查看全部配置」「磁盘占用与清理」「备份与恢复」三个菜单项都要可达。
+        # 编号按「实际列出的段数」算，加菜单项时这里的数字要跟着变。
+        out = run_menu(cfg2, "12\n\n13\n0\n14\n1\n\n0\n0\n", os.path.join(tmp2, "bak"))
         check("菜单项「查看全部配置」可达", "cloud.enabled" in out)
+        check("菜单项「磁盘占用与清理」可达", "磁盘占用与清理" in out and "截图" in out)
         check("菜单项「备份与恢复」可达并真的备份了",
               "已备份到" in out and len(os.listdir(os.path.join(tmp2, "bak"))) >= 1)
+        # 编号不能撞：截取**一次**菜单渲染（从「本机配置工具」到「0) 退出」）再数编号，
+        # 否则多轮菜单的输出会叠加进来，怎么数都是重复的。
+        import re as _re
+        blocks = _re.findall(r"本机配置工具(.*?0\) 退出)", out, _re.S)
+        nums = _re.findall(r"^\s+(\d+)\) ", blocks[0], _re.M) if blocks else []
+        dup = {x for x in nums if nums.count(x) > 1}
+        check("菜单编号无重复（cloud 段跳过时容易撞号）",
+              bool(nums) and not dup,
+              "共 %d 个编号: %s%s" % (len(nums), sorted(nums, key=int),
+                                    ("  重复: %s" % sorted(dup)) if dup else ""))
+        # 编号含 0（退出）在内应当是「0..N 连续无缺口」
+        got = sorted(int(x) for x in nums)
+        check("菜单编号连续无缺口（0..%d）" % (len(got) - 1),
+              got == list(range(len(got))), str(got))
 
         # 输入 q 能安全退出（不该崩）
         out = run_menu(cfg2, "q\n", os.path.join(tmp2, "bak"))
@@ -1605,6 +1627,25 @@ def test_config_tool():
         # 输入越界编号不崩
         out = run_menu(cfg2, "99\n0\n", os.path.join(tmp2, "bak"))
         check("输入不存在的编号只是提示，不崩", "没有这个编号" in out)
+
+        # ---- 6.5) ★ 隔离铁律：清理菜单绝不能作用于真实项目根 ----
+        # 2026-09-19 血的教训：磁盘清理菜单原先用模块级 ROOT，测试把 CONFIG_PATH
+        # 指到临时目录后仍去清真实 logs/，一次「立即清理」真删掉 471 张截图。
+        # 现在清理路径全部从 project_root()（= CONFIG_PATH 所在目录）派生，
+        # 这两条断言把「隔离」钉死，防止以后有人改回 ROOT。
+        saved_cfg3 = tool.CONFIG_PATH
+        try:
+            tool.CONFIG_PATH = os.path.join(tmp2, "config.json")
+            real_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            check("隔离：project_root() 跟随 CONFIG_PATH，不是真实项目根",
+                  tool.project_root() == tmp2,
+                  "得到 %s" % tool.project_root())
+            check("隔离：清理目标目录不在真实项目根下",
+                  not os.path.abspath(os.path.join(tool.project_root(), "logs"))
+                  .startswith(os.path.abspath(real_root) + os.sep),
+                  tool.project_root())
+        finally:
+            tool.CONFIG_PATH = saved_cfg3
     finally:
         tool.CONFIG_PATH, tool.BACKUP_DIR, tool.REMOTE_STATE = real_cfg2, real_bak2, real_state2
         cfgmod.CONFIG_PATH = saved2
@@ -1933,6 +1974,137 @@ def test_foreground_guard():
           u2.game_foreground(ttl=0.0) is True)
 
 
+def test_cleanup():
+    """日志/截图清理：只删自己的、当天不动、按体积兜底、不碰目录与符号链接。
+
+    这一组是**保护性断言** —— 清理逻辑写错就是删用户文件，比别的 bug 严重得多，
+    所以每条「不该删」都要有断言钉住。
+    """
+    import tempfile
+    import time as _t
+    from stzb import cleanup as cl
+
+    print("\n[26] 日志/截图清理（保留天数 + 体积上限 + 保护规则）")
+
+    root = tempfile.mkdtemp(prefix="stzb_clt_")
+    logs = os.path.join(root, "logs")
+    shots = os.path.join(logs, "shots")
+    reports = os.path.join(logs, "reports")
+    diag = os.path.join(logs, "diag")
+    for d in (shots, reports, diag):
+        os.makedirs(d, exist_ok=True)
+
+    def mk(folder, name, days_old, size=100):
+        p = os.path.join(folder, name)
+        with open(p, "wb") as f:
+            f.write(b"x" * size)
+        t = _t.time() - days_old * 86400
+        os.utime(p, (t, t))
+        return p
+
+    # ---- ① 按天数清理：老的走、新的留 ----
+    mk(shots, "old_001.png", 30)
+    mk(shots, "old_002.png", 20)
+    mk(shots, "new_003.png", 1)
+    mk(shots, "today_004.png", 0)
+    mk(shots, "_probe_keep.png", 99)          # 下划线开头 = 侦察对比图
+    mk(reports, "run_old.html", 30)
+    mk(reports, "run_new.html", 1)
+    mk(reports, "latest.html", 99)            # 快捷入口
+    mk(reports, "latest.json", 99)
+    mk(logs, "run_2020-01-01.log", 30)
+    mk(logs, "console.log", 99)               # 实时的控制台日志
+    mk(diag, "band_a.png", 30)
+    mk(diag, "eval_home.py", 30)              # 侦察脚本
+    os.makedirs(os.path.join(diag, "sub"), exist_ok=True)
+    mk(os.path.join(diag, "sub"), "deep.png", 30)
+
+    res = cl.cleanup_by_days(root, keep_days=14, shots_max_mb=0,
+                             logger=lambda m: None)
+
+    check("过期截图被删", not os.path.exists(os.path.join(shots, "old_001.png")))
+    check("较老的截图也被删", not os.path.exists(os.path.join(shots, "old_002.png")))
+    check("未过期的截图保留", os.path.exists(os.path.join(shots, "new_003.png")))
+    check("当天截图保留", os.path.exists(os.path.join(shots, "today_004.png")))
+    check("下划线开头的侦察图不删",
+          os.path.exists(os.path.join(shots, "_probe_keep.png")))
+    check("过期报告被删", not os.path.exists(os.path.join(reports, "run_old.html")))
+    check("未过期报告保留", os.path.exists(os.path.join(reports, "run_new.html")))
+    check("latest.html 永不删", os.path.exists(os.path.join(reports, "latest.html")))
+    check("latest.json 永不删", os.path.exists(os.path.join(reports, "latest.json")))
+    check("过期文本日志被删",
+          not os.path.exists(os.path.join(logs, "run_2020-01-01.log")))
+    check("console.log 永不删", os.path.exists(os.path.join(logs, "console.log")))
+    check("diag 里的过期图片被删", not os.path.exists(os.path.join(diag, "band_a.png")))
+    check("diag 里的 .py 绝不动", os.path.exists(os.path.join(diag, "eval_home.py")))
+    check("diag 子目录绝不动", os.path.isdir(os.path.join(diag, "sub")))
+    check("子目录里的文件不递归删",
+          os.path.exists(os.path.join(diag, "sub", "deep.png")))
+    check("删掉的都是自己的文件（新文件一个没少）",
+          len([n for n in os.listdir(shots) if n.endswith(".png")]) == 3)
+    check("释放字节数 > 0", res["freed"] > 0)
+
+    # ---- ② 体积上限：从最老开始删，当天豁免 ----
+    root2 = tempfile.mkdtemp(prefix="stzb_clt2_")
+    shots2 = os.path.join(root2, "logs", "shots")
+    os.makedirs(shots2, exist_ok=True)
+    for name, days in (("a_old.png", 3), ("b_old.png", 2), ("c_old.png", 1),
+                       ("today.png", 0)):
+        p = os.path.join(shots2, name)
+        with open(p, "wb") as f:
+            f.write(b"x" * 1048576)           # 每个 1MB
+        t = _t.time() - days * 86400
+        os.utime(p, (t, t))
+    cl.cleanup_by_days(root2, keep_days=0, shots_keep_days=0,
+                       shots_max_mb=2, diag=False, logger=lambda m: None)
+    left = set(os.listdir(shots2))
+    check("体积超限时从最老的开始删", "a_old.png" not in left, str(sorted(left)))
+    check("体积降到上限以内", cl.usage(shots2, cl.IMG_EXT)["bytes"] <= 2 * 1048576)
+    check("★ 当天文件在体积清理中也被保住", "today.png" in left)
+
+    # ---- ③ keep_days=0 且不限体积 = 什么都不删 ----
+    root3 = tempfile.mkdtemp(prefix="stzb_clt3_")
+    shots3 = os.path.join(root3, "logs", "shots")
+    os.makedirs(shots3, exist_ok=True)
+    mk(shots3, "very_old.png", 300)
+    cl.cleanup_by_days(root3, keep_days=0, shots_keep_days=0,
+                       shots_max_mb=0, diag=False, logger=lambda m: None)
+    check("keep_days=0 且不限体积 → 再老也不删",
+          os.path.exists(os.path.join(shots3, "very_old.png")))
+
+    # ---- ④ 幂等：连跑两次结果一致（不该越删越多） ----
+    r1 = cl.cleanup_by_days(root, keep_days=14, shots_max_mb=0,
+                            logger=lambda m: None)
+    r2 = cl.cleanup_by_days(root, keep_days=14, shots_max_mb=0,
+                            logger=lambda m: None)
+    check("重复清理是幂等的（第二次删 0 个）",
+          r2["deleted"] == 0, "第一次 %d / 第二次 %d" % (r1["deleted"], r2["deleted"]))
+
+    # ---- ⑤ 目录不存在也不崩 ----
+    try:
+        cl.cleanup_by_days(os.path.join(root, "nonexistent_dir"),
+                           keep_days=14, logger=lambda m: None)
+        check("目录不存在时不抛异常", True)
+    except Exception as e:
+        check("目录不存在时不抛异常", False, repr(e))
+
+    # ---- ⑥ 配置解析：-1 = 跟随，0 = 不清理（语义不能混） ----
+    class _Cfg(dict):
+        def get(self, k, d=None):
+            return dict.get(self, k, d)
+    c1 = _Cfg({"logging.keep_days": 7, "logging.shots_keep_days": -1,
+               "logging.shots_max_mb": 0})
+    p1 = cl.parse_cfg(c1, root)
+    check("shots_keep_days=-1 解析为「跟随 keep_days」", p1["shots_keep_days"] is None)
+    check("keep_days 原样读出", p1["keep_days"] == 7)
+    check("shots_max_mb=0 表示不限", p1["shots_max_mb"] == 0)
+    c2 = _Cfg({"logging.shots_keep_days": 0})
+    check("shots_keep_days=0 表示「不按天清」而非「跟随」（0 与 -1 语义不同）",
+          cl.parse_cfg(c2, root)["shots_keep_days"] == 0)
+    check("配置缺项时用默认值不崩",
+          cl.parse_cfg(_Cfg({}), root)["keep_days"] == 14)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -1969,6 +2141,7 @@ if __name__ == "__main__":
     test_title_page()
     test_home_recruit_missed()
     test_foreground_guard()
+    test_cleanup()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)
