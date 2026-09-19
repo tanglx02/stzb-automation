@@ -17,8 +17,8 @@ from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
 from .core import (GAME_PKG, Device, Point, Templates, TextItem, find_all_text,
                    find_login_button, find_masked, find_text, match_score,
-                   merge_items, norm, ocr_image, ocr_region_scaled, read_png,
-                   wait_until)
+                   merge_items, norm, ocr_image, ocr_image_scaled,
+                   ocr_region_scaled, read_png, wait_until)
 
 # --------------------------------------------------------------------------- 锚点坐标（1920x1080）
 
@@ -221,9 +221,44 @@ class Ui:
         self.shots.append(path)
         return items, path
 
+    # 面板判定时，OCR 总行数少于这个值就认为「整屏没读全」，补一轮放大 OCR。
+    # 实测（2026-09-20）：税收面板只读到 1 行（真值 12 行），内政面板正常 11~25 行。
+    PANEL_MIN_ITEMS = 4
+
+    def _ocr_scaled(self, path: str, factor: int = 2) -> List[TextItem]:
+        """把**已经截好的一张图**放大后再 OCR，用于原图整屏漏读时兜底。
+
+        为什么不重新截屏：调用方手上的坐标就是这一帧算出来的，换一帧会错位。
+
+        实测（2026-09-20 00:29 那轮失败）：税收面板是深色插画底 + 小字，
+        1920x1080 原图 OCR 整屏只读出 1 行（连「征收」「等待中」都读不出），
+        但同一张图放大 2 倍能读出 12 行。放大后坐标会自动除以倍数还原，
+        所以结果可以直接和原图结果合并。
+        """
+        if not path:
+            return []
+        tmp = None
+        try:
+            base = os.path.basename(path).rsplit(".", 1)[0]
+            tmp = self.dev.shot_path("%s_x%d" % (base, factor))
+        except Exception:
+            tmp = None
+        try:
+            return ocr_image_scaled(path, factor=factor, tmp_path=tmp)
+        except Exception:
+            return []
+
     def ocr_multi(self, tag: str = "uim", n: int = 4,
-                  interval: float = 0.45) -> Tuple[List[TextItem], str]:
-        """多帧 OCR 取并集。用于盖在动态插画上的面板（特性/税收），单帧容易糊。"""
+                  interval: float = 0.45,
+                  scaled_fallback: bool = False) -> Tuple[List[TextItem], str]:
+        """多帧 OCR 取并集。用于盖在动态插画上的面板（特性/税收），单帧容易糊。
+
+        `scaled_fallback=True`：并集仍然少得可怜时，把最后一帧放大 2 倍再认一次
+        并合并。**面板开没开的判定必须带这个兜底** —— 否则深色面板整屏漏读会被
+        误判成「不在这个面板里」，进而退回主城重进、最后报「进不去」。
+
+        默认 False 是为了不改变其它调用点（任务内部找按钮那些）的耗时和语义。
+        """
         groups: List[List[TextItem]] = []
         last = ""
         for i in range(max(1, n)):
@@ -233,7 +268,12 @@ class Ui:
             groups.append(items)
             if i < n - 1:
                 time.sleep(interval)
-        return merge_items(groups), last
+        merged = merge_items(groups)
+        if scaled_fallback and len(merged) < self.PANEL_MIN_ITEMS:
+            big = self._ocr_scaled(last)
+            if len(big) > len(merged):
+                merged = merge_items([merged, big])
+        return merged, last
 
     def tap(self, x: int, y: int, delay: float = 0.7) -> None:
         if self.dry_run:
@@ -664,12 +704,19 @@ class Ui:
     def wait_for_cond(self, kws: Optional[Sequence[str]], fn,
                       timeout: float = 12.0, interval: float = 1.2,
                       tag: str = "waitcond") -> bool:
-        """轮询等待「关键词出现」或「fn(items) 成立」，期间清掉退出确认弹窗。"""
+        """轮询等待「关键词出现」或「fn(items) 成立」，期间清掉退出确认弹窗。
+
+        传了 fn 就用放大兜底：fn 是「面板开没开」这类判定，而深色面板原图
+        OCR 会整屏漏读，漏读会让校验误判成「没生效」→ 把剩下的候选坐标全白点
+        一遍。实测 2026-09-20：税收入口因此白花 45 秒，而且那些多余点击会落到
+        **已经打开的面板上**（税格旁边就是付费的「20/征收」），有误触风险。
+        """
         end = time.time() + timeout
         n = 0
         while time.time() < end:
             n += 1
-            items, _ = self.ocr("%s_%d" % (tag, n))
+            items, _ = self.ocr_multi("%s_%d" % (tag, n), n=1,
+                                      scaled_fallback=fn is not None)
             if self.guard(items) == "hufu_lack":
                 return False
             if fn is not None and fn(items):
@@ -911,7 +958,10 @@ class Ui:
     def open_neizheng(self) -> bool:
         self.log("  · 打开「内政」面板")
         for attempt in range(1, 5):
-            items, _ = self.ocr("nz_pre_%d" % attempt)
+            # 带放大兜底：内政界面也是深色底 + 美术字，偶发整屏漏读。
+            # 漏读会让 is_home/is_neizheng 同时判 False → 白白 to_home() 重来一轮。
+            items, _ = self.ocr_multi("nz_pre_%d" % attempt, n=1,
+                                      scaled_fallback=True)
             if self.is_neizheng(items):
                 return True
             if not self.is_home(items):
@@ -937,7 +987,8 @@ class Ui:
                 self.tap(*HOME_TAB_NEIZHENG)
             # 内政面板入场有动画，等它稳一下再确认
             time.sleep(3.5)
-            items, _ = self.ocr("nz_post_%d" % attempt)
+            items, _ = self.ocr_multi("nz_post_%d" % attempt, n=1,
+                                      scaled_fallback=True)
             if self.is_neizheng(items):
                 return True
         self.log("    × 打不开内政面板")
@@ -990,7 +1041,18 @@ class Ui:
             # 内政主界面上的「市井 / 税收 / 特性」只是入口名字，不代表面板已打开
             return False
         if name == "税收":
-            if self.has(items, "已征收", "征收中", "加速获取", "强征", "氵正丬攵", "征丬攵"):
+            # ⚠️ 这里**不能**把「强征」当锚点。内政主界面上「税收」入口底下挂着一个
+            # 状态标签，文案会变（「立即征收N/3」「可强征N/3」「可领取N/3」），
+            # 其中「可强征N/3」含「强征」二字 —— 一旦内政界面 OCR 只读到几行、
+            # _is_neizheng_screen 又认不出，就会被判成「已经在税收面板里了」，
+            # 于是任务在**内政界面上**开始找征收按钮，静默错位。
+            # 实测 2026-09-20：164 帧历史截图里有 1 帧
+            # （sub_pre_税收_1_2_027.png）就是这样被误判的；去掉「强征」后归零。
+            #
+            # 代价是放弃了税收面板里那个付费「20/强征」按钮这个信号 —— 可以接受：
+            # 三个格子**永远各有一个「征收」标题**（已征收/征收中/等待中那几格也在），
+            # 所以下面的 _count("征收") >= 2 在任何状态下都成立，比「强征」稳得多。
+            if self.has(items, "已征收", "征收中", "加速获取", "氵正丬攵", "征丬攵"):
                 return True
             # 税收面板有 3 个格子的标题（都含「征收」），主界面最多 1 处
             return self._count(items, "征收") >= 2
@@ -1024,9 +1086,12 @@ class Ui:
         self.log("  · 进入「%s」" % name)
 
         def snap(tag):
-            if use_multi:
-                return self.ocr_multi(tag, n=3)
-            return self.ocr(tag)
+            # ★ 必须带 scaled_fallback：税收/特性/演武 这三个面板是深色插画底，
+            #   原图 OCR 会整屏漏读（实测税收帧只读到 1 行），一旦漏读就会把
+            #   「已经进了面板」判成「不在这个面板里」，然后退回主城重进、空转到
+            #   最后报「进不去」。放大 2 倍能把同一帧读到 12 行。
+            return self.ocr_multi(tag, n=3 if use_multi else 1,
+                                  scaled_fallback=True)
 
         for rnd in range(1, 4):
             items, _ = snap("sub_pre_%s_%d" % (name, rnd))

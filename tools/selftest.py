@@ -2104,6 +2104,125 @@ def test_cleanup():
     check("配置缺项时用默认值不崩",
           cl.parse_cfg(_Cfg({}), root)["keep_days"] == 14)
 
+    # ---- ⑦ 收尾清理的契约：任何异常都不许往外抛 ----
+    # 2026-09-20 实测事故：清理抛异常后，整个收尾被跳过 ——
+    # «清理后占用» 那行没打、last_run.json 没更新（还停在昨天）。
+    # 后果是下次调度以为今天没跑，**重复跑一整轮、重复领奖**，
+    # 这比直接失败更难发现。所以这条契约必须钉死。
+    import run_daily as rd
+
+    on = _Cfg({"logging.cleanup_enabled": True})   # 必须开着，否则函数提前 return
+
+    def _raise_systemexit(*a, **kw):
+        raise SystemExit(1)        # ★ 故意用**非 Exception**，才是踩过的那条路径
+
+    orig_cbd = rd.cleanup_by_days
+    msgs = []
+    try:
+        rd.cleanup_by_days = _raise_systemexit
+        escaped = None
+        try:
+            rd._do_cleanup(on, msgs.append)
+        except BaseException as e:
+            escaped = e
+        check("收尾清理吞掉非 Exception 异常（SystemExit），不往外抛",
+              escaped is None, repr(escaped))
+        check("异常被记进日志，不是静默吞掉",
+              any("清理过程异常" in m for m in msgs), repr(msgs[-1:]))
+
+        def _raise_kbd(*a, **kw):
+            raise KeyboardInterrupt()
+
+        rd.cleanup_by_days = _raise_kbd
+        km = []
+        escaped = None
+        try:
+            rd._do_cleanup(on, km.append)
+        except BaseException as e:
+            escaped = e
+        check("Ctrl-C 中断清理时不外抛（清理立刻停，但收尾继续走完）",
+              escaped is None, repr(escaped))
+        check("Ctrl-C 有专门提示，不会被当成普通异常",
+              any("Ctrl-C" in m for m in km), repr(km[-1:]))
+    finally:
+        rd.cleanup_by_days = orig_cbd
+
+
+def test_panel_ocr_fallback():
+    print("\n[30] 面板判定：深色面板整屏漏读时，必须补一轮放大 OCR")
+    # 2026-09-20 00:29 实测失败：税收面板是深色插画底 + 小字，
+    # 1920x1080 原图 OCR 整屏**只读到 1 行**（真值 12 行，连「征收」「等待中」
+    # 都读不出）→ _in_panel("税收") 判 False → open_sub 以为「当前不在内政界面」
+    # → 退回主城重进 → 反复空转 → 最后报「进不去「税收」」，整轮任务失败。
+    # 同一帧放大 2 倍能读到 12 行。所以判定路径必须带放大兜底。
+    import stzb.ui as _ui
+
+    # ---- ① 「可强征N/3」是内政界面上的入口状态标签，不是「已在税收面板」 ----
+    # 曾经把「强征」当税收面板的锚点，于是内政界面 OCR 只读到 1 个锚点
+    # （_is_neizheng_screen 认不出）时会被误判成「已经在税收面板里了」，
+    # 任务就在内政界面上找征收按钮，静默错位。
+    ui = FakeUi()
+    thin_nz = [itc("市井", 1045, 700), itc("可强征0/3", 1743, 769)]
+    check("内政界面（锚点不足）+「可强征0/3」→ 不算已在税收面板",
+          ui._in_panel("税收", thin_nz) is False)
+
+    # 真税收面板的三个格子标题必须照样认得出
+    real_ss = [itc("征收", 427, 784), itc("征收", 948, 784), itc("征收", 1467, 784),
+               itc("20/征收", 1511, 877), itc("等待中···", 1467, 900)]
+    check("真税收面板仍判「已在里面」", ui._in_panel("税收", real_ss) is True)
+
+    # 最坏状态：三格全是付费「20/强征」——三格的「征收」标题还在，必须照样认得出
+    # （这是「不再拿强征当锚点」的兜底依据，别让后人把强征加回来）
+    paid_only = [itc("征收", 427, 784), itc("征收", 948, 784), itc("征收", 1467, 784),
+                 itc("20/强征", 992, 877), itc("20/强征", 1511, 877)]
+    check("三格全付费「20/强征」时仍认得出税收面板",
+          ui._in_panel("税收", paid_only) is True)
+
+    # ② 原图只读到 1 行时，ocr_multi 要自动补放大 OCR 并合并
+    rich = list(real_ss) + [itc("100", 93, 790), itc("659", 372, 790)]
+
+    class _PoorDev:
+        """复刻偷读：原图 OCR 只给 1 行。"""
+        def ocr(self, tag):
+            return [itc("73万6720", 590, 932)], "C:/fake/%s.png" % tag
+
+        def shot_path(self, tag):
+            return "C:/fake/%s.png" % tag
+
+    class _RichDev(_PoorDev):
+        def ocr(self, tag):
+            return list(rich), "C:/fake/%s.png" % tag
+
+    calls = {"n": 0}
+    orig = _ui.ocr_image_scaled
+    _ui.ocr_image_scaled = lambda path, factor=2, tmp_path=None: (
+        calls.__setitem__("n", calls["n"] + 1), list(rich))[1]
+    try:
+        u2 = FakeUi()
+        u2.shots = []
+        u2.dev = _PoorDev()
+        items, _ = u2.ocr_multi("t", n=1, scaled_fallback=True)
+        check("原图只读到 1 行 → 自动补了一轮放大 OCR", calls["n"] == 1)
+        check("放大结果并入后能认出税收面板（漏读不再误判）",
+              u2._in_panel("税收", items) is True)
+
+        calls["n"] = 0
+        u3 = FakeUi()
+        u3.shots = []
+        u3.dev = _RichDev()
+        u3.ocr_multi("t2", n=1, scaled_fallback=True)
+        check("原图读得够多 → 不浪费放大 OCR", calls["n"] == 0)
+
+        # 默认关着，不能悄悄改变其它调用点的耗时
+        calls["n"] = 0
+        u4 = FakeUi()
+        u4.shots = []
+        u4.dev = _PoorDev()
+        u4.ocr_multi("t3", n=1)
+        check("默认不开启放大兜底（其它调用点行为不变）", calls["n"] == 0)
+    finally:
+        _ui.ocr_image_scaled = orig
+
 
 if __name__ == "__main__":
     print("=" * 62)
@@ -2142,6 +2261,7 @@ if __name__ == "__main__":
     test_home_recruit_missed()
     test_foreground_guard()
     test_cleanup()
+    test_panel_ocr_fallback()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)

@@ -137,9 +137,12 @@ class RunLock:
         if not self.held:
             return
         self.held = False
+        # 这是 atexit 收尾，**绝不能往外抛**：抛了会在退出时打一堆栈、
+        # 还会污染退出码。删不掉也无所谓 —— acquire() 认得出「pid 已不在」
+        # 的残留锁会自己接管，所以残留锁不会把下次运行拦死。
         try:
             os.remove(self.path)
-        except Exception:
+        except BaseException:            # noqa: BLE001 收尾不容中断
             pass
 
 
@@ -505,12 +508,21 @@ def _do_cleanup(cfg, log, *, skip: bool = False, force: bool = False) -> dict:
                (p["shots_keep_days"] if p["shots_keep_days"] is not None
                 else (keep if keep > 0 else "不限")),
                p["shots_max_mb"] if p["shots_max_mb"] > 0 else "不限"))
-        return cleanup_by_days(ROOT, keep_days=keep,
-                               shots_keep_days=p["shots_keep_days"],
-                               shots_max_mb=p["shots_max_mb"],
-                               log_keep_days=p["log_keep_days"],
-                               diag=p["diag"], logger=log)
-    except Exception as e:
+        res = cleanup_by_days(ROOT, keep_days=keep,
+                              shots_keep_days=p["shots_keep_days"],
+                              shots_max_mb=p["shots_max_mb"],
+                              log_keep_days=p["log_keep_days"],
+                              diag=p["diag"], logger=log)
+        log("· 清理后占用：%s" % summary_line(ROOT))
+        return res
+    except KeyboardInterrupt:
+        log("  ! 清理被 Ctrl-C 中断")
+        return {}
+    except BaseException as e:
+        # ★ 接 BaseException 而不是 Exception —— 本函数的契约是「任何异常都不抛」，
+        #   而 SystemExit 之类**不属于 Exception**，实测能从这里穿出去、把整个收尾
+        #   （写 last_run.json / 关模拟器 / 停心跳）带走。收尾的唯一职责就是把账记完，
+        #   所以除了「用户按 Ctrl-C」以外，什么都不许中断它。
         log("  ! 清理过程异常：%r（不影响本轮结果）" % (e,))
         return {}
 
@@ -934,8 +946,19 @@ def main():
     # ------------------------------------------------------- 5.5 清理过期文件
     # 放在写报告之后：报告已把本轮截图内嵌进去，再删源图不会丢证据。
     report.env_info(磁盘占用=summary_line(ROOT))
-    _do_cleanup(cfg, log, skip=args.no_cleanup)
-    log("· 清理后占用：%s" % summary_line(ROOT))
+    # ★ 第二道防线（`_do_cleanup` 自己已经扛住了）。
+    #   这里必须**连 BaseException 一起接住**，因为收尾链的硬要求是
+    #   「无论如何都要把 last_run.json 写上、把模拟器关掉、把心跳停掉」——
+    #   少了它，下次调度会以为今天没跑，**重复跑一整轮、重复领奖**，
+    #   这比直接失败更难发现。兜极端情况：磁盘满到连 log 自己都写不出去、
+    #   或运行环境在删除路径上插了钩子直接 SystemExit。
+    #   只放行 KeyboardInterrupt：Ctrl-C 是用户要停，那时该停。
+    try:
+        _do_cleanup(cfg, log, skip=args.no_cleanup)
+    except KeyboardInterrupt:
+        log("  ! 清理被 Ctrl-C 中断")
+    except BaseException as e:                       # noqa: BLE001 收尾不容中断
+        log("  ! 清理异常（已忽略，不影响本轮结果）：%r" % e)
 
     # ---------------------------------------------------------------- 6. 收尾
     if not args.no_emulator:
