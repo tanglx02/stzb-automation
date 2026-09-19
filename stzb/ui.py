@@ -15,7 +15,7 @@ import os
 import time
 from typing import Callable, Iterable, List, Optional, Sequence, Tuple
 
-from .core import (Device, Point, Templates, TextItem, find_all_text,
+from .core import (GAME_PKG, Device, Point, Templates, TextItem, find_all_text,
                    find_login_button, find_masked, find_text, match_score,
                    merge_items, norm, ocr_image, ocr_region_scaled, read_png,
                    wait_until)
@@ -173,8 +173,38 @@ class Ui:
         self.never_tap: Sequence[str] = ()
         if cfg is not None:
             self.never_tap = cfg.get("safety.never_tap", []) or []
+        self.pkg = (cfg.get("device.package") if cfg is not None else None) or GAME_PKG
         self.shots: List[str] = []
         self._tpl: Optional[Templates] = None
+        self._fg_cache: Tuple[float, bool] = (0.0, True)   # (时间, 是否在前台)
+
+    # ------------------------------------------------------------------ 前台把关
+
+    def game_foreground(self, ttl: float = 3.0) -> bool:
+        """游戏现在是不是真的在前台（带 TTL 缓存）。
+
+        为什么需要它（2026-09-19 实测撞到）：模拟器起着、**游戏没起来**时，
+        OCR 读到的是 MuMu 桌面/启动器，而 boot() 会一路走「认不出的界面」分支
+        **盲点右上角 ✕**，直到 300 秒超时 —— 实测空转 7 分 48 秒，什么都没干成。
+        加这一条后，boot() 能立刻发现「前台不是游戏」并重新拉起，而不是干点。
+
+        实测依据（50 帧全量采样）：游戏内 `mCurrentFocus` 恒定是
+        `com.netease.stzb.netease/com.netease.stzb.Client`；不在游戏时是
+        `app.lawnchair/app.lawnchair.Launcher` 之类 —— 包名这一层区分得很干净。
+
+        ⚠️ 注意它**只能**判「在不在前台」，**不能**判「在游戏里的哪一屏」——
+        游戏内那一行不随界面切换而变（这也是实测结论）。界面判定仍归画面层。
+        """
+        now = time.time()
+        ts, val = self._fg_cache
+        if now - ts < ttl:
+            return val
+        try:
+            val = self.dev.game_foreground(self.pkg)
+        except Exception:
+            val = True                     # 读不到就放行，别把正常流程拦死
+        self._fg_cache = (now, val)
+        return val
 
     # ------------------------------------------------------------------ 基础
 
@@ -394,12 +424,34 @@ class Ui:
         """
         end = time.time() + timeout
         rounds = 0
+        not_fg = 0                       # 连续「前台不是游戏」的轮数
         while time.time() < end:
             rounds += 1
             items, path = self.ocr("boot_%02d" % rounds)
             if self.is_home(items):
                 self.log("  ✓ 已进入主城")
                 return True
+            # ★ 前台把关（2026-09-19 实测撞到才加的）：
+            #   模拟器起着、**游戏没起来**时，OCR 读到的是 MuMu 桌面/启动器，
+            #   而下面那些分支会一路走「认不出的界面」→ 盲点右上角 ✕，
+            #   直到 300 秒超时 —— 实测整整空转 7 分 48 秒，一个任务都没跑成。
+            #   先问一句「前台到底是不是游戏」比对着别人的界面瞎点强得多。
+            if not self.game_foreground(ttl=0.0):
+                not_fg += 1
+                self.log("    ! 前台不是游戏（%s）→ 重新拉起 %s"
+                         % (self.dev.foreground_pkg() or "读不到", self.pkg))
+                if not self.dry_run:
+                    try:
+                        self.dev.launch(self.pkg)
+                    except Exception as e:
+                        self.log("    ! 拉起失败：%r" % (e,))
+                time.sleep(6)
+                # 连续 3 轮都不在游戏前台 → 说明真的拉不起来，早点失败比干耗好
+                if not_fg >= 3:
+                    self.log("  !! 连续 %d 轮游戏都不在前台，放弃启动" % not_fg)
+                    return False
+                continue
+            not_fg = 0
             # ★ 标题页（冷启动第一屏）：山水画 + 底部金字「点击以开始游戏」。
             #   它**全屏 OCR 读出 0 行**，所以只能在「几乎没有文字」时，
             #   退一步做区域放大 OCR 才认得出。

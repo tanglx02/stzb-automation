@@ -262,7 +262,7 @@ stzb-automation/
 ├─ tools\
 │   ├─ config.py       本机配置工具（交互菜单 + 命令行）
 │   ├─ emu.py          手动开关模拟器
-│   ├─ selftest.py     离线自检（343 项断言）
+│   ├─ selftest.py     离线自检（359 项断言）
 │   ├─ probe_switch*.py 账号/角色切换界面的侦察脚本
 │   └─ ...             侦察 / 排查小工具
 │

@@ -1821,6 +1821,118 @@ def test_home_recruit_missed():
           [x.text for x in panel])
 
 
+def test_foreground_guard():
+    """前台把关：用 dumpsys 的 mCurrentFocus 判断「游戏在不在前台」。
+
+    为什么需要（2026-09-19 真机实测撞到）：
+    模拟器起着、**游戏没起来**时，OCR 读到的是 MuMu 桌面/启动器，而 boot()
+    会一路走「认不出的界面」分支**盲点右上角 ✕**，直到 300 秒超时 ——
+    实测整整空转 7 分 48 秒，一个任务都没跑成。
+
+    ★ 一并记住**实测得出的边界**（50 帧全量采样）：
+      游戏内 mCurrentFocus **恒定**是 com.netease.stzb.netease/com.netease.stzb.Client，
+      **不随游戏内界面切换而变** → 它**不能**用来判「在主城还是税收面板」。
+      所以断言里同时守住「能判前台」和「不据此判界面」两条。
+    """
+    print("\n[P] 前台把关（dumpsys mCurrentFocus）")
+    import stzb.core as core
+
+    dev = core.Device.__new__(core.Device)      # 不跑 __init__，避免连设备
+    PKG = "com.netease.stzb.netease"
+
+    # —— 正样本：真机采集到的原始文本（一字不改，直接拿来当输入）
+    REAL_GAME = ("mCurrentFocus=Window{598f027 u0 "
+                 "com.netease.stzb.netease/com.netease.stzb.Client}")
+    REAL_LAUNCHER = ("mCurrentFocus=Window{d54c7b3 u0 "
+                     "com.netease.stzb.netease/com.netease.stzb.Launcher}")
+    REAL_DESKTOP = ("mCurrentFocus=Window{8e31bf4 u0 "
+                    "app.lawnchair/app.lawnchair.Launcher}")
+
+    cases = [
+        (REAL_GAME, PKG, "游戏内 → 解析出游戏包名"),
+        (REAL_DESKTOP, "app.lawnchair", "MuMu 桌面 → 解析出桌面包名"),
+        (REAL_LAUNCHER, PKG, "游戏启动器 → 仍是游戏包名"),
+        ("mCurrentFocus=null", "", "null → 空串"),
+        ("", "", "空输入 → 空串"),
+        ("  mCurrentFocus=Window{f u0 com.android.systemui/com.android.systemui.panel}  ",
+         "com.android.systemui", "带前后空格也能解析"),
+    ]
+    for text, want, name in cases:
+        dev.foreground = lambda t=text: t
+        got = dev.foreground_pkg()
+        check(name, got == want, "得到 %r，期望 %r" % (got, want))
+
+    # activity 解析
+    dev.foreground = lambda: REAL_GAME
+    check("能解析出前台 Activity",
+          dev.foreground_activity() == "%s/com.netease.stzb.Client" % PKG,
+          dev.foreground_activity())
+
+    # game_foreground 三态
+    for text, want, name in [
+        (REAL_GAME, True, "在游戏里 → True"),
+        (REAL_DESKTOP, False, "在桌面上 → False"),
+        (REAL_LAUNCHER, True, "在游戏启动器里 → True（同包名）"),
+        ("mCurrentFocus=null", True, "读不到 → True（放行，不误拦）"),
+    ]:
+        dev.foreground = lambda t=text: t
+        check(name, dev.game_foreground(PKG) is want)
+
+    # ★ 边界断言：前台信息在游戏内恒定，因此**不得**参与界面判定
+    #   把 handler 的源码拿来查：界面判定函数里不许出现 foreground
+    import inspect
+    import stzb.ui as ui_mod
+    src = inspect.getsource(ui_mod.Ui.is_home)
+    check("is_home 不得依赖前台信息（它判不了界面）",
+          "foreground" not in src)
+    src2 = inspect.getsource(ui_mod.Ui.is_neizheng)
+    check("is_neizheng 不得依赖前台信息",
+          "foreground" not in src2)
+
+    # 有 TTL 缓存，且读不到时不抛异常
+    class _Dev:
+        def __init__(self, raises=False):
+            self.calls = 0
+            self.raises = raises
+
+        def game_foreground(self, pkg=None):
+            self.calls += 1
+            if self.raises:
+                raise RuntimeError("adb 挂了")
+            return True
+
+        def foreground_pkg(self):
+            return "com.netease.stzb.netease"
+
+    d = _Dev()
+    u = ui_mod.Ui.__new__(ui_mod.Ui)
+    u.dev = d
+    u.pkg = PKG
+    u._fg_cache = (0.0, True)
+    u.log = lambda *a, **k: None
+    import time as _t
+    u._fg_cache = (_t.time(), True)
+    a = u.game_foreground()
+    b = u.game_foreground()
+    check("TTL 缓存生效（3 秒内不重复查 adb）", a and b and d.calls == 0,
+          "实际调用 %d 次" % d.calls)
+
+    u._fg_cache = (0.0, True)
+    u.game_foreground(ttl=0.0)
+    first = d.calls
+    u.game_foreground(ttl=0.0)
+    check("ttl=0 时每次都查", d.calls == first + 1, "%d → %d" % (first, d.calls))
+
+    d2 = _Dev(raises=True)
+    u2 = ui_mod.Ui.__new__(ui_mod.Ui)
+    u2.dev = d2
+    u2.pkg = PKG
+    u2._fg_cache = (0.0, True)
+    u2.log = lambda *a, **k: None
+    check("查前台抛异常时放行（不把正常流程拦死）",
+          u2.game_foreground(ttl=0.0) is True)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -1856,6 +1968,7 @@ if __name__ == "__main__":
     test_config_autoresolve()
     test_title_page()
     test_home_recruit_missed()
+    test_foreground_guard()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)

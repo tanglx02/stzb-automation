@@ -541,6 +541,49 @@ class Device:
                 return line.strip()
         return ""
 
+    def foreground_pkg(self) -> str:
+        """从 mCurrentFocus 里解析出**当前前台窗口所属的包名**。读不到返回空串。
+
+        实测（2026-09-19，注意这条和「控件树」的结论不同）：
+        游戏内这一行**恒定**是
+            mCurrentFocus=Window{598f027 u0 com.netease.stzb.netease/com.netease.stzb.Client}
+        50/50 帧完全一致，**不随游戏内界面切换而变** —— 所以它**不能**用来
+        区分「在主城还是在内政还是税收面板」（那是画面层的事）。
+        但它能可靠回答**另一个**问题：**游戏到底在不在前台**。
+        这正是本项目的真实薄弱点：模拟器起着、游戏没起来时，OCR 读到的可能是
+        桌面/启动器，而脚本会一路盲点右上角直到 300 秒超时（实测空转 7.8 分钟）。
+
+        格式形如：
+            mCurrentFocus=Window{8e31bf4 u0 app.lawnchair/app.lawnchair.Launcher}
+            mCurrentFocus=null
+        所以取 Window{...} 里的 `<pkg>/<activity>`，再切出包名。
+        """
+        line = self.foreground()
+        if not line:
+            return ""
+        m = re.search(r"Window\{[^}]*?\s([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)", line)
+        if m:
+            return m.group(1)
+        m = re.search(r"\s([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)+)/", line)
+        return m.group(1) if m else ""
+
+    def foreground_activity(self) -> str:
+        """当前前台的 Activity 全名（形如 pkg/.SomeActivity）。读不到返回空串。"""
+        line = self.foreground()
+        m = re.search(r"Window\{[^}]*?\s([A-Za-z0-9_.]+)/([A-Za-z0-9_.$]+)", line)
+        return "%s/%s" % (m.group(1), m.group(2)) if m else ""
+
+    def game_foreground(self, pkg: str = GAME_PKG) -> bool:
+        """游戏是不是**真的在前台**。用于点击前的把关，防止对着桌面/启动器瞎点。
+
+        读不到前台信息时返回 True（宁可放行也不误拦）—— 这条是「不确定就放行」，
+        因为它的用途是防止明显的空转，而不是安全阀；安全阀另有 never_tap 管。
+        """
+        p = self.foreground_pkg()
+        if not p:
+            return True
+        return p == pkg
+
     def game_running(self, pkg: str = GAME_PKG) -> bool:
         out = self.raw("shell", "pidof", pkg, check=False).strip()
         return bool(out)
