@@ -1,22 +1,27 @@
 # -*- coding: utf-8 -*-
-"""常驻探活代理 —— 在每台客户端机器上挂着跑，让后台随时能看到它「在线」。
+"""常驻代理 —— 挂在客户端机器上，**一直和后端保持连接**。
 
 **为什么需要单独一个入口：**
-`run_daily.py` 只在跑任务那几分钟里发心跳。定时任务是每天两档，
-剩下 20 多个小时后台看到的都是「离线」—— 那就失去「探测客户端是否在线」的意义了。
-所以这个脚本常驻后台，只做两件事：
+`run_daily.py` 跑完就退出，只在那几分钟里连着后端。定时任务是每天两档，
+剩下 20 多个小时后台看不到它，也**推不动它** —— 管理员点了「立刻跑一轮」
+也只能干等下一档。所以这个脚本常驻后台，做三件事：
 
-  1. 每 30 秒发一次心跳，让后台的「客户端」页一直显示在线
-  2. 收后台点的「探测」指令 → 截屏 + OCR → 把界面文字回传
+  1. 维持和后端的**实时长连接**（WebSocket；连不上自动退回心跳）
+  2. 收后台点的「探测 / 强制切换」指令 → 立刻执行 → 把结果回传
+  3. 后台派了任务 → **立刻在本机起一轮 run_daily** 把那批任务跑掉
 
-它**不会**自动跑游戏任务（那是 run_daily 的事），除了心跳和探测之外，
-不在游戏里做任何点击。想验证界面就点探测，想跑任务就走 run_daily / 待执行队列。
+第 3 条是「后台随时指定任务」能真正落地的关键：任务不是等下一档，
+而是派下来几秒内就开始跑。
+
+它自己**不碰游戏界面**（探测除外，那是只读的截屏 + OCR）——
+真正的点击全部交给 run_daily 子进程，因为那里有单实例锁和完整的报告逻辑。
 
 用法：
     python agent.py                 # 前台常驻，日志打到屏幕和 logs/agent.log
-    python agent.py --once          # 只发一次心跳就退出（用来快速验证配置）
-    python agent.py --no-probe      # 只心跳，不响应探测指令（不想让它碰模拟器时用）
-    python agent.py --interval 60   # 覆盖心跳间隔（秒）
+    python agent.py --once          # 只探活一次就退出（用来快速验证配置）
+    python agent.py --no-probe      # 不响应探测指令（完全不碰模拟器/ADB）
+    python agent.py --no-run        # 只连不跑：后台派了任务也不自动起一轮
+    python agent.py --interval 60   # 覆盖心跳间隔（秒），实时通道不受它影响
 
 配合 Windows 计划任务 / 开机自启：
     pythonw.exe agent.py            # 无窗口常驻
@@ -27,7 +32,9 @@ import argparse
 import datetime as dt
 import io
 import os
+import subprocess
 import sys
+import threading
 import time
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -37,9 +44,10 @@ from stzb.account import describe_screen, ensure_target, find_masked   # noqa: E
 from stzb.cloud import CloudClient, CloudError                          # noqa: E402
 from stzb.config import load                                            # noqa: E402
 from stzb.core import DEFAULT_ADB, GAME_PKG, Device                     # noqa: E402
-from stzb.heartbeat import Heartbeat, StatusBox                         # noqa: E402
-from stzb.identity import Identity, read_assignment_cache, \
-    write_assignment_cache                                              # noqa: E402
+from stzb.heartbeat import StatusBox                                     # noqa: E402
+from stzb.identity import (Identity, read_assignment_cache,              # noqa: E402
+                           run_in_progress, write_assignment_cache)
+from stzb.realtime import BUSY_PREFIX, Realtime                          # noqa: E402
 from stzb.ui import Ui                                                  # noqa: E402
 
 CLIENT_STATE = os.path.join(ROOT, "state", "client.json")
@@ -88,6 +96,8 @@ def main() -> int:
     ap.add_argument("--no-probe", action="store_true",
                     help="不响应探测指令（完全不碰模拟器/ADB）")
     ap.add_argument("--quiet", action="store_true", help="不往屏幕打印，只写日志文件")
+    ap.add_argument("--no-run", action="store_true",
+                    help="后台派了任务也不自动起一轮（只连不跑，排障时用）")
     args = ap.parse_args()
 
     os.makedirs(SHOT_DIR, exist_ok=True)
@@ -226,6 +236,12 @@ def main() -> int:
             return True, msg, info
 
         if kind == "switch":
+            # ★ 本机有一轮任务在跑时不要抢游戏界面：任务那边以为还在主城，
+            #   这里把角色切走 → 后面所有点击全部错位。回报 BUSY 让服务端
+            #   把指令放回队列，等本轮结束再执行（管理端那次点击不会白点）。
+            if run_in_progress(ROOT):
+                return False, (BUSY_PREFIX + "本机正在跑任务，代理不与它抢游戏界面，"
+                                             "已放回队列等本轮结束"), {"deferred": True}
             target = cached or read_assignment_cache(ASSIGN_CACHE)
             if not target:
                 return False, "后台还没给这台客户端指派账号/角色", {}
@@ -240,25 +256,123 @@ def main() -> int:
 
         return False, "常驻代理不处理指令：%s（跑任务请用 run_daily 或后台的待执行队列）" % kind, {}
 
-    hb = Heartbeat(client, identity, state_fn=box.get,
-                   on_assignment=on_assignment, on_command=on_command,
-                   logger=log,
-                   interval=args.interval or int((info or {}).get("heartbeat_interval") or 30))
-    hb.start()
-    log("代理已进入常驻状态（心跳每 %s 秒一次）。按 Ctrl+C 退出。" % hb.interval)
+    # ------------------------------------------------ 后台派任务 → 立刻起一轮
+    #
+    # 常驻代理只负责「保持连接 + 收到就起」，真正跑任务交给 run_daily：
+    # 它自带单实例锁（防两轮同时点模拟器）和完整的报告/上传逻辑，
+    # 代理不必（也不该）把这些重复实现一遍。
+    #
+    # 用 `--job-only` 起，是为了**防退化成常规档位运行**：万一那条任务在我们
+    # 决定起进程的这一瞬间被别人抢走或被取消，run_daily 必须直接退出，
+    # 而不是顺势把「当前档位的常规任务」跑一遍 —— 那等于凭空多跑一轮，还会重复领奖。
+    rt_holder: dict = {"rt": None}
+    run_state: dict = {"proc": None}
+
+    def _spawn_run(why: str) -> bool:
+        proc = run_state.get("proc")
+        if proc is not None and proc.poll() is None:
+            log("  · 上一轮还在跑（pid=%s），这次不重开" % proc.pid)
+            return False
+        if run_in_progress(ROOT):
+            # 可能是定时任务起的，也可能是别人手动跑的 —— 反正现在不能抢
+            log("  · 本机已有一轮任务在跑，%s（任务留在队列里）" % why)
+            return False
+        log_file = os.path.join(LOG_DIR, "agent_run.log")
+        try:
+            fh = io.open(log_file, "a", encoding="utf-8")
+            fh.write("\n===== %s 常驻代理起一轮：%s =====\n"
+                     % (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), why))
+            fh.flush()
+            proc = subprocess.Popen(
+                [sys.executable, os.path.join(ROOT, "run_daily.py"), "--job-only"],
+                cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT)
+        except Exception as e:
+            log("  ! 起 run_daily 失败：%r" % (e,))
+            return False
+        run_state["proc"] = proc
+        box.set(state="starting", busy=True, note="正在按后台任务跑一轮")
+        log("  ✓ 已起一轮 run_daily（pid=%s，%s），输出见 logs/agent_run.log"
+            % (proc.pid, why))
+        threading.Thread(target=_wait_run, args=(proc,), name="stzb-run-wait",
+                         daemon=True).start()
+        return True
+
+    def _wait_run(proc) -> None:
+        """等这一轮跑完，再把队列里**剩下**的任务接着跑掉。
+
+        为什么结束时还要看一眼队列：后台可能连着派了好几条，而每条只推一次通知，
+        第二条到达时代理正忙着（上面会拒绝重开）。不补这一眼的话，第二条就得等到
+        下一档 —— 而「随时指定任务」正是这次改动的目的，等到下一档等于没做。
+
+        这一眼也顺带兜住了「实时通道抖动导致 notify 丢失」：只要有一次状态同步
+        成功，`pending_jobs` 就会告诉我们队列里还有东西（见 Realtime._apply）。
+        """
+        try:
+            code = proc.wait()
+        except Exception:
+            code = -1
+        run_state["proc"] = None
+        log("  · 这一轮 run_daily 结束（退出码 %s）" % code)
+        box.set(state="idle", busy=False, note="常驻代理在线（未在跑任务）")
+        try:
+            ok, data = client.list_jobs()
+            jobs = ((data or {}).get("jobs") or []) if ok else []
+        except Exception:
+            jobs = []
+        if jobs:
+            log("  · 队列里还有 %d 条任务，接着跑" % len(jobs))
+            _spawn_run("队列里还有 %d 条任务" % len(jobs))
+        elif rt_holder["rt"] is not None:
+            rt_holder["rt"].beat_now()     # 让后台立刻看到「空闲了」
+
+    def on_notify(what, msg):
+        if what == "jobs":
+            if args.no_run:
+                log("  · 后台派了任务；本代理以 --no-run 启动，不自动起一轮（留给下一档）")
+                return
+            rt = rt_holder["rt"]
+            if rt is not None and rt.task_paused:
+                log("  · 后台派了任务，但这台客户端被设为「暂停派发」→ 不跑")
+                return
+            _spawn_run("后台派了任务%s"
+                       % ((" #%s" % msg.get("job")) if msg.get("job") else ""))
+        elif what == "config":
+            log("  · 后台配置已更新到 v%s（本轮不重拉，下次 run_daily 生效）"
+                % msg.get("version", "?"))
+
+    rt = Realtime(client, identity, state_fn=box.get,
+                  on_assignment=on_assignment, on_command=on_command,
+                  on_notify=on_notify,
+                  logger=log,
+                  interval=args.interval or int((info or {}).get("heartbeat_interval") or 30))
+    rt_holder["rt"] = rt
+    rt.start()
+    log("代理已进入常驻状态。按 Ctrl+C 退出。")
     if args.no_probe:
         log("  注意：以 --no-probe 运行，不会响应「探测」「强制切换」指令。")
+    if args.no_run:
+        log("  注意：以 --no-run 运行，后台派的任务不会自动起一轮。")
+
+    # 把连上的传输层说清楚（实时通道由后台线程去连，给它一点时间）
+    for _ in range(30):
+        if rt.ws_connected or (rt.transport == "http" and rt.beats):
+            break
+        time.sleep(0.2)
+    if rt.ws_connected:
+        log("  传输方式   : 实时长连接（%s）—— 后台的指令/任务会即时送达" % rt.url)
+    else:
+        log("  传输方式   : 心跳兜底（每 %s 秒一次），实时通道会自动重试。原因：%s"
+            % (rt.interval, rt.ws_error or "尚未连上"))
 
     try:
         while True:
             time.sleep(1)
-            # 每 5 分钟打一条「我还活着」，否则日志会静得让人以为挂了
-            if hb.beats and hb.beats % max(1, int(300 / max(1, hb.interval))) == 0:
-                pass
     except KeyboardInterrupt:
         log("收到 Ctrl+C，代理退出。")
     finally:
-        hb.stop()
+        if run_state.get("proc") is not None and run_state["proc"].poll() is None:
+            log("  （本机还有一轮 run_daily 在跑，它是独立进程，代理退出不影响它）")
+        rt.stop()
     return 0
 
 

@@ -24,7 +24,7 @@
   </div>
   <div class="actions">
     <form method="post" action="/settings/rotate-token"
-          onsubmit="return confirm('轮换后旧令牌立刻失效，脚本必须同步更新，否则上不了报。确定？')">
+          data-confirm="轮换后旧令牌立刻失效，脚本必须同步更新，否则上不了报。确定？">
       <button class="danger" type="submit">轮换 agent 令牌</button>
     </form>
   </div>

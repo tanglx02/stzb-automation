@@ -163,6 +163,149 @@ def test_no_plaintext_passwords_anywhere():
 
 # ------------------------------------------------------------------ 小工具
 
+def test_console_csp_allows_own_scripts():
+    """控制台 CSP 必须放行同源脚本、但绝不放内联脚本。
+
+    ★ 这条盯的是一个**静默失效**的真实事故：CSP 曾经写死 `script-src 'none'`，
+      而页面里的交互（角色下拉联动、在线状态自动刷新、**删除/轮换令牌前的
+      二次确认**）全是内联脚本和内联 onsubmit= —— 浏览器一律不执行，
+      而且页面上不报任何错，只有开发者控制台里才看得到。
+      结果就是几个不可逆操作没有确认框，还能跑很久没人发现。
+
+    所以这里双向钉住：
+      · CSP 的方向：script-src 必须允许 'self'，但**不能**出现 'none' 或
+        'unsafe-inline'（前者静默废掉全部交互，后者等于放弃 XSS 防护）；
+      · 模板的方向：不许再出现内联 <script> 或 on* 事件处理器
+        —— 否则一旦有人把 CSP 收紧回去，又会静默失效。
+    """
+    import re
+
+    print("\n== 控制台 CSP 放行同源脚本、禁止内联（回归） ==")
+    ok = True
+
+    main_py = os.path.join(ROOT, "server", "app", "main.py")
+    src = open(main_py, encoding="utf-8").read()
+    i = src.find('"Content-Security-Policy"')
+    if i < 0:
+        print("   ✗ main.py 里找不到 Content-Security-Policy")
+        return False
+    # CSP 是多个相邻字符串字面量拼起来的，这里把它们凑回一整条
+    block = src[i:src.find(")", i)]
+    parts = re.findall(r'"((?:[^"\\]|\\.)*)"', block)
+    csp = "".join(parts[1:])
+    m = re.search(r"script-src ([^;]*)", csp)
+    val = (m.group(1) if m else "").strip()
+    print("   script-src 指令：%r" % val)
+
+    if "'self'" not in val:
+        print("   ✗ script-src 没有 'self' —— 外部 console.js 会被挡掉")
+        ok = False
+    if "'none'" in val:
+        print("   ✗ script-src 是 'none' —— 控制台交互会**静默**失效（曾经的事故）")
+        ok = False
+    if "'unsafe-inline'" in val:
+        print("   ✗ script-src 放了 'unsafe-inline' —— 等于放弃 XSS 防护")
+        ok = False
+    if "connect-src 'self'" not in csp:
+        print("   ✗ 没有 connect-src 'self' —— 自动刷新用的 fetch 会被挡")
+        ok = False
+
+    tpl_dir = os.path.join(ROOT, "server", "app", "templates")
+    bad = []
+    for name in sorted(os.listdir(tpl_dir)):
+        if not name.endswith(".html"):
+            continue
+        html = open(os.path.join(tpl_dir, name), encoding="utf-8").read()
+        html = re.sub(r"\{#.*?#\}", "", html, flags=re.S)      # 去掉 jinja 注释
+        if re.search(r"<script(?![^>]*\bsrc=)", html, re.I):
+            bad.append("%s: 内联 <script>" % name)
+        if re.search(r"\son(click|submit|change|input|load|error)\s*=", html, re.I):
+            bad.append("%s: 内联 on* 处理器" % name)
+    if bad:
+        print("   ✗ 模板里还有内联脚本/处理器（会被 CSP 静默拒掉）：%s" % bad)
+        ok = False
+    else:
+        print("   ✓ 模板里零内联脚本、零内联事件处理器")
+
+    js = os.path.join(ROOT, "server", "app", "static", "console.js")
+    if not os.path.exists(js):
+        print("   ✗ 缺少 /static/console.js（外部脚本没了，交互全废）")
+        ok = False
+    print("   %s" % ("✓ 通过了" if ok else "✗ 失败"))
+    return ok
+
+
+def test_realtime_contract():
+    """实时通道两侧的契约：BUSY 标记一致、两条通道共用同一份状态计算。
+
+    这两条都属于「改错了平时看不出来、出事时很难查」的类型：
+      · BUSY 前缀两边不一致 → 客户端回报的「正忙」服务端认不出 →
+        指令被当成普通失败消费掉 → 管理端点了「探测」永远不执行；
+      · 状态计算被复制成两份 → 同一台客户端走长连接和走心跳拿到的
+        「该不该切换」可能不一样，且只在某条通道上复现。
+    """
+    print("\n== 实时通道两侧契约（回归） ==")
+    ok = True
+    try:
+        from stzb.realtime import BUSY_PREFIX as CLIENT_BUSY, Realtime
+        from stzb.heartbeat import Heartbeat
+    except Exception as e:
+        print("   ! 无法 import 客户端模块：%r（跳过）" % (e,))
+        return None
+    try:
+        from app.routes_agent import BUSY_PREFIX as SERVER_BUSY, build_client_state
+    except Exception as e:
+        print("   ! 无法 import 服务端模块：%r（跳过）" % (e,))
+        return None
+
+    if CLIENT_BUSY != SERVER_BUSY:
+        print("   ✗ BUSY 前缀不一致：客户端 %r / 服务端 %r" % (CLIENT_BUSY, SERVER_BUSY))
+        ok = False
+    else:
+        print("   ✓ BUSY 前缀两侧一致：%r" % CLIENT_BUSY)
+
+    # 状态计算必须只有一份：HTTP 心跳的处理里要能看到对它的调用
+    from app import routes_agent as ra
+    src = inspect_source(ra._heartbeat)
+    if "build_client_state" not in src:
+        print("   ✗ _heartbeat 没有调用 build_client_state —— 状态计算被复制了一份？")
+        ok = False
+    else:
+        print("   ✓ HTTP 心跳与长连接共用 build_client_state（同一份状态计算）")
+
+    # 两种会话对上层暴露的接口要一致，否则换一个类就会在运行期炸
+    shared = ["start", "stop", "poke", "snapshot"]
+    missing = [n for n in shared if not (hasattr(Realtime, n) and hasattr(Heartbeat, n))]
+    if missing:
+        print("   ✗ Realtime / Heartbeat 接口不一致，缺：%s" % missing)
+        ok = False
+    else:
+        print("   ✓ Realtime 与 Heartbeat 的对外接口一致（%s）" % "、".join(shared))
+
+    # 上层读的那些状态字段，两个类都得有（否则换类时会在运行期 AttributeError）
+    class _FakeClient:
+        base_url = "http://127.0.0.1:1"
+        token = "t"
+        version = ""
+
+    class _FakeIdent:
+        uid = "u"
+        host = "h"
+
+    fields = ("assignment", "switch_needed", "switch_reason", "task_paused",
+              "last_ok", "last_error", "last_at", "beats", "interval")
+    a = Realtime(_FakeClient(), _FakeIdent())
+    b = Heartbeat(_FakeClient(), _FakeIdent())
+    lost = [f for f in fields if not (hasattr(a, f) and hasattr(b, f))]
+    if lost:
+        print("   ✗ 会话状态字段缺失：%s" % lost)
+        ok = False
+    else:
+        print("   ✓ 会话状态字段两边齐全：%s" % "、".join(fields))
+    print("   %s" % ("✓ 通过了" if ok else "✗ 失败"))
+    return ok
+
+
 def inspect_source(fn):
     import inspect
     try:
@@ -176,7 +319,9 @@ def main():
     for fn in (test_whitelist_matches, test_account_section_is_local_only,
                test_unregistered_client_gets_no_directed_jobs,
                test_offline_derived_from_last_seen,
-               test_no_plaintext_passwords_anywhere):
+               test_no_plaintext_passwords_anywhere,
+               test_console_csp_allows_own_scripts,
+               test_realtime_contract):
         try:
             results.append((fn.__name__, fn()))
         except Exception:

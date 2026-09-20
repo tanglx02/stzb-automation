@@ -12,7 +12,17 @@
     带回去执行，再通过 /probe 回报（见 db.client_request_probe）
   · 「给某台客户端派任务」= 写进 run_requests.client_id，心跳时按 uid 过滤着领
 
-这样写还有一个好处：以后想把后端搬到公网，这套接口一个字都不用改。
+**实时长连接（/ws）只是「加速器」，不改上面这套形状。** 它做的是：客户端常驻时
+先建一条 WebSocket，后端有派任务 / 指令 / 改指派就顺手喊一声（毫秒到）；
+客户端收到后**照常走上面的 HTTP 接口**取数据，而不是从推送里取。
+
+之所以不把推送当数据源，是因为推送是**尽力而为**的：消息会丢、连接会断，
+只有数据库是唯一事实来源。这样断开最多让事情慢一拍，绝不会丢活 ——
+以后想把后端搬到公网（或换长轮询 / 消息队列），这套接口一个字都不用改。
+
+★ 状态计算只有一份：心跳和长连接共用 `build_client_state()`。
+  两处各写一遍迟早分叉，后果是「同一台客户端走哪条通道拿到不一样的指派」，
+  只在一条通道上复现、极难排查。护栏测试 test_realtime_contract 盯着这条。
 """
 from __future__ import annotations
 
@@ -29,6 +39,11 @@ from . import db, managed, plan, security, settings
 from .schemas import AckIn, HeartbeatIn, ProbeResultIn, RunIn
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
+
+# ★ 与客户端 stzb/realtime.py 的 BUSY_PREFIX **必须一致**（自检里有断言钉着）。
+#   含义：客户端此刻正在跑任务，没法安全地同时操作游戏界面 →
+#   这条指令不是「失败」，而是「先放回队列，等我闲下来」。
+BUSY_PREFIX = "BUSY:"
 
 
 def require_agent(x_agent_token: Optional[str] = Header(default=None),
@@ -143,77 +158,19 @@ def _save_upload(run_id: int, up: UploadFile, *, kind: str, label: str,
     return {"id": aid, "filename": name, "size": size, "kind": kind, "label": label}
 
 
-# ------------------------------------------------------------------ 基础
+# ------------------------------------------------------ 客户端状态（共用）
 
-@router.get("/ping")
-def ping(request: Request,
-         x_agent_version: Optional[str] = Header(default=None),
-         x_agent_host: Optional[str] = Header(default=None),
-         x_agent_uid: Optional[str] = Header(default=None)):
-    """探活 / 心跳。GET 版（不带负载），老客户端兼容。
+def build_client_state(cli: Dict[str, Any],
+                       status: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """把「这台客户端现在该收到什么」算出来。
 
-    只做「我还在」这一件事：登记客户端、刷新 last_seen。返回值里的
-    `assignment` 让客户端启动时就知道自己该用哪个账号/角色。
+    HTTP 心跳（/ping）与实时通道（WebSocket）**共用这一份实现** ——
+    两处各写一遍迟早会分叉，而分叉的后果是「同一台客户端走不同通道
+    拿到不同的指派」，出现时极难排查。所以谁也别复制粘贴这段逻辑。
+
+    返回的就是客户端要的那一坨：指派（assignment）、是否需要切换
+    （switch_needed）、一次性指令（command）、有没有待领任务。
     """
-    return _heartbeat(request, None, x_agent_version, x_agent_host, x_agent_uid)
-
-
-@router.post("/ping")
-def ping_post(request: Request, body: HeartbeatIn):
-    """带负载的心跳。客户端后台线程每隔 N 秒发一次，附带当前状态。
-
-    返回值是**服务端对客户端的指令通道**，包含：
-      · config_version 变了没（客户端可据此决定要不要重拉配置）
-      · assignment     该用哪个账号 / 哪个角色（换了指派客户端会自动切）
-      · switch_needed  true 表示「你当前跑的账号/角色和目标不一致，切一下」
-      · command        一次性指令（人工点的「探测」「强制切换」「立刻跑一轮」）
-    """
-    return _heartbeat(request, body, body.host and None, None, None)
-
-
-def _heartbeat(request: Request, body: Optional[HeartbeatIn],
-               hdr_version: Optional[str], hdr_host: Optional[str],
-               hdr_uid: Optional[str]) -> Dict[str, Any]:
-    ident = _ident(request)
-    uid = (body.uid if body and body.uid else None) or ident["uid"] or hdr_uid or ""
-    host = (body.host if body and body.host else None) or ident["host"] or hdr_host or ""
-    version = (body and None) or ident["version"] or hdr_version or ""
-
-    # 老客户端（只发头、连 uid 都没有）拿 host 当标识，至少还能被看见
-    uid = uid or host
-    if not uid:
-        # 实在没有标识就退化：不发 token 的探活不该污染客户端列表
-        cur = db.config_current()
-        return {"ok": True, "app": settings.APP_NAME, "version": settings.APP_VERSION,
-                "config_version": cur["version"],
-                "allow_run_requests": settings.ALLOW_RUN_REQUESTS,
-                "server_time": db.now(),
-                "heartbeat_interval": settings.HEARTBEAT_INTERVAL,
-                "registered": False,
-                "note": "本次心跳没带 uid，未登记为客户端"}
-
-    status: Optional[Dict[str, Any]] = None
-    if body is not None:
-        status = {
-            "mode": body.mode or "",
-            "state": body.state or "",
-            "busy": bool(body.busy),
-            "note": (body.note or "")[:300],
-            "current": (body.current.model_dump() if body.current else {}),
-            "device": (body.device.model_dump() if body.device else {}),
-            "last_run_at": body.last_run_at or "",
-            "extra": body.extra or {},
-        }
-
-    if hdr_host:
-        db.kv_set("last_agent_host", hdr_host)
-    if hdr_version:
-        db.kv_set("last_agent_version", hdr_version)
-
-    cli = db.client_upsert(uid, host=host, agent_version=version,
-                           ip=_client_ip(request), status=status)
-    if not cli:
-        raise HTTPException(status_code=400, detail="无法登记客户端")
 
     # ---- 该用哪个账号/角色 ----
     aid = cli.get("account_id")
@@ -316,18 +273,108 @@ def _heartbeat(request: Request, body: Optional[HeartbeatIn],
     }
 
 
+# ------------------------------------------------------------------ 基础
+
+@router.get("/ping")
+def ping(request: Request,
+         x_agent_version: Optional[str] = Header(default=None),
+         x_agent_host: Optional[str] = Header(default=None),
+         x_agent_uid: Optional[str] = Header(default=None)):
+    """探活 / 心跳。GET 版（不带负载），老客户端兼容。
+
+    只做「我还在」这一件事：登记客户端、刷新 last_seen。返回值里的
+    `assignment` 让客户端启动时就知道自己该用哪个账号/角色。
+    """
+    return _heartbeat(request, None, x_agent_version, x_agent_host, x_agent_uid)
+
+
+@router.post("/ping")
+def ping_post(request: Request, body: HeartbeatIn):
+    """带负载的心跳。客户端后台线程每隔 N 秒发一次，附带当前状态。
+
+    返回值是**服务端对客户端的指令通道**，包含：
+      · config_version 变了没（客户端可据此决定要不要重拉配置）
+      · assignment     该用哪个账号 / 哪个角色（换了指派客户端会自动切）
+      · switch_needed  true 表示「你当前跑的账号/角色和目标不一致，切一下」
+      · command        一次性指令（人工点的「探测」「强制切换」「立刻跑一轮」）
+    """
+    return _heartbeat(request, body, body.host and None, None, None)
+
+
+def _heartbeat(request: Request, body: Optional[HeartbeatIn],
+               hdr_version: Optional[str], hdr_host: Optional[str],
+               hdr_uid: Optional[str]) -> Dict[str, Any]:
+    ident = _ident(request)
+    uid = (body.uid if body and body.uid else None) or ident["uid"] or hdr_uid or ""
+    host = (body.host if body and body.host else None) or ident["host"] or hdr_host or ""
+    version = (body and None) or ident["version"] or hdr_version or ""
+
+    # 老客户端（只发头、连 uid 都没有）拿 host 当标识，至少还能被看见
+    uid = uid or host
+    if not uid:
+        # 实在没有标识就退化：不发 token 的探活不该污染客户端列表
+        cur = db.config_current()
+        return {"ok": True, "app": settings.APP_NAME, "version": settings.APP_VERSION,
+                "config_version": cur["version"],
+                "allow_run_requests": settings.ALLOW_RUN_REQUESTS,
+                "server_time": db.now(),
+                "heartbeat_interval": settings.HEARTBEAT_INTERVAL,
+                "registered": False,
+                "note": "本次心跳没带 uid，未登记为客户端"}
+
+    status: Optional[Dict[str, Any]] = None
+    if body is not None:
+        status = {
+            "mode": body.mode or "",
+            "state": body.state or "",
+            "busy": bool(body.busy),
+            "note": (body.note or "")[:300],
+            "current": (body.current.model_dump() if body.current else {}),
+            "device": (body.device.model_dump() if body.device else {}),
+            "last_run_at": body.last_run_at or "",
+            "extra": body.extra or {},
+        }
+
+    if hdr_host:
+        db.kv_set("last_agent_host", hdr_host)
+    if hdr_version:
+        db.kv_set("last_agent_version", hdr_version)
+
+    cli = db.client_upsert(uid, host=host, agent_version=version,
+                           ip=_client_ip(request), status=status)
+    if not cli:
+        raise HTTPException(status_code=400, detail="无法登记客户端")
+
+    # 具体算什么，见 build_client_state()：HTTP 心跳与实时通道共用
+    return build_client_state(cli, status)
+
+
 @router.post("/probe")
 def probe_result(request: Request, body: ProbeResultIn,
                  x_agent_uid: Optional[str] = Header(default=None),
                  x_agent_host: Optional[str] = Header(default=None)):
-    """客户端上报人工探测的结果（界面文字、截图摘要、切换成败）。"""
+    """客户端上报人工探测的结果（界面文字、截图摘要、切换成败）。
+
+    **`BUSY:` 前缀是一种控制信号，不是普通失败**：客户端正在跑任务时没法安全地
+    同时操作游戏界面，于是回报 `BUSY:…`；这里把指令**放回待执行**，
+    等它闲下来再取走。没有这个分支的话，管理端点「探测」时客户端恰好忙，
+    指令就会被消费掉且永远不执行 —— 而界面上还显示「已下发」，很误导人。
+    （客户端侧发出这个前缀的地方见 stzb/realtime.py 的 BUSY_PREFIX。）
+    """
     ident = _ident(request)
     uid = body.uid or ident["uid"] or x_agent_uid or ident["host"] or x_agent_host or ""
     cli = db.client_by_uid(uid)
     if not cli:
         raise HTTPException(status_code=404, detail="这台客户端还没登记过（先发一次心跳）")
-    db.client_probe_finish(int(cli["id"]), bool(body.ok), body.message, body.data)
-    return {"ok": True}
+    msg = str(body.message or "")
+    if not body.ok and msg.startswith(BUSY_PREFIX):
+        back = db.client_probe_requeue(int(cli["id"]), note=msg[len(BUSY_PREFIX):].strip())
+        db.event("info", "agent", "客户端正忙，指令已放回队列（%s）%s"
+                 % (cli.get("name") or uid, "：%s" % msg[len(BUSY_PREFIX):].strip()
+                    if msg[len(BUSY_PREFIX):].strip() else ""))
+        return {"ok": True, "requeued": bool(back)}
+    db.client_probe_finish(int(cli["id"]), bool(body.ok), msg, body.data)
+    return {"ok": True, "requeued": False}
 
 
 # ------------------------------------------------------------------ 配置

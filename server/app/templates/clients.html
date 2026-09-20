@@ -4,10 +4,12 @@
 
 <h1>客户端</h1>
 <div class="sub">
-  采集脚本跑在哪台机器上，这里就会自动登记哪台。后端<b>不会</b>主动去连采集端
-  —— 所以这里的「在线」是客户端每 {{ heartbeat_interval }} 秒主动上报一次心跳算出来的；
-  「探测」是把指令挂到那台客户端上，等它下次心跳（最多 {{ heartbeat_interval }} 秒）自己执行再回报。
-  就算后端和采集端就在同一台机器上，也是这套机制，行为一致。
+  采集脚本跑在哪台机器上，这里就会自动登记哪台。客户端常驻进程会跟后端保持一条
+  <b>实时长连接</b>：后台派任务、下指令都是<b>毫秒级送达</b>；万一张连接被防火墙 / 反代
+  挡掉，会自动退回每 {{ heartbeat_interval }} 秒一次的 HTTP 心跳（能力一样，只是慢一拍）。
+  <br>
+  「在线 / 离线」始终由客户端的心跳时间算出来，跟长连接无关 —— 长连接只影响<b>快慢</b>，
+  不影响<b>在不在</b>。就算后端和采集端就在同一台机器上，也是这套机制，行为一致。
 </div>
 
 {% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
@@ -27,6 +29,7 @@
 <p class="hint">
   判定规则：心跳距今 ≤ {{ offline_after }} 秒算在线（{{ heartbeat_interval }} 秒一拍，容忍丢 2 拍）。
   客户端没启动脚本时收不到心跳，就会显示离线 —— 这是正常的，不代表机器掉线。
+  卡片上的「实时 / 心跳」小标签只表示后台推送快不快，<b>不是</b>在线判据。
 </p>
 
 {% if not clients %}
@@ -45,6 +48,10 @@
     <span class="pill {% if c.online %}ok{% else %}gray{% endif %}">
       {% if c.online %}在线{% elif c.stale %}心跳中断{% else %}离线{% endif %}
     </span>
+    {# 实时通道指示灯：连上=后台的指令/任务毫秒级送达；没连=退回心跳节奏（最多等一拍心跳）。
+       它**不是**在线判据 —— 在线与否看左边的点（那是 last_seen 的年龄）。 #}
+    <span class="chip rt {% if c.realtime %}on{% else %}off{% endif %}" id="rt-{{ c.id }}"
+          title="实时长连接已建立：后台派的任务和指令会立刻送达">{% if c.realtime %}实时{% else %}心跳{% endif %}</span>
     {% if not c.enabled %}<span class="pill skip">已暂停派发</span>{% endif %}
     <span class="cli-meta">
       {{ c.host or '—' }}
@@ -94,8 +101,7 @@
     <div class="grid2">
       <label class="f">
         <span class="name">游戏账号</span>
-        <select name="account_id" onchange="filterRoles(this, {{ c.id }})"
-                data-cli="{{ c.id }}">
+        <select name="account_id" data-cli-role-filter="{{ c.id }}">
           <option value="">（不指派，客户端用自己本地的账号）</option>
           {% for a in accounts %}
             <option value="{{ a.id }}" data-roles="{{ a.roles|map(attribute='id')|join(',') }}"
@@ -126,7 +132,7 @@
       <button class="primary" type="submit">保存指派</button>
       {% if c.account_id %}
       <span class="hint">当前：<b>{{ c.status.get('current', {}).get('masked') or '未上报' }}</b>
-        —— 保存后客户端下次心跳会自动切过去</span>
+        —— 保存后{% if c.realtime %}客户端<b>立刻</b>就知道要切换{% else %}客户端下次心跳会自动切过去{% endif %}</span>
       {% endif %}
     </div>
   </form>
@@ -134,11 +140,13 @@
   <!-- ---------------- 探测 ---------------- -->
   <h3>探测 / 指令</h3>
   {% if c.probe and c.probe.status %}
-  <div class="probe {% if c.probe.status == 'done' %}ok{% elif c.probe.status == 'failed' %}bad{% else %}pending{% endif %}">
+  <div class="probe {% if c.probe.status == 'done' %}ok{% elif c.probe.status == 'failed' %}bad{% else %}pending{% endif %}"
+       id="probe-{{ c.id }}">
     <div class="probe-head">
       <b>{{ c.probe.kind }}</b>
-      <span class="pill {% if c.probe.status == 'done' %}ok{% elif c.probe.status == 'failed' %}fail{% else %}skip{% endif %}">
-        {% if c.probe.status == 'done' %}已完成{% elif c.probe.status == 'failed' %}失败{% elif c.probe.status == 'pending' %}等待客户端心跳{% else %}执行中{% endif %}
+      <span class="pill {% if c.probe.status == 'done' %}ok{% elif c.probe.status == 'failed' %}fail{% else %}skip{% endif %}"
+            id="probe-pill-{{ c.id }}">
+        {% if c.probe.status == 'done' %}已完成{% elif c.probe.status == 'failed' %}失败{% elif c.probe.status == 'pending' %}{% if c.realtime %}已推送，等待执行{% else %}等待客户端心跳{% endif %}{% else %}执行中{% endif %}
       </span>
       <span class="hint">{{ c.probe.requested_at }}{% if c.probe.requested_by %} · {{ c.probe.requested_by }}{% endif %}</span>
       <span class="spacer"></span>
@@ -173,7 +181,7 @@
     </div>
     <div class="actions">
       <button type="submit">下发指令</button>
-      <span class="hint">指令在下一次心跳（≤{{ heartbeat_interval }} 秒）被取走并执行，结果会显示在上面</span>
+      <span class="hint">连着实时通道就<b>秒到</b>；没连上则等下一次心跳（≤{{ heartbeat_interval }} 秒）取走执行。结果都显示在上面</span>
     </div>
   </form>
 
@@ -194,7 +202,7 @@
       <div class="actions"><button type="submit">保存</button></div>
     </form>
     <form method="post" action="/clients/{{ c.id }}/delete"
-          onsubmit="return confirm('只删后台这条登记记录，客户端本身不受影响。\n它下次心跳会重新登记。确定删除？')">
+          data-confirm="只删后台这条登记记录，客户端本身不受影响。它下次心跳会重新登记。确定删除？">
       <div class="actions"><button class="danger" type="submit">删除这条客户端记录</button></div>
     </form>
   </details>
@@ -207,53 +215,7 @@
   默认名是机器名。想区分就点「改名」。
 </p>
 
-<script>
-// 账号下拉一变，角色下拉只留该账号名下的角色。
-// 直接在 DOM 上按 data-acc 过滤 —— 服务端已经把全量角色的归属写在 data 属性里了，
-// 不需要再发一次请求。
-function filterRoles(sel, cliId) {
-  var box = document.getElementById('roles-' + cliId);
-  if (!box) return;
-  var acc = sel.value;
-  var opts = box.querySelectorAll('option[data-acc]');
-  for (var i = 0; i < opts.length; i++) {
-    var o = opts[i];
-    var keep = (acc === '' || o.getAttribute('data-acc') === acc);
-    o.hidden = !keep;
-    if (!keep && o.selected) { box.value = ''; }
-  }
-  // 没选账号 → 角色下拉整体不可用
-  box.disabled = (acc === '');
-}
-// 进页面先按当前值收敛一次，避免刚打开就看到别的账号的角色
-document.addEventListener('DOMContentLoaded', function () {
-  var sels = document.querySelectorAll('select[data-cli]');
-  for (var i = 0; i < sels.length; i++) {
-    filterRoles(sels[i], sels[i].getAttribute('data-cli'));
-  }
-  // 每 15 秒刷新一次在线状态（心跳 30 秒一拍，15 秒足够跟得上）
-  setInterval(refreshOnline, 15000);
-});
-
-function refreshOnline() {
-  fetch('/api/clients', {headers: {'Accept': 'application/json'}})
-    .then(function (r) { return r.ok ? r.json() : null; })
-    .then(function (d) {
-      if (!d) return;
-      var set = function (id, v) { var e = document.getElementById(id); if (e) e.textContent = v; };
-      set('n-online', d.online.online);
-      set('n-offline', d.online.offline);
-      set('n-paused', d.online.paused);
-      set('n-total', d.online.total);
-      (d.clients || []).forEach(function (c) {
-        var dot = document.querySelector('#cli-' + c.id + ' .dot');
-        if (dot) {
-          dot.className = 'dot ' + (c.online ? 'on' : (c.age_seconds !== null && c.age_seconds <= d.offline_after * 6 ? 'stale' : 'off'));
-        }
-      });
-    })
-    .catch(function () { /* 刷新失败无所谓，页面上次的数据继续显示 */ });
-}
-</script>
-
+{# 交互脚本一律放在 /static/console.js（外部同源文件）—— 页面里写内联脚本或
+   内联事件处理器（onclick= / onsubmit= …）会被 CSP 的 script-src 'self' 拒掉，
+   而且是静默失效，页面上看不到任何报错。 #}
 {% endblock %}

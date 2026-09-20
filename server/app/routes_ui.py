@@ -10,7 +10,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from . import db, managed, plan, security, settings
+from . import db, managed, plan, realtime, security, settings
 
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
@@ -382,7 +382,10 @@ async def config_save(request: Request):
                                 status_code=303)
     ver = db.config_save(payload, note=str(form.get("note") or ""),
                          by=current_user(request) or "?")
-    db.event("info", "console", "配置已更新到版本 v%d" % ver)
+    # 配置变了 → 通知所有在线客户端「你手里的版本过期了」，它们会自行决定何时重拉
+    pushed = realtime.notify_all("config", version=ver)
+    db.event("info", "console", "配置已更新到版本 v%d%s"
+             % (ver, "（已实时通知 %d 台客户端）" % pushed if pushed else ""))
     return RedirectResponse("/config?saved=1", status_code=303)
 
 
@@ -396,6 +399,7 @@ def config_restore(request: Request, ver: int):
         return RedirectResponse("/config?err=%s" % _q("找不到版本 v%d" % ver), status_code=303)
     payload = managed.filter_payload(json.loads(row["payload_json"]))
     newv = db.config_save(payload, note="回滚自 v%d" % ver, by=current_user(request) or "?")
+    realtime.notify_all("config", version=newv)
     db.event("info", "console", "配置回滚：v%d -> 新版本 v%d" % (ver, newv))
     return RedirectResponse("/config?restored=1", status_code=303)
 
@@ -435,6 +439,13 @@ async def job_create(request: Request):
         slot = "auto"
     rid = db.request_create(slot, only, dry, current_user(request) or "?", note,
                             client_id=cid)
+    # ★ 立刻推给采集端，别让它等到下一拍心跳（最多 30 秒）才知道有活干。
+    #   推送只是「提醒」：任务本身已经落库，推不到也会被心跳兜住。
+    #   定向任务只推给点名的那台；公共任务谁都能领，所以推给全部在线客户端。
+    if cid:
+        realtime.notify_client(cid, "jobs", job=rid)
+    else:
+        realtime.notify_all("jobs", job=rid)
     target = (db.client_get(cid) or {}).get("name") if cid else "任意客户端"
     db.event("info", "console", "新建待执行任务 #%d（%s 档，范围=%s，执行者=%s）"
              % (rid, slot, only or "按档位", target))
@@ -453,9 +464,14 @@ def job_cancel(request: Request, req_id: int):
 #
 # 拓扑：后端与采集端可能不在同一台机器（也可能就在同一台），但后端一律
 # **不主动连**采集端 —— 所有交互都由采集端发起。
-# 所以「在线」= 客户端心跳的 last_seen 距今多久；「探测」= 把指令挂到客户端那行，
-# 等它下次心跳（最多 30 秒）带走执行，再把结果报回来。
-# 界面上写清楚了这一点，免得用的人以为是实时的。
+# 采集端常驻时会建一条 WebSocket 长连接（见 realtime.py）：后台派任务 / 下指令
+# **毫秒级**送达；长连接没建起来（防火墙、反代没透传 Upgrade、NAT 掐空闲连接……）
+# 就退回心跳节奏。
+#
+# 两条铁律：
+#   ①「在线 / 离线」始终看心跳的 last_seen 年龄 —— **不能**拿长连接在不在当判据
+#      （长连接只影响快慢，不影响在不在）。
+#   ② 待办状态始终在数据库里，推送只是「喊一声」；所以断开最多让事情慢一拍，绝不丢活。
 
 @router.get("/clients", response_class=HTMLResponse)
 def clients_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
@@ -466,6 +482,9 @@ def clients_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
     for c in rows:
         c["_roles"] = [r for r in (db.role_list(int(c["account_id"]))
                                    if c.get("account_id") else []) if r.get("enabled")]
+        # 实时通道此刻连没连上。**只作提示**（连上=推送毫秒到，没连=等下一拍心跳），
+        # 「在线/离线」始终看 age_seconds —— 别拿实时通道当在线判据。
+        c["realtime"] = realtime.is_connected(c.get("uid") or "")
     return templates.TemplateResponse(request, "clients.html", _ctx(
         request, nav="clients", clients=rows, accounts=accounts,
         online=db.client_online_count(), ok=ok, err=err, hl=hl,
@@ -489,7 +508,8 @@ async def client_assign(request: Request, cid: int):
     """指派某台客户端该跑哪个账号 / 哪个角色。
 
     这一步是「后端设置账号角色、客户端自动切换」的入口：改完这里，
-    客户端下一次心跳就会看到 switch_needed=true，然后自己切过去。
+    客户端连着实时通道就**立刻**看到 switch_needed=true 并切过去；
+    没连上则下一次心跳看到，然后自己切。两条路径取的是同一份状态（build_client_state）。
     """
     require_admin(request)
     form = await request.form()
@@ -500,6 +520,7 @@ async def client_assign(request: Request, cid: int):
 
     if aid is None:
         db.client_update(cid, account_id=None, role_id=None)
+        realtime.push_state_to_client(cid)
         db.event("info", "console", "客户端 #%d 取消账号指派" % cid)
         return RedirectResponse("/clients?hl=%d" % cid, status_code=303)
 
@@ -513,6 +534,7 @@ async def client_assign(request: Request, cid: int):
             return RedirectResponse("/clients?err=%s" % _q("角色不属于该账号，已忽略角色"),
                                     status_code=303)
     db.client_update(cid, account_id=aid, role_id=rid)
+    realtime.push_state_to_client(cid)
     label = "%s / %s" % (acc["label"], (db.role_get(rid) or {}).get("name") or "不限角色") \
         if rid else acc["label"]
     db.event("info", "console", "客户端 #%d 指派为 %s" % (cid, label))
@@ -529,6 +551,8 @@ def client_toggle(request: Request, cid: int):
         return RedirectResponse("/clients?err=%s" % _q("客户端不存在"), status_code=303)
     newv = 0 if cli.get("enabled") else 1
     db.client_update(cid, enabled=newv)
+    # 推一份新状态过去，客户端立刻知道「我被暂停了 / 恢复了」，不用等下一拍心跳
+    realtime.push_state_to_client(cid)
     db.event("warn", "console", "客户端 #%d %s任务派发" % (cid, "恢复" if newv else "暂停"))
     return RedirectResponse("/clients?hl=%d&ok=%s"
                             % (cid, _q("已%s任务派发" % ("恢复" if newv else "暂停"))),
@@ -537,7 +561,7 @@ def client_toggle(request: Request, cid: int):
 
 @router.post("/clients/{cid}/probe")
 async def client_probe(request: Request, cid: int):
-    """给客户端挂一条一次性指令。它下次心跳（≤30s）带回去执行。"""
+    """给客户端挂一条一次性指令。连着实时通道就**秒到**，否则下次心跳取回。"""
     require_admin(request)
     form = await request.form()
     kind = str(form.get("kind") or "probe")
@@ -545,10 +569,16 @@ async def client_probe(request: Request, cid: int):
     if not db.client_get(cid):
         return RedirectResponse("/clients?err=%s" % _q("客户端不存在"), status_code=303)
     p = db.client_request_probe(cid, kind=kind, by=current_user(request) or "?", note=note)
-    db.event("info", "console", "请求客户端 #%d 执行「%s」" % (cid, db.PROBE_KINDS.get(kind, kind)))
+    # 指令已落库；推进去只是让它别等（客户端收到后仍走 /ping 那条路取指令）
+    pushed = realtime.notify_client(cid, "command", probe=p.get("id"))
+    db.event("info", "console", "请求客户端 #%d 执行「%s」%s"
+             % (cid, db.PROBE_KINDS.get(kind, kind), "（已实时推送）" if pushed else ""))
     return RedirectResponse("/clients?hl=%d&ok=%s"
-                            % (cid, _q("已下发指令，等它下次心跳（最多 %d 秒）"
-                                       % settings.HEARTBEAT_INTERVAL)), status_code=303)
+                            % (cid, _q("已下发指令%s"
+                                       % ("（实时通道已送达）" if pushed
+                                          else "，等它下次心跳（最多 %d 秒）"
+                                               % settings.HEARTBEAT_INTERVAL))),
+                            status_code=303)
 
 
 @router.post("/clients/{cid}/probe/clear")
@@ -583,6 +613,9 @@ def api_clients(request: Request):
             "current": (c.get("status") or {}).get("current") or {},
             "enabled": bool(c.get("enabled")),
             "probe_status": (c.get("probe") or {}).get("status"),
+            # 实时通道是否连着。同样只作提示：连上=后台的指令/任务秒到，
+            # 没连=退回心跳节奏（最多等一个心跳间隔）。不是在线判据。
+            "realtime": realtime.is_connected(c.get("uid") or ""),
         } for c in rows],
     })
 
@@ -720,7 +753,7 @@ async def role_save(request: Request, rid: int):
     """保存单个角色的全部设置（在「角色执行」页上配置）。
 
     这是「每个游戏角色跑什么任务」的唯一入口，保存后不需要动客户端配置 ——
-    客户端下一次心跳就会拿到新的 task_plan。
+    客户端连着实时通道立刻拿到新的 task_plan，没连上则下一次心跳拿到。
 
     字段：name / tab / server / season（备注）/ enabled / mode / task_* / slot_* / note
     """
@@ -744,6 +777,8 @@ async def role_save(request: Request, rid: int):
     if tp:
         fields["task_plan"] = tp
     db.role_update(rid, **fields)
+    # 任务模式/启停变了，立刻推给正跑着这个角色的客户端（推不到的会被心跳兜住）
+    realtime.push_state_for_role(rid, account_id=role.get("account_id"))
 
     p = plan.loads_plan(tp or role.get("task_plan"))
     if p["mode"] == plan.MODE_CUSTOM and not plan.selected_tasks(p):

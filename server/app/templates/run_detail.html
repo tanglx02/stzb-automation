@@ -26,7 +26,7 @@
   {% if report %}<a class="btn primary" href="/runs/{{ run.id }}/report" target="_blank">在新窗口打开完整报告</a>{% endif %}
   <a class="btn" href="/runs">← 回列表</a>
   <form method="post" action="/runs/{{ run.id }}/delete"
-        onsubmit="return confirm('确定删除这一轮记录及它的报告和截图？')">
+        data-confirm="确定删除这一轮记录及它的报告和截图？">
     <button class="danger" type="submit">删除这一轮</button>
   </form>
 </div>

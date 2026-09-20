@@ -2377,6 +2377,86 @@ def test_current_role():
           _A.ROLE_NAME_ANCHOR == "势力值")
 
 
+def test_run_liveness():
+    """「本机是否正在跑一轮」的判据（常驻代理与 run_daily 共用）。
+
+    判错的两个方向都会出事：
+      · 把空闲判成忙  → 后台派的任务永远接不了（提示「已有一轮在跑」但其实是残留锁）；
+      · 把忙判成空闲  → 两个进程一起点模拟器，点击全部错位，还可能重复领奖。
+    """
+    print("\n[34] 本机运行状态判据")
+    import datetime as _dt
+    import json as _json
+    import subprocess
+    import tempfile
+
+    from stzb.identity import (LOCK_STALE_SECONDS, pid_alive, run_in_progress,
+                               run_lock_path)
+
+    def _write_lock(path, pid, started):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            _json.dump({"pid": pid, "started": started}, f)
+
+    def _now_iso():
+        return _dt.datetime.now().isoformat(timespec="seconds")
+
+    root = tempfile.mkdtemp(prefix="stzb_live_")
+    lock = run_lock_path(root)
+
+    # 没有锁文件 → 空闲
+    check("没有锁文件 → 不算在跑", run_in_progress(root) is False)
+
+    # 锁里写的是**自己**的 pid → 不算「别人在跑」
+    _write_lock(lock, os.getpid(), _now_iso())
+    check("锁里是自己的 pid → 不算在跑（避免自锁）", run_in_progress(root) is False)
+
+    # ★ 残留锁（pid 早就不在了）→ 必须判成**空闲**，否则任务永远接不了
+    _write_lock(lock, 999999, _now_iso())
+    check("pid 已不在（残留锁）→ 判空闲，不是忙", run_in_progress(root) is False)
+
+    # pid 活着但锁已超龄 → 也当残留
+    p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
+    try:
+        old = _dt.datetime.now() - _dt.timedelta(seconds=LOCK_STALE_SECONDS + 60)
+        _write_lock(lock, p.pid, old.isoformat(timespec="seconds"))
+        check("pid 活着但锁超龄 → 判空闲", run_in_progress(root) is False)
+
+        # pid 活着且锁是新鲜的 → 这才算「真有一轮在跑」
+        _write_lock(lock, p.pid, _now_iso())
+        check("pid 活着 + 锁新鲜 → 判「正在跑」", run_in_progress(root) is True)
+        check("pid_alive 对活着的进程返回 True", pid_alive(p.pid) is True)
+    finally:
+        try:
+            p.kill()
+            p.wait(timeout=5)
+        except Exception:
+            pass
+    check("pid_alive 对不存在的 pid 返回 False", pid_alive(999999) is False)
+
+    # 锁文件内容坏掉（半截 JSON / 空文件）→ 判空闲，绝不抛异常
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("{ 坏掉的内容")
+    check("锁文件内容坏掉 → 判空闲且不抛异常", run_in_progress(root) is False)
+    with open(lock, "w", encoding="utf-8") as f:
+        f.write("")
+    check("锁文件为空 → 判空闲", run_in_progress(root) is False)
+
+    # 常驻代理起 run_daily 时必须带 --job-only（否则队列空就会误跑一轮常规任务）
+    with open(os.path.join(ROOT, "agent.py"), encoding="utf-8") as f:
+        agent_src = f.read()
+    check("常驻代理起 run_daily 时带上了 --job-only",
+          '--job-only' in agent_src, "agent.py 里找不到 --job-only")
+    with open(os.path.join(ROOT, "run_daily.py"), encoding="utf-8") as f:
+        rd_src = f.read()
+    check("run_daily 实现了 --job-only 且队列空时直接退出（不退化成常规运行）",
+          "args.job_only and not job" in rd_src and "job-only" in rd_src)
+    check("run_daily 与常驻代理共用同一套存活判据（不各自实现一遍）",
+          "from stzb.identity import" in rd_src and "run_in_progress" in agent_src
+          and "def pid_alive" not in rd_src)
+
+
+
 def test_role_dialog():
     print("\n[33] 「选择角色」对话框：按角色名识别 / 点选")
     # ★★★ 2026-09-20 实机发现：这才是「按角色名识别」唯一可靠的地方。
@@ -2493,6 +2573,7 @@ if __name__ == "__main__":
     test_junqing_and_recruit()
     test_current_role()
     test_role_dialog()
+    test_run_liveness()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)

@@ -394,6 +394,13 @@ details.more > summary { cursor: pointer; font-size: 13px; color: var(--muted); 
 .chip.skip { background: var(--skip-bg); color: var(--skip); }
 .chip .n { opacity: .75; font-variant-numeric: tabular-nums; }
 
+/* 实时通道指示灯（客户端卡片上那颗）。
+   连上=后台派的任务/指令毫秒级送达；没连=退回心跳节奏（最多等一拍心跳）。
+   刻意做得比「在线/离线」那颗 pill 弱一些 —— 它是「快慢」提示，不是状态判据。 */
+.chip.rt { font-size: 11px; letter-spacing: .3px; }
+.chip.rt.on { background: #e8f1fd; color: #1a6fd4; }
+.chip.rt.off { background: #f2f3f6; color: var(--muted); }
+
 .bar { height: 6px; border-radius: 999px; background: #eceef3; overflow: hidden;
   margin-top: 9px; }
 .bar > i { display: block; height: 100%; background: var(--ok); border-radius: 999px; }

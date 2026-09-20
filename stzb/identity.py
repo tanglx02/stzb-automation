@@ -126,3 +126,81 @@ def write_assignment_cache(data: Dict[str, Any], state_path: Optional[str] = Non
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# ================================================================== 进程存活判断
+#
+# 下面这几个东西是「同一台机器上有没有一轮任务正在跑」的**唯一判据**。
+# 常驻代理（agent.py）靠它决定「后台派的活现在能不能接」，run_daily 靠它
+# 决定「要不要接管上一个进程留下的锁」。两处各写一遍必然分叉 ——
+# 分叉的后果是「代理以为空闲、其实有任务在跑」，两边一起点模拟器，
+# 点击全部错位（这个坑真踩过，见 RunLock 的说明）。
+
+# 单实例锁的最长有效期（秒）。正常一轮含冷启动模拟器在 10 分钟以内，
+# 超过就当成上次异常退出（关窗口 / 蓝屏 / 任务计划强杀）留下的残留锁。
+LOCK_STALE_SECONDS = 2400
+
+
+def pid_alive(pid: int) -> bool:
+    """判断进程是否还活着（跨平台，任何异常都当「不活着」）。
+
+    ⚠️ Windows 上**不能**用 `os.kill(pid, 0)` 探活：Windows 的 os.kill 会把
+    非 CTRL_* 的信号实现成 `TerminateProcess` —— 探活探成杀人，直接把那台
+    正在跑任务的进程干掉。所以这里走 Win32 API 查退出码。
+    """
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            h = k32.OpenProcess(0x1000, False, int(pid))
+            if not h:
+                return False
+            code = ctypes.c_ulong()
+            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
+            k32.CloseHandle(h)
+            return bool(ok) and code.value == 259      # STILL_ACTIVE
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except Exception:
+        return False
+
+
+def run_lock_path(project_root: str) -> str:
+    """单实例锁的位置（run_daily 与 agent 必须用同一个）。"""
+    return os.path.join(project_root, "state", "run.lock")
+
+
+def run_in_progress(project_root: str, now: Optional[float] = None) -> bool:
+    """本机此刻是否**真有一轮任务在跑**。
+
+    ★ 判据是「锁文件里的 pid 还活着 **且** 锁没超龄」，不是「锁文件在不在」——
+      被强杀的进程会留下残留锁文件，拿「文件存在」当判据会把其实空闲的机器
+      判成「忙」，于是后台派的活永远接不了。run_daily 自己也是这么判的
+      （它会识别并接管残留锁），两边口径必须一致。
+    """
+    import time as _t
+    import datetime as _dt
+    p = run_lock_path(project_root)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            d = json.load(f) or {}
+    except Exception:
+        return False
+    try:
+        pid = int(d.get("pid") or 0)
+    except Exception:
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    try:
+        age = (_t.time() if now is None else now) - \
+            _dt.datetime.fromisoformat(str(d.get("started"))).timestamp()
+    except Exception:
+        age = LOCK_STALE_SECONDS + 1          # 读不出开始时间 → 当过期
+    return age < LOCK_STALE_SECONDS and pid_alive(pid)

@@ -6,6 +6,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -16,7 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import db, security, settings
+from . import db, realtime, security, settings
+from .realtime import router as realtime_router
 from .routes_agent import router as agent_router
 from .routes_ui import router as ui_router
 
@@ -50,7 +52,13 @@ async def lifespan(app: FastAPI):
     _banner(creds)
     if not creds:
         log.info("已初始化过，跳过引导。数据目录=%s", settings.DATA_DIR)
-    yield
+    # 实时通道要靠事件循环才能从别的线程推消息（管理端路由是同步函数），
+    # 所以这里先把循环记下来；退出时清掉，免得关闭过程中还往里塞回调。
+    realtime.bind_loop(asyncio.get_running_loop())
+    try:
+        yield
+    finally:
+        realtime.unbind_loop()
 
 
 app = FastAPI(title=settings.APP_NAME, version=settings.APP_VERSION,
@@ -71,12 +79,23 @@ os.makedirs(_static, exist_ok=True)
 app.mount("/static", StaticFiles(directory=_static), name="static")
 
 app.include_router(agent_router)
+app.include_router(realtime_router)
 app.include_router(ui_router)
 
 
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
-    """给所有响应加上基础安全头。报告页自己那份更严，会覆盖这里。"""
+    """给所有响应加上基础安全头。报告页自己那份更严，会覆盖这里。
+
+    ★ script-src 从 'none' 放宽到 'self'（**只放同源外部文件，仍然禁止内联**）——
+      这不是放松安全，而是修一个静默失效的 bug：
+      原来写死 'none'，而控制台页面里用的是内联脚本和内联 onsubmit= 确认框，
+      浏览器一律不执行、且**页面上不报任何错**（只有开发者控制台里才有）。
+      后果是「删除客户端 / 删除运行记录 / 轮换采集端令牌」这些不可逆操作
+      **没有二次确认框**，角色下拉联动和在线状态自动刷新也全都没生效。
+      现在：脚本一律放 /static/*.js，页面里零内联 → 'self' 就够了，
+      不需要 'unsafe-inline'，XSS 防护强度不变。
+    """
     resp = await call_next(request)
     resp.headers.setdefault("X-Content-Type-Options", "nosniff")
     resp.headers.setdefault("X-Frame-Options", "SAMEORIGIN")
@@ -84,7 +103,8 @@ async def security_headers(request: Request, call_next):
     resp.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
-        "script-src 'none'; form-action 'self'; base-uri 'none'; frame-ancestors 'self'",
+        "script-src 'self'; connect-src 'self'; form-action 'self'; "
+        "base-uri 'none'; frame-ancestors 'self'",
     )
     return resp
 

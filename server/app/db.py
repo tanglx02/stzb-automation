@@ -750,6 +750,38 @@ def client_probe_finish(cid: int, ok: bool, message: str = "",
           "客户端 #%d 探测%s：%s" % (cid, "完成" if ok else "失败", str(message or "")[:120]))
 
 
+def client_probe_requeue(cid: int, note: str = "") -> bool:
+    """把「已取走但没能执行」的指令**放回待执行**（状态改回 pending）。
+
+    用途只有一个，但很关键：
+
+        客户端正在跑任务时收到「探测界面 / 强制切换」，它**不能**同时操作
+        游戏界面 —— 探测要截屏 OCR、切换要点按钮，跟正在跑的任务会互相打架，
+        结果两边都乱。所以客户端会回报一个 `BUSY:` 开头的失败，
+        我们在这里把指令放回队列，等它闲下来自然会再取走执行。
+
+    没有这一步的话：管理端点了「探测」，客户端恰好忙 → 指令被消费掉 →
+    **永远不执行**，而界面上还显示「已下发」，非常误导人。
+
+    返回 True 表示确实放回去了（原本是 running 状态）。
+    """
+    with tx() as c:
+        row = c.execute("SELECT probe_json FROM clients WHERE id=?", (cid,)).fetchone()
+        if not row or not row["probe_json"]:
+            return False
+        payload = _loads(row["probe_json"], {}) or {}
+        if payload.get("status") != "running":
+            return False
+        payload["status"] = "pending"
+        payload["taken_at"] = None
+        payload["deferred_at"] = now()
+        if note:
+            payload["defer_note"] = str(note)[:200]
+        c.execute("UPDATE clients SET probe_json=? WHERE id=?",
+                  (json.dumps(payload, ensure_ascii=False), cid))
+    return True
+
+
 def client_online_count() -> Dict[str, int]:
     with tx() as c:
         rows = c.execute("SELECT last_seen, enabled FROM clients").fetchall()

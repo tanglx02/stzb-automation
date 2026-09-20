@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}{{ app_name }}{% endblock %}</title>
 <link rel="stylesheet" href="/static/style.css">
+{# 控制台的全部交互都在这个外部文件里。**不要**在页面里写内联 <script> 或
+   内联事件处理器（onclick= / onsubmit= …）—— CSP 的 script-src 是 'self'，
+   内联的一律不执行且不报错（只有在浏览器控制台看得到），曾经因此让
+   「删除前二次确认」静默失效。 #}
+<script src="/static/console.js" defer></script>
 {% block head %}{% endblock %}
 </head>
 <body>

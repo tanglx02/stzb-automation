@@ -45,8 +45,11 @@ from stzb.cloud import upload_run, load_last_report, CloudClient, CloudError, ho
 from stzb.config import load                      # noqa: E402
 from stzb.core import DEFAULT_ADB, GAME_PKG, Device   # noqa: E402
 from stzb.emulator import MuMu                    # noqa: E402
-from stzb.heartbeat import Heartbeat, StatusBox   # noqa: E402
-from stzb.identity import Identity, read_assignment_cache, write_assignment_cache
+from stzb.heartbeat import StatusBox             # noqa: E402
+from stzb.realtime import BUSY_PREFIX, Realtime   # noqa: E402
+from stzb.identity import (Identity, LOCK_STALE_SECONDS, pid_alive,  # noqa: E402
+                           read_assignment_cache, run_lock_path,
+                           write_assignment_cache)
 from stzb.remote_config import apply_remote, pick_job   # noqa: E402
 from stzb.report import RunReport                 # noqa: E402
 from stzb import task_plan as tplan               # noqa: E402
@@ -57,39 +60,12 @@ STATE = os.path.join(ROOT, "state", "last_run.json")
 REMOTE_STATE = os.path.join(ROOT, "state", "remote_config.json")   # 远端配置落地记录
 CLIENT_STATE = os.path.join(ROOT, "state", "client.json")          # 客户端稳定标识
 ASSIGN_CACHE = os.path.join(ROOT, "state", "assignment.json")      # 后端指派缓存
-LOCK = os.path.join(ROOT, "state", "run.lock")
+# 单实例锁：位置与「进程还活着吗」的判断统一放在 stzb.identity ——
+# 常驻代理 agent.py 要用同一套口径判断「现在能不能接后台派的活」。
+LOCK = run_lock_path(ROOT)
 LOG_DIR = os.path.join(ROOT, "logs")
 SHOT_DIR = os.path.join(ROOT, "logs", "shots")
 REPORT_DIR = os.path.join(ROOT, "logs", "reports")
-
-# 单实例锁的最长有效期。正常一轮 10 分钟以内（含冷启动模拟器），超过就当成上次异常退出留下的。
-LOCK_STALE_SECONDS = 2400
-
-
-def pid_alive(pid: int) -> bool:
-    """判断进程是否还活着（跨平台，不抛异常）。"""
-    if pid <= 0:
-        return False
-    if os.name == "nt":
-        try:
-            import ctypes
-            k32 = ctypes.windll.kernel32
-            # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            h = k32.OpenProcess(0x1000, False, int(pid))
-            if not h:
-                return False
-            code = ctypes.c_ulong()
-            ok = k32.GetExitCodeProcess(h, ctypes.byref(code))
-            k32.CloseHandle(h)
-            return bool(ok) and code.value == 259      # STILL_ACTIVE
-        except Exception:
-            return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except Exception:
-        return False
-
 
 class RunLock:
     """同一台模拟器同一时刻只允许一个实例操控。
@@ -327,16 +303,21 @@ def _cloud_ready(cfg, log) -> bool:
 
 # ---------------------------------------------------------------- 心跳 / 在线探测
 
-class HeartbeatSession:
-    """后台心跳的一条龙封装。
+class RealtimeSession:
+    """后台实时会话的一条龙封装（长连接优先，心跳降级兜底）。
 
-    服务端在公网、客户端在内网，服务端连不上客户端 —— 所以「后台看到客户端在线」
+    服务端在别处、客户端在内网，服务端连不上客户端 —— 所以「后台看到客户端在线」
     全靠这个线程主动上报。它同时承担两个职责：
       1. 让后台知道「我在线、我在干什么、我现在是哪个账号」
-      2. 把后台点在界面上的「探测」「强制切换」等指令取回来执行
+      2. 把后台点/派下来的「探测」「强制切换」即时接住
+
+    ★ 传输层由 `stzb.realtime.Realtime` 决定：**WebSocket 长连接优先**，
+      连不上（防火墙 / 反代没配 Upgrade / 网络抖动）就自动退回原来的 HTTP 心跳，
+      并周期性重试长连接。两种模式下本类的能力完全一样，只是快慢不同。
 
     刻意做成「用完就丢」的上下文管理器：主流程跑任务期间它在后台转，
-    任务一结束就停掉，不给长期驻留留隐患（定时任务每天跑两次，不是常驻服务）。
+    任务一结束就停掉 —— 跑完就退出的进程没必要挂着连接
+    （要「后台随时能戳到」请用常驻的 agent.py）。
     """
 
     def __init__(self, client, identity, mode: str, logger):
@@ -344,31 +325,36 @@ class HeartbeatSession:
         self.identity = identity
         self.log = logger
         self.box = StatusBox(mode=mode)
-        self.hb: Optional[Heartbeat] = None
+        self.rt: Optional[Realtime] = None
         self.assignment: Dict[str, Any] = {}
         self._ui = None            # 需要时才建（探测指令要用它截屏 OCR）
         self._make_ui = None
+        self.jobs_seen = 0         # 运行期间后台又派了几次任务
 
     def bind_ui_factory(self, fn) -> None:
         """挂一个「怎么造 Ui 对象」的工厂。收到探测指令时才用它。"""
         self._make_ui = fn
 
-    def start(self, interval: Optional[int] = None) -> "HeartbeatSession":
-        self.hb = Heartbeat(
+    def start(self, interval: Optional[int] = None) -> "RealtimeSession":
+        self.rt = Realtime(
             self.client, self.identity,
             state_fn=self.box.get,
             on_assignment=self._on_assignment,
             on_command=self._on_command,
+            on_notify=self._on_notify,
             logger=self.log,
             interval=interval,
+            # 本轮正在跑、中途插不了队，所以不要「一有待领任务就报一声」——
+            # 那会变成每次状态同步都喊一句的噪音（原因见 Realtime._apply）。
+            notify_on_pending_jobs=False,
         ).start()
         self.box.set(state="idle")
         return self
 
     def stop(self) -> None:
-        if self.hb:
-            self.hb.stop()
-            self.hb = None
+        if self.rt:
+            self.rt.stop()
+            self.rt = None
 
     def __enter__(self):
         return self
@@ -388,10 +374,39 @@ class HeartbeatSession:
             self.log("  · 后台要求切换账号/角色：%s" % reason)
             self.box.set(note="待切换：%s" % reason)
 
+    def _on_notify(self, what: str, msg: Dict[str, Any]) -> None:
+        """后台推过来的通知。
+
+        · "jobs"   —— 后台派了新任务。**本轮正在跑、插不了队**，所以只记一笔；
+                      这条任务会留在服务端队列里，由常驻代理或下一档接手
+                      （常驻 agent.py 收到同一条通知会立刻起一轮 run_daily）。
+        · "config" —— 远端配置变了。本轮不重拉（跑到一半换配置会让本轮结果
+                      前后不一致），下一轮自然会拉到新版本。
+        · 其它      —— 只是提醒本端同步一次状态（由 Realtime 内部处理）。
+        """
+        if what == "jobs":
+            self.jobs_seen += 1
+            job = msg.get("job")
+            self.log("  · 后台派了新任务%s；本轮正在跑，跑完后它仍在队列里等下一档"
+                     % ((" #%s" % job) if job else ""))
+            self.box.set(note="后台又派了任务，排在队列里")
+        elif what == "config":
+            self.log("  · 后台配置已更新到 v%s（本轮沿用已拉到的版本，下一轮生效）"
+                     % msg.get("version", "?"))
+
     def _on_command(self, cmd: Dict[str, Any]):
         """执行后台下发的一次性指令，返回 (ok, message, data)。"""
         kind = cmd.get("kind") or "probe"
         self.log("  · 收到后台指令：%s" % kind)
+
+        # ★「切换」会去动游戏界面（点按钮、切角色）。本机正在跑任务时干这件事，
+        #  两边的判断会互相打架（任务那边以为还在主城，其实已经被切走了）。
+        #  所以忙的时候**不硬闯**，回报 BUSY 让服务端把指令放回队列，
+        #  等本轮跑完自然会再取走执行 —— 管理端那一次点击不会白点。
+        #  探测是只读的（截屏 + OCR），半路看一眼界面本来就有用，所以放行。
+        if kind == "switch" and self.box.get().get("busy"):
+            return False, (BUSY_PREFIX + "本机正在跑任务，切换会与任务抢游戏界面，"
+                                        "已放回队列等本轮结束"), {"deferred": True}
 
         if kind == "probe":
             ui = self._ui_obj()
@@ -588,7 +603,10 @@ def main():
                     help="独立运行：完全不连后端（不拉配置、不领任务、不上传），"
                          "优先级高于 config.json")
     ap.add_argument("--upload-last", action="store_true",
-                    help="不跑任务，只把本地最近的报告补传到后端")
+                    help="只把本机最近一份报告补传到后端，不跑任务")
+    ap.add_argument("--job-only", action="store_true",
+                    help="只为「后台待执行队列」里的任务跑一轮；队列空就立刻退出，"
+                         "绝不退化成按档位的常规运行（常驻代理收到推送时用它）")
     ap.add_argument("--whoami", action="store_true",
                     help="打印本机的客户端标识（后台靠它认机器）")
     args = ap.parse_args()
@@ -661,10 +679,14 @@ def main():
     # 跳过上传时要说清是「模式决定」还是「命令行显式要求」，否则日志里看不出区别
     upload_skip_reason = "独立运行模式（不连后端）" if not managed else "按 --no-upload 跳过上传"
 
+    if args.job_only and not managed:
+        log("!! --job-only 只在「后端托管」模式下有意义，当前是独立运行 → 直接退出")
+        return 0
+
     client = None
     job = None
     identity = Identity.load(CLIENT_STATE)
-    hb_session: Optional[HeartbeatSession] = None
+    rt_session: Optional[RealtimeSession] = None
     assignment: Dict[str, Any] = {}
     if managed:
         try:
@@ -690,19 +712,19 @@ def main():
             log("  ! 后端探活失败：%s（继续跑，跑完再试上传）" % info)
 
         # 起后台心跳线程：跑任务期间持续上报在线状态，并接收后台指令
-        hb_session = HeartbeatSession(client, identity, mode, log)
-        hb_session.bind_ui_factory(lambda: Ui(
+        rt_session = RealtimeSession(client, identity, mode, log)
+        rt_session.bind_ui_factory(lambda: Ui(
             Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
                    serial_candidates=cfg.get("device.serial_candidates"),
                    shot_dir=shot_dir),
             cfg, logger=log, dry_run=True))
         try:
-            hb_session.start()
-            log("· 已开始后台心跳（每 %d 秒一次，后台可据此看到本机在线）"
-                % (hb_session.hb.interval if hb_session.hb else 30))
+            rt_session.start()
+            log("· 已开始后台实时会话（长连接优先；连不上会自动退回每 %d 秒心跳）"
+                % (rt_session.rt.interval if rt_session.rt else 30))
         except Exception as e:
             log("  ! 心跳线程启动失败：%r（不影响任务）" % (e,))
-            hb_session = None
+            rt_session = None
 
         # 心跳响应里带的指派：这是「后端设置账号角色 → 客户端自动切换」的数据来源
         if isinstance(info, dict) and info.get("assignment"):
@@ -729,6 +751,13 @@ def main():
 
         if cfg["cloud"].get("pull_jobs", True):
             job = pick_job(client, logger=log)
+        if args.job_only and not job:
+            # ★ 常驻代理收到「后台派了任务」的推送时会用 --job-only 起一轮。
+            #   队列空（任务被别的客户端抢走 / 已被取消）就**必须立刻退出** ——
+            #   否则会退化成「按当前档位跑一遍常规任务」，那就等于凭空多跑一轮，
+            #   还会重复领奖。这是这个开关存在的唯一理由。
+            log("· 按 --job-only：后台待执行队列里没有属于本机的任务，直接退出")
+            return 0
         if job:
             if job.get("slot") and job["slot"] != "auto":
                 slot = job["slot"]
@@ -762,15 +791,15 @@ def main():
             if tplan.is_paused(tp):
                 log("· 角色「%s」的执行任务模式是「暂停执行」→ 本轮不跑任何任务"
                     % role_name)
-                if hb_session:
-                    hb_session.box.set(state="idle", busy=False,
+                if rt_session:
+                    rt_session.box.set(state="idle", busy=False,
                                        note="角色已设为暂停执行")
                 return 0
             if not tplan.allows_slot(tp, slot):
                 log("· 角色「%s」只在 %s 档运行，当前是 %s 档 → 本轮跳过"
                     % (role_name, "、".join(tplan.normalize(tp)["slots"]), slot))
-                if hb_session:
-                    hb_session.box.set(state="idle", busy=False,
+                if rt_session:
+                    rt_session.box.set(state="idle", busy=False,
                                        note="不在该角色的运行档位")
                 return 0
             picked = tplan.selected_tasks(tp, cfg.get("tasks"))
@@ -779,8 +808,8 @@ def main():
                     log("  ! 角色「%s」的执行任务模式是「自定义」，但一个任务都没勾选"
                         % role_name)
                     log("    到后台「角色执行」页给它勾上要跑的任务（或改回「跟随后端全局配置」）。")
-                    if hb_session:
-                        hb_session.box.set(state="idle", busy=False,
+                    if rt_session:
+                        rt_session.box.set(state="idle", busy=False,
                                            note="角色任务模式未勾选任何任务")
                     return 0
                 only = list(picked)
@@ -853,8 +882,8 @@ def main():
         return code
 
     # ---------------------------------------------------------------- 1. 模拟器
-    if hb_session:
-        hb_session.box.set(state="starting", busy=True, note="正在准备模拟器")
+    if rt_session:
+        rt_session.box.set(state="starting", busy=True, note="正在准备模拟器")
     if args.no_emulator:
         rlog("· 按 --no-emulator 跳过模拟器管理，直接连 ADB")
     else:
@@ -882,9 +911,9 @@ def main():
         return _bail(3, "ADB 连接失败")
     rlog("· ADB 已连接：%s" % dev.serial)
     report.env_info(ADB设备=dev.serial)
-    if hb_session:
-        hb_session.box.set(state="starting", note="ADB 已连接，准备打开游戏")
-        hb_session.box.patch_device(emulator_running=True, adb_serial=dev.serial)
+    if rt_session:
+        rt_session.box.set(state="starting", note="ADB 已连接，准备打开游戏")
+        rt_session.box.patch_device(emulator_running=True, adb_serial=dev.serial)
 
     # ---------------------------------------------------------------- 3. 游戏
     if dev.game_running(pkg):
@@ -897,13 +926,13 @@ def main():
         if not wait_game_ready(dev, pkg, timeout=120, log=rlog):
             return _bail(4, "游戏启动失败")
         report.env_info(游戏启动耗时="%.0f 秒" % (time.time() - t0))
-    if hb_session:
-        hb_session.box.set(state="starting", note="游戏已启动")
-        hb_session.box.patch_device(game_running=True)
+    if rt_session:
+        rt_session.box.set(state="starting", note="游戏已启动")
+        rt_session.box.patch_device(game_running=True)
 
     ui = Ui(dev, cfg, logger=rlog, dry_run=dry_run)
-    if hb_session:
-        hb_session._ui = ui          # 后台探测指令直接复用这个 Ui，不用另建
+    if rt_session:
+        rt_session._ui = ui          # 后台探测指令直接复用这个 Ui，不用另建
 
     # ---------------------------------------------------------------- 3.5 账号/角色切换
     # 放在 boot() 之前：切换必须在**登录页**完成（「点击换区」是登录页的入口），
@@ -924,8 +953,8 @@ def main():
             rlog("· 本机设置：不切角色，只校验账号")
 
     if want_switch and (assignment.get("masked") or assignment.get("role")):
-        if hb_session:
-            hb_session.box.set(state="switching", note="正在按后台指派切换账号/角色")
+        if rt_session:
+            rt_session.box.set(state="switching", note="正在按后台指派切换账号/角色")
         rlog("· 按后台指派校验账号 / 角色…")
         t_sw = time.time()
         sw = ensure_target(ui, assignment, log=rlog, dry_run=dry_run)
@@ -934,13 +963,13 @@ def main():
         if not sw.ok:
             # 切换失败**不能硬着头皮跑** —— 那是别人的账号，跑出来的任务全错。
             rlog("!! 账号/角色切换失败，本轮中止（避免跑错账号）")
-            if hb_session:
-                hb_session.box.set(state="error",
+            if rt_session:
+                rt_session.box.set(state="error",
                                    note="切换失败：%s" % sw.reason)
-                hb_session.box.patch_current(switched_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+                rt_session.box.patch_current(switched_at=time.strftime("%Y-%m-%d %H:%M:%S"))
             return _bail(5, "账号/角色切换失败：%s" % sw.reason)
-        if hb_session:
-            hb_session.box.patch_current(
+        if rt_session:
+            rt_session.box.patch_current(
                 masked=sw.masked or assignment.get("masked"),
                 role=sw.role or assignment.get("role"),
                 account_label=assignment.get("label"),
@@ -950,15 +979,15 @@ def main():
 
     # ---------------------------------------------------------------- 4. 进主城
     t0 = time.time()
-    if hb_session:
-        hb_session.box.set(state="starting", note="正在进入主城")
+    if rt_session:
+        rt_session.box.set(state="starting", note="正在进入主城")
     if not ui.boot():
         return _bail(4, "进主城失败")
     report.env_info(进入主城耗时="%.0f 秒" % (time.time() - t0))
 
     # ---------------------------------------------------------------- 5. 任务
-    if hb_session:
-        hb_session.box.set(state="running", busy=True,
+    if rt_session:
+        rt_session.box.set(state="running", busy=True,
                            note="正在跑 %s 档任务" % slot)
     started = time.time()
     res = run_all(ui, cfg, slot, only=only, logger=log, report=report)
@@ -967,8 +996,8 @@ def main():
     for k, v in res.items():
         log("  %-10s %s" % (k, "OK" if v else "失败/跳过"))
     log("耗时 %.1f 秒；源截图存于 %s" % (time.time() - started, shot_dir))
-    if hb_session:
-        hb_session.box.set(state="idle", busy=False,
+    if rt_session:
+        rt_session.box.set(state="idle", busy=False,
                            note="%s 档跑完，成功 %d / 共 %d"
                                 % (slot, sum(1 for v in res.values() if v), len(res)),
                            last_run_at=dt.datetime.now().isoformat(timespec="seconds"))
@@ -1032,15 +1061,15 @@ def main():
 
     # 收尾前把「跑完了」这个状态刷上去，再停心跳 ——
     # 否则后台看到的最后一拍还停在「正在跑」，要等 90 秒才判离线。
-    if hb_session:
-        hb_session.box.set(state="idle", busy=False,
+    if rt_session:
+        rt_session.box.set(state="idle", busy=False,
                            note="本轮结束（%s 档）" % slot,
                            last_run_at=dt.datetime.now().isoformat(timespec="seconds"))
         try:
-            hb_session.hb.beat()        # 立刻补一拍，后台马上就看到「空闲了」
+            rt_session.rt.beat_now()    # 立刻补一拍，后台马上就看到「空闲了」
         except Exception:
             pass
-        hb_session.stop()
+        rt_session.stop()
         log("· 后台心跳已停止。")
 
     if args.open_report:

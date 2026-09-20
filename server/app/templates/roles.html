@@ -5,13 +5,14 @@
 <h1>角色执行</h1>
 <div class="sub">
   每个角色<b>跑哪些任务</b>、<b>每天跑得怎么样</b>，都在这一页。
-  在这里改完不需要碰客户端的任何配置文件 —— 那台机器下一次心跳就会拿到新的任务模式。
+  在这里改完不需要碰客户端的任何配置文件 —— 那台机器连着实时通道就<b>立刻</b>生效，
+  没连上则下一次心跳（约 {{ heartbeat_interval }} 秒）生效。
 </div>
 
 <div class="filters">
   <form method="get" action="/roles" class="inline-form">
     <label class="f"><span class="name">查看最近</span>
-      <select name="days" onchange="this.form.submit()">
+      <select name="days" data-auto-submit>
         {% for n in (1, 3, 7, 14, 30) %}
           <option value="{{ n }}" {% if n == days %}selected{% endif %}>最近 {{ n }} 天</option>
         {% endfor %}
@@ -110,7 +111,7 @@
         </label>
         <div class="actions">
           <button class="primary" type="submit">保存</button>
-          <span class="hint">保存后，那台机器下一次心跳（约 {{ heartbeat_interval }} 秒）即生效</span>
+          <span class="hint">保存后接着实时通道就<b>立刻</b>生效；没连上则等下一次心跳（约 {{ heartbeat_interval }} 秒）</span>
         </div>
       </form>
       {% endif %}

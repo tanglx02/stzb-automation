@@ -87,7 +87,7 @@
       <td>
         {% if h.version != version %}
         <form method="post" action="/config/restore/{{ h.version }}"
-              onsubmit="return confirm('把配置回滚到 v{{ h.version }}？会生成一个新版本。')">
+              data-confirm="把配置回滚到 v{{ h.version }}？会生成一个新版本。">
           <button class="lnk" type="submit">回滚到此版本</button>
         </form>
         {% else %}<span class="muted">当前</span>{% endif %}
