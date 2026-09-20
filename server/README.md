@@ -214,11 +214,21 @@ docker compose logs -f app            # 实时日志
 docker compose restart app            # 重启
 docker compose pull && docker compose up -d --build    # 升级
 
-# 忘了管理端口令 —— 打印一个新的
+# 忘了管理端口令 —— 打印一个新的（用户不存在会自动建管理员，用于救急）
 docker compose exec app python -m app.cli reset-password
 
 # 直接设成指定口令
 docker compose exec app python -m app.cli set-password '新的口令'
+
+# ---- 多用户 ----
+docker compose exec app python -m app.cli users                  # 列出所有用户
+docker compose exec app python -m app.cli add-user zhangsan      # 建普通用户（口令随机）
+docker compose exec app python -m app.cli add-user ops --admin    # 建管理员
+docker compose exec app python -m app.cli disable-user zhangsan   # 停用（会话立刻失效）
+docker compose exec app python -m app.cli enable-user zhangsan
+docker compose exec app python -m app.cli promote-user zhangsan   # 提为管理员
+docker compose exec app python -m app.cli demote-user ops         # 降为普通用户
+docker compose exec app python -m app.cli reset-password -u zhangsan
 
 # 轮换采集端令牌（轮换后必须同步改本机 config.json，否则上不了报）
 docker compose exec app python -m app.cli new-token
@@ -333,6 +343,8 @@ STZB_CLIENT_OFFLINE_AFTER=90   # 超过多少秒没心跳算掉线
 | `/config` | 任务配置编辑 + 版本历史 + 回滚 |
 | `/jobs` | 待执行任务：新建 / 取消，可选「定向给某客户端」 |
 | `/settings` | 令牌轮换、改口令、服务端信息 |
+| `/users` | **用户管理**（仅管理员）：建号 / 改名 / 停用 / 调角色 / 重置口令 / 删号 |
+| `/password` | 改**自己**的口令（任何登录用户；被重置过口令的人首登会被强制跳来这里） |
 | `/events` | 事件日志（上传、配置变更、登录、轮换） |
 | `/api/summary` | 给外部用的 JSON 摘要 |
 | `/api/clients` | 客户端在线状态 JSON |
@@ -347,7 +359,12 @@ STZB_CLIENT_OFFLINE_AFTER=90   # 超过多少秒没心跳算掉线
 | **配置下发边界** | 服务端**只能**下发业务段（`tasks` / 各任务参数 / `safety`）。`device`（adb 路径与端口）、`emulator`（MuMuManager 路径、虚拟机索引）、`cloud`（后端地址与令牌）、`logging` **永远以本机为准**。脚本侧还有一份同样的白名单做二次过滤 —— 两边各拦一遍，任何一边写错都不会把本机配置搞坏。 |
 | **口令/令牌存储** | 只存 **scrypt 哈希**（n=2^15, r=8, p=1），常数量时间比较；界面只显示令牌头尾。数据库泄露也拿不到明文。 |
 | **上传报告 XSS** | 报告是「上传来的文件」。服务端用严格 CSP（`default-src 'none'`、禁 script、只允许 `data:` 图片和内联样式）提供，并放在 `<iframe sandbox>` 里渲染。就算有人往报告里塞 `<script>` 也执行不了。 |
-| **登录暴力破解** | 按 IP 限流（默认 15 分钟内 8 次失败即锁），失败和成功都记事件；用户名错与口令错耗时一致，不泄露哪个字段错。 |
+| **登录暴力破解** | 按 IP 限流（默认 15 分钟内 8 次失败即锁），失败和成功都记事件；用户名错与口令错耗时一致（用固定的假哈希拉平），不泄露哪个字段错，也防用户名枚举。 |
+| **多用户数据隔离** | 账号 / 运行 / 待执行都有 `owner_id`；角色的归属顺着 `account_id → game_accounts.owner_id` 查（只存一处，避免「账号给了 A、角色还挂在 B 名下」）。过滤靠显式参数 `own_only` / `owner_id` 传递，**不用全局状态**（并发下会串味）。普通用户手敲 URL 或直接 POST 都被服务端挡掉，界面藏按钮只是顺手。 |
+| **权限变更即时生效** | 会话里**只存 uid**（不存整个用户对象），每次请求现查库。管理员停用/降级某人后，那人下一次点任何页面就出不去 —— 塞进 session 的话得等会话过期，等于停用形同虚设。改名不影响会话（认 uid 不认名字）。 |
+| **不给自己挖坑** | 不能停用/删除自己；不能改自己的角色（降级会当场丢管理员权限，之后就点不动了）；不能把**最后一个启用的管理员**降级/停用/删除。这三条都是为了不出现「谁也进不去后台、只能命令行救」。 |
+| **一次性初始口令** | 管理员建号/重置时生成临时口令，只在跳转 URL 里带一次、页面显示一次，**不入库不出日志**（库里只有哈希）；被重置者首登被强制改成自己的口令，管理员全程不知道对方最终口令。 |
+| **删用户不删数据** | 删用户时他的游戏账号**收归管理员**（`owner_id → NULL`）而不是级联删除 —— 账号上挂着历史运行记录和角色任务配置，连带清掉属于「惩罚过重且不可逆」。 |
 | **路径穿越** | 上传文件名只保留 `[A-Za-z0-9._-]`，并强制落在 `artifacts/<run_id>/` 下。 |
 | **磁盘被塞满** | 单文件上限 24MB、每轮截图上限 60 张，超出直接 413/429；历史按 `STZB_KEEP_RUNS` 自动清理。 |
 | **定向任务越权** | 定向任务（`run_requests.client_id` 非空）只有指定客户端能看见和领取；**未注册/无 uid** 的调用一律只拿公共任务。领取时还会**再查一次归属**，防止抢别人已排的任务。这条是端到端联调测出来的真实漏洞，已修并有回归测试。 |

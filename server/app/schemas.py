@@ -41,7 +41,7 @@ class HeartbeatIn(BaseModel):
     """心跳负载。字段全部可选 —— 老客户端不带负载也能正常探活。"""
     uid: Optional[str] = None               # 客户端持久化的稳定标识
     host: Optional[str] = None
-    mode: Optional[str] = None              # standalone | managed
+    mode: Optional[str] = None              # 运行模式：managed（后端托管）/ unbound（未绑定后端）
     state: Optional[str] = None             # idle | running | switching | error
     busy: Optional[bool] = None
     note: Optional[str] = None

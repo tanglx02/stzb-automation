@@ -217,7 +217,7 @@ with TestClient(app) as c:
 
     print("\n== 页面可访问性 ==")
     for p in ("/clients", "/accounts", "/", "/jobs", "/runs", "/roles", "/settings",
-              "/events", "/config"):
+              "/events", "/config", "/users", "/password"):
         print("  %-12s %s" % (p, c.get(p).status_code))
     print("\n== 在线统计 ==", db.client_online_count())
 

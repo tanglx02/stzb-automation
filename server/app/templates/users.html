@@ -1,0 +1,195 @@
+{% extends "base.html" %}
+{% block title %}用户管理 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>用户管理</h1>
+<div class="sub">
+  在这台共用主机上，谁能用、能看哪些账号，都由这一页说了算。<b>没有自助注册</b> ——
+  由管理员建号、发一次性初始口令，对方首次登录时被强制改成自己的口令。
+</div>
+
+{% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
+{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+
+{# 一次性口令：拼在跳转 URL 里带过来，**只显示这一次**。
+   库里只存哈希，刷新或离开这一页之后，连管理员也拿不回原文 —— 只能重置。 #}
+{% if new_pwd %}
+  {% set parts = new_pwd.split('|', 1) %}
+<div class="tokenbox">
+  <b>一次性口令（只显示这一次，请立刻交给本人）：</b><br>
+  用户名 <b>{{ parts[0] }}</b> &nbsp;·&nbsp; 口令 <b>{{ parts[1] }}</b><br>
+  <span style="font-size:12px">对方首次登录会被要求立即改掉它。关掉或刷新本页后就再也看不到这个口令了，
+    忘了只能再重置一次。</span>
+</div>
+{% endif %}
+
+<div class="note">
+  <b>三种角色的边界（决定了每个人能看到什么）：</b>
+  <ul>
+    <li><b>管理员</b> —— 看全部：所有用户、所有游戏账号与角色、所有运行记录；
+      并且独占「任务配置 / 设置 / 客户端指派 / 用户管理」这些主机级操作。</li>
+    <li><b>普通用户</b> —— 只看自己的：自己登记的账号与角色、自己排的任务、自己的运行记录。
+      客户端页给他<b>只读</b>看（他需要知道机器在不在、轮到谁跑），但不能改名 / 指派 / 暂停。</li>
+    <li>普通用户<b>可以</b>自己添加游戏账号与角色、自己排任务，不需要管理员代劳。</li>
+  </ul>
+</div>
+
+<h2>新建用户</h2>
+<form method="post" action="/users">
+  <div class="panel">
+    <div class="grid2">
+      <label class="f">
+        <span class="name">登录名 *</span>
+        <input type="text" name="username" required placeholder="例如：zhangsan"
+               pattern="[A-Za-z0-9_.@-]{3,40}"
+               title="字母、数字、下划线、点、@、减号，3~40 位">
+        <div class="hint">只能用字母、数字、<code>_ . @ -</code>，3~40 位。登录时不区分大小写。</div>
+      </label>
+      <label class="f">
+        <span class="name">角色</span>
+        <select name="role">
+          <option value="user">普通用户（只看自己的数据）</option>
+          <option value="admin">管理员（看全部 + 主机级操作）</option>
+        </select>
+        <div class="hint">给「只想管自己那几个号」的人选普通用户就够了。</div>
+      </label>
+    </div>
+    <div class="grid2">
+      <label class="f">
+        <span class="name">显示名（选填）</span>
+        <input type="text" name="display_name" placeholder="例如：张三">
+      </label>
+      <label class="f">
+        <span class="name">联系方式（选填）</span>
+        <input type="text" name="contact" placeholder="例如：微信 / QQ / 手机号">
+      </label>
+    </div>
+    <label class="f">
+      <span class="name">初始口令（留空 = 自动生成一个）</span>
+      <input type="text" name="password" autocomplete="new-password"
+             placeholder="留空更省事：系统生成一串随机口令，比人想的更结实">
+      <div class="hint">
+        填了的话，至少 {{ min_pwd }} 位，且不能用弱口令。无论填不填，
+        <b>对方首次登录都会被强制改成自己的口令</b> —— 你全程不知道他最终的口令。
+      </div>
+    </label>
+    <label class="f">
+      <span class="name">备注（选填）</span>
+      <input type="text" name="note" placeholder="例如：小明，跑两个小号">
+    </label>
+    <div class="actions">
+      <button class="primary" type="submit">创建用户</button>
+      <span class="hint">创建后这一页会显示<b>一次</b>初始口令，记得马上复制走。</span>
+    </div>
+  </div>
+</form>
+
+<h2>用户列表（{{ users|length }}）</h2>
+
+{% if not users %}
+<div class="panel empty">还没有任何用户。</div>
+{% else %}
+<table>
+  <thead><tr>
+    <th class="num">#</th><th>登录名 / 显示名</th><th>角色</th><th>状态</th>
+    <th class="num">账号</th><th class="num">运行</th><th>最近登录</th><th>联系方式</th><th></th>
+  </tr></thead>
+  <tbody>
+  {% for u in users %}
+    <tr {% if hl == u.id %}style="background:var(--brand-weak)"{% endif %}>
+      <td class="num">{{ u.id }}</td>
+      <td>
+        <b>{{ u.username }}</b>
+        {% if u.display and u.display != u.username %}
+          <span class="hint">{{ u.display }}</span>
+        {% endif %}
+        {% if u.id == me.id %}<span class="pill info">我</span>{% endif %}
+        {% if u.note %}<div class="hint">{{ u.note }}</div>{% endif %}
+      </td>
+      <td>{% if u.is_admin %}<span class="pill info">管理员</span>
+          {% else %}<span class="pill gray">普通用户</span>{% endif %}</td>
+      <td>
+        {% if not u.enabled %}<span class="pill fail">已停用</span>
+        {% elif u.must_change %}<span class="pill skip">待改口令</span>
+        {% else %}<span class="pill ok">正常</span>{% endif %}
+      </td>
+      <td class="num">{{ u.n_accounts }}</td>
+      <td class="num">{{ u.n_runs }}</td>
+      <td class="muted">
+        {% if u.last_login_at %}{{ u.last_login_at }}
+          {% if u.last_login_ip %}<div class="hint">{{ u.last_login_ip }}</div>{% endif %}
+        {% else %}<span class="hint">从未登录</span>{% endif %}
+      </td>
+      <td class="muted">{{ u.contact or '—' }}</td>
+      <td style="white-space:nowrap">
+        <details style="display:inline-block;vertical-align:top">
+          <summary class="lnk">编辑</summary>
+          <form method="post" action="/users/{{ u.id }}/update" style="margin-top:8px">
+            <input type="hidden" name="_has_enabled" value="1">
+            <div class="grid2">
+              <label class="f"><span class="name">登录名</span>
+                <input type="text" name="username" value="{{ u.username }}"
+                       pattern="[A-Za-z0-9_.@-]{3,40}"></label>
+              <label class="f"><span class="name">角色</span>
+                <select name="role">
+                  <option value="user" {% if not u.is_admin %}selected{% endif %}>普通用户</option>
+                  <option value="admin" {% if u.is_admin %}selected{% endif %}>管理员</option>
+                </select></label>
+            </div>
+            <div class="grid2">
+              <label class="f"><span class="name">显示名</span>
+                <input type="text" name="display_name" value="{{ u.display_name or '' }}"></label>
+              <label class="f"><span class="name">联系方式</span>
+                <input type="text" name="contact" value="{{ u.contact or '' }}"></label>
+            </div>
+            <label class="f"><span class="name">备注</span>
+              <input type="text" name="note" value="{{ u.note or '' }}"></label>
+            <label class="f cbrow">
+              <input type="checkbox" name="enabled" value="1"
+                     {% if u.enabled %}checked{% endif %}
+                     {% if u.id == me.id %}disabled{% endif %}>
+              <span class="name">启用
+                {% if u.id == me.id %}<span class="hint">（不能停用自己）</span>{% endif %}</span>
+            </label>
+            <div class="actions"><button class="primary sm" type="submit">保存</button></div>
+            <div class="hint">
+              改名不会把人踢下线（会话认的是内部 id，不是名字）。
+              停用 / 降级会<b>立刻生效</b>，对方下一次点任何页面就出不去。
+            </div>
+          </form>
+        </details>
+      </td>
+    </tr>
+    <tr {% if hl == u.id %}style="background:var(--brand-weak)"{% endif %}>
+      <td></td>
+      <td colspan="8" style="padding-top:0">
+        <div class="inline-form">
+          <form method="post" action="/users/{{ u.id }}/reset"
+                data-confirm="重置「{{ u.username }}」的口令？会生成一串新的临时口令（只显示一次），他下次登录必须改掉。">
+            <button class="lnk" type="submit">重置口令</button>
+          </form>
+          {% if u.id != me.id %}
+          <form method="post" action="/users/{{ u.id }}/delete"
+                data-confirm="删除用户「{{ u.username }}」？他的游戏账号不会跟着删，而是收归管理员名下（可在「账号角色」页再处理）。">
+            <button class="lnk danger" type="submit">删除用户</button>
+          </form>
+          {% endif %}
+          <span class="hint">
+            {% if u.id == me.id %}这是当前登录的账号，不能删自己。{% endif %}
+            {% if u.is_admin %}· 系统里启用的管理员只剩一个时，这个账号不能降级 / 停用 / 删除（否则没人能进后台）。{% endif %}
+          </span>
+        </div>
+      </td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+{% endif %}
+
+<p class="hint">
+  删除用户时他登记的<b>游戏账号与运行记录都会保留</b>（账号收归管理员、记录按当时的归属留档），
+  因为这属于「换个人接着管」，不该连带清掉数据。要真正清账号，去
+  <a href="/accounts">账号角色</a> 页单独删。
+</p>
+
+{% endblock %}

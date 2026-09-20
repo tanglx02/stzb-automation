@@ -34,19 +34,15 @@
   </p>
 </div>
 
-<h2>修改管理端口令</h2>
+<h2>我的口令</h2>
 <div class="panel">
-  <form method="post" action="/settings/password">
-    <label class="f"><span class="name">当前口令</span>
-      <input type="password" name="current" autocomplete="current-password" required></label>
-    <div class="grid2">
-      <label class="f"><span class="name">新口令（至少 8 位）</span>
-        <input type="password" name="new1" autocomplete="new-password" required></label>
-      <label class="f"><span class="name">再输一次</span>
-        <input type="password" name="new2" autocomplete="new-password" required></label>
-    </div>
-    <div class="actions"><button class="primary" type="submit">更新口令</button></div>
-  </form>
+  <p class="hint" style="margin-top:0">
+    改口令统一在 <a href="/password">「我的口令」</a> 页做 —— 那一页对<b>所有登录用户</b>开放
+    （普通用户也能改自己的），校验规则也统一在那儿，不会出现「管理员能设弱口令、普通用户不能」。
+  </p>
+  <div class="actions" style="margin-top:10px">
+    <a class="btn primary" href="/password">去改我的口令</a>
+  </div>
 </div>
 
 <h2>服务端信息</h2>
@@ -73,6 +69,9 @@
     <li>上传的报告 HTML 用 <b>严格 CSP</b>（禁脚本、禁外链）沙箱化后放在 iframe 里渲染。</li>
     <li>登录失败会按 IP 限流；所有响应带 <code>nosniff</code> / <code>X-Frame-Options</code>。</li>
     <li>采集端令牌走 <code>X-Agent-Token</code> 头，服务端只接受哈希比对，不落明文。</li>
+    <li>多用户：普通用户只能看自己登记的账号与运行记录，隔离由数据层 <code>owner_id</code>
+      强制生效；停用/降级<b>立刻</b>生效，不用等会话过期。详见
+      <a href="/users">用户管理</a>。</li>
   </ul>
 </div>
 

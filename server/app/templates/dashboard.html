@@ -2,8 +2,34 @@
 {% block title %}总览 · {{ app_name }}{% endblock %}
 {% block body %}
 
+{% if denied %}
+<div class="banner warn">
+  那一页只对<b>管理员</b>开放。你是普通用户，能看的是<b>自己的</b>账号、角色与运行记录 ——
+  主机级的设置（任务配置 / 设置 / 客户端指派 / 用户管理）由管理员统一管。
+</div>
+{% endif %}
+
 <h1>总览</h1>
-<div class="sub">最近 14 天的采集情况</div>
+<div class="sub">
+  {% if tenant %}
+    这是<b>你自己的</b>采集情况（最近 14 天）。别人的账号与记录不在你的视野内。
+  {% else %}
+    最近 14 天的采集情况（<b>全部用户</b>）。
+  {% endif %}
+</div>
+
+{% if tenant %}
+<div class="note">
+  <b>你在这台主机上能做什么：</b>
+  <ul>
+    <li>在 <a href="/accounts">账号角色</a> 登记你自己的游戏账号与角色；</li>
+    <li>在 <a href="/roles">角色执行</a> 给每个角色勾选要跑的任务；</li>
+    <li>在 <a href="/jobs">待执行</a> 自己排一个任务 —— 主机会在空闲时自动轮到你；</li>
+    <li><a href="/clients">客户端</a> 页可以<b>看</b>（机器在不在、当前在跑谁），但不能改。</li>
+  </ul>
+  加账号需要在主机上操作模拟器输入验证码，所以 Host 忙的时候会排队，轮到空闲才会开始。
+</div>
+{% endif %}
 
 <div class="cards">
   <div class="card"><div class="k">执行轮数</div><div class="v">{{ stats.total }}</div></div>
@@ -73,10 +99,20 @@
 <h2>采集端状态</h2>
 <div class="panel">
   <div class="row">
+    {% if not tenant %}
     <div class="kv"><div class="k">令牌（只显示头尾）</div><div class="v mono">{{ agent_hint }}</div></div>
     <div class="kv"><div class="k">最近上报的机器</div><div class="v">{{ last_agent_host }}</div></div>
+    {% endif %}
     <div class="kv"><div class="k">配置版本</div><div class="v">v{{ config_version }}{% if config_updated %}
       <span class="hint">（{{ config_updated }}）</span>{% endif %}</div></div>
+    {% if my_accounts is defined %}
+    <div class="kv"><div class="k">我的游戏账号</div><div class="v">
+      {% if my_accounts %}{{ my_accounts|length }} 个
+        <span class="hint">（<a href="/accounts">管理</a>）</span>
+      {% else %}<span class="muted">还没登记</span>
+        <span class="hint">（<a href="/accounts">去添加</a>）</span>{% endif %}
+    </div></div>
+    {% endif %}
   </div>
   <p class="hint">脚本端在 <code>config.json</code> 的 <code>cloud</code> 段填写地址与令牌后，
      每轮跑完会自动把结果、报告和截图传到这里。</p>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Form, HTTPException, Request
@@ -18,36 +19,108 @@ router = APIRouter(tags=["console"])
 
 
 # ------------------------------------------------------------------ 鉴权
+#
+# 多用户模型（2026-09-20 起）：
+#   · 登录态存在 session 里：{"user": 登录名, "uid": 用户 id, "role": admin|user}
+#   · require_user()  —— 任何登录用户都能过，返回当前用户字典
+#   · require_admin() —— 只有管理员能过，普通用户被 303 踢回首页
+#
+# ★ 为什么 session 里要存 uid 而不是只存用户名：用户名是可以被管理员改的，
+#   改完之后老会话里的名字就对不上任何人了（用户会莫名其妙掉线，或者更糟 ——
+#   改名后恰好撞上另一个同名用户，拿到别人的数据）。uid 是自增主键，永不变。
+#
+# ★ **没有**「只看自己的」的第二种 admin 概念。过滤靠两个显式参数传递
+#   （own_only / owner_id），不靠全局状态 —— 全局状态在并发请求下会串味。
+
+def current_uid(request: Request) -> Optional[int]:
+    v = request.session.get("uid")
+    try:
+        return int(v) if v is not None else None
+    except Exception:
+        return None
+
 
 def current_user(request: Request) -> Optional[str]:
     return request.session.get("user")
 
 
-def require_admin(request: Request) -> str:
-    u = current_user(request)
+def current_account(request: Request) -> Optional[Dict[str, Any]]:
+    """取当前登录用户的完整信息（每次请求现查库）。
+
+    ★ 刻意**不**把用户信息整个塞进 session：
+      · 管理员停用/删除某个用户后，那个用户的会话必须立刻失效 —— 塞进 session
+        的话得等 4 小时过期，等于停用形同虚设；
+      · 角色（admin/user）也可能被改，同样要立刻生效。
+      现查库一次约 0.1ms，这点成本换「权限变更立即生效」非常值。
+    """
+    uid = current_uid(request)
+    if uid is None:
+        return None
+    u = db.user_get(uid)
+    if not u or not u.get("enabled"):
+        return None                      # 被停用/删掉 → 当作没登录
+    return u
+
+
+def require_user(request: Request) -> Dict[str, Any]:
+    u = current_account(request)
     if not u:
+        request.session.clear()
         raise HTTPException(status_code=303, headers={"Location": "/login"})
     return u
 
 
+def require_admin(request: Request) -> Dict[str, Any]:
+    """管理员专用。普通用户访问管理页 → 303 回首页并带说明。"""
+    u = require_user(request)
+    if not u.get("is_admin"):
+        raise HTTPException(status_code=303, headers={"Location": "/?denied=1"})
+    return u
+
+
+def is_admin(request: Request) -> bool:
+    u = current_account(request)
+    return bool(u and u.get("is_admin"))
+
+
+def scope_of(request: Request) -> Dict[str, Any]:
+    """把「该看谁的数据」算成两个参数，给 db 层那些 *owner_id/own_only* 用。
+
+    管理员 → own_only=False（看全部）
+    普通用户 → own_only=True + 自己的 uid
+
+    单独抽出来是为了**不重复**地在几十个路由里手写这段判断 ——
+    漏写一处的后果是越权（看到别人的数据），而漏写很难靠肉眼发现。
+    """
+    u = current_account(request) or {}
+    if u.get("is_admin"):
+        return {"owner_id": None, "own_only": False}
+    return {"owner_id": int(u["id"]) if u.get("id") else None, "own_only": True}
+
+
 def _nav_badge(request: Request) -> Dict[str, Any]:
-    """左侧导航上的角标数字。"""
-    if not current_user(request):
+    """左侧导航上的角标数字。普通用户只统计自己的，不然角标会指向看不到的内容。"""
+    if not current_account(request):
         return {}
+    sc = scope_of(request)
     d: Dict[str, Any] = dict(db.client_online_count())
     try:
-        d["roles_attention"] = len(db.role_daily_overview(days=1).get("attention") or [])
+        d["roles_attention"] = len(
+            db.role_daily_overview(days=1, **sc).get("attention") or [])
     except Exception:
         d["roles_attention"] = 0
     return d
 
 
 def _ctx(request: Request, **kw) -> Dict[str, Any]:
+    u = current_account(request)
     base = {
         "request": request,
         "app_name": settings.APP_NAME,
         "version": settings.APP_VERSION,
         "user": current_user(request),
+        "me": u,
+        "is_admin": bool(u and u.get("is_admin")),
         "task_meta": managed.TASK_META,
         "status_label": managed.STATUS_LABEL,
         # 在线探测相关：模板里到处要用，统一放这儿，免得每页都传一遍
@@ -75,7 +148,7 @@ def _client_ip(request: Request) -> str:
 
 @router.get("/login", response_class=HTMLResponse)
 def login_page(request: Request, err: str = ""):
-    if current_user(request):
+    if current_account(request):
         return RedirectResponse("/", status_code=303)
     return templates.TemplateResponse(request, "login.html", _ctx(request, err=err))
 
@@ -93,15 +166,24 @@ async def login_submit(request: Request):
     form = await request.form()
     user = str(form.get("user") or "")
     pwd = str(form.get("password") or "")
-    if not security.check_admin(user, pwd):
+    u = security.check_user(user, pwd)
+    if not u:
         security.login_record_fail(ip)
         db.event("warn", "console", "登录失败（ip=%s，用户=%s）" % (ip, user))
         return templates.TemplateResponse(request, 
             "login.html", _ctx(request, err="用户名或口令不对"), status_code=401)
 
     security.login_reset(ip)
-    request.session["user"] = user.strip()
-    db.event("info", "console", "登录成功（ip=%s）" % ip)
+    # ★ 三样都要写：user 给人看，uid 用于「改名后老会话依然认得人」，
+    #   role 只是给模板做首屏判断（真正的权限每次都现查库，见 current_account）
+    request.session["user"] = u["username"]
+    request.session["uid"] = int(u["id"])
+    request.session["role"] = u.get("role") or "user"
+    db.user_touch_login(int(u["id"]), ip)
+    db.event("info", "console", "登录成功（ip=%s，用户=%s）" % (ip, u["username"]))
+    # 被重置过口令的用户，进来先逼他改掉
+    if u.get("must_change"):
+        return RedirectResponse("/password?first=1", status_code=303)
     return RedirectResponse("/", status_code=303)
 
 
@@ -111,14 +193,76 @@ def logout(request: Request):
     return RedirectResponse("/login", status_code=303)
 
 
+# ------------------------------------------------------------------ 我的口令
+
+def _apply_password_change(u: Dict[str, Any], form, back: str) -> RedirectResponse:
+    """改口令的公共逻辑 —— `/password` 与 `/settings/password` 共用。
+
+    ★ 抽出来是为了**两处校验不漂移**：之前 `settings/password` 只查了长度 ≥ 8，
+      没走 `password_problem()`，于是「管理员可以在设置页把口令改成 12345678」
+      而普通用户在 /password 页却改不了 —— 同一条规则分两处实现必然分叉。
+
+    `first=True` 时跳过「验证当前口令」：那是管理员刚发的一次性口令，
+    输它一次没有意义（用户本来就是为了换掉它才来的）。
+    """
+    cur = str(form.get("current") or "")
+    new1 = str(form.get("new1") or "")
+    new2 = str(form.get("new2") or "")
+    first = bool(form.get("first"))
+    sep = "&" if "?" in back else "?"
+
+    if not first:
+        row = db.user_by_name(u["username"], with_hash=True) or {}
+        if not security.verify_secret(cur, row.get("pwd_hash") or ""):
+            return RedirectResponse("%s%serr=%s" % (back, sep, _q("当前口令不对")),
+                                    status_code=303)
+    if new1 != new2:
+        return RedirectResponse("%s%serr=%s" % (back, sep, _q("两次输入不一致")),
+                                status_code=303)
+    problem = security.password_problem(new1, u["username"])
+    if problem:
+        return RedirectResponse("%s%serr=%s" % (back, sep, _q(problem)),
+                                status_code=303)
+
+    security.set_user_password(int(u["id"]), new1)
+    db.event("info", "console", "用户「%s」修改了自己的口令" % u["username"])
+    return RedirectResponse("%s%sok=%s" % (back, sep, _q("口令已更新")),
+                            status_code=303)
+
+
+@router.get("/password", response_class=HTMLResponse)
+def password_page(request: Request, first: int = 0, ok: str = "", err: str = ""):
+    u = require_user(request)
+    return templates.TemplateResponse(request, "password.html", _ctx(
+        request, nav="password", first=bool(first), ok=ok, err=err, me=u))
+
+
+@router.post("/password")
+async def password_change(request: Request):
+    """改自己的口令。
+
+    ★ 与 /settings/password 的区别：这一页**任何登录用户**都能用（改自己的），
+      那一页只改管理员的。普通用户没有 /settings 的权限，所以必须有这一页，
+      否则被管理员重置口令后（must_change=1）他就被永久锁死在改密提示上了。
+    """
+    u = require_user(request)
+    form = await request.form()
+    back = "/password?first=1" if form.get("first") else "/password"
+    return _apply_password_change(u, form, back)
+
+
 # ------------------------------------------------------------------ 仪表盘
 
 @router.get("/", response_class=HTMLResponse)
-def dashboard(request: Request):
-    require_admin(request)
-    stats = db.run_stats(days=14)
-    runs = db.run_list(limit=8)
-    pending = db.request_pending(limit=5)
+def dashboard(request: Request, denied: int = 0):
+    u = require_user(request)
+    sc = scope_of(request)
+    stats = db.run_stats(days=14, **sc)
+    runs = db.run_list(limit=8, **sc)
+    if sc["own_only"]:
+        pending = db.request_list(limit=5, owner_id=sc["owner_id"], own_only=True)
+    else:
+        pending = db.request_pending(limit=5)
     cur = db.config_current()
     return templates.TemplateResponse(request, "dashboard.html", _ctx(
         request, nav="dash", stats=stats, runs=runs, pending=pending,
@@ -128,6 +272,9 @@ def dashboard(request: Request):
         last_agent_host=db.kv_get("last_agent_host") or "—",
         clients=db.client_list(),
         online=db.client_online_count(),
+        my_accounts=db.account_list(with_roles=False, **sc),
+        tenant=sc["own_only"],
+        denied=bool(denied),
     ))
 
 
@@ -136,26 +283,34 @@ def dashboard(request: Request):
 @router.get("/runs", response_class=HTMLResponse)
 def runs_page(request: Request, page: int = 1, bad: int = 0, deleted: int = 0,
               client: str = "", account: str = ""):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
     page = max(1, page)
     per = 25
     cid = int(client) if str(client).isdigit() else None
     aid = int(account) if str(account).isdigit() else None
+    # 普通用户指定了别人的账号 id 也不能看 —— 改写成自己的账号列表之外就无结果
+    if aid is not None and sc["own_only"] and not db.account_owned_by(aid, sc["owner_id"]):
+        aid = -1                      # 一个不存在的 id，查出来必然是空
     rows = db.run_list(limit=per, offset=(page - 1) * per, only_failed=bool(bad),
-                       client_id=cid, account_id=aid)
+                       client_id=cid, account_id=aid, **sc)
     return templates.TemplateResponse(request, "runs.html", _ctx(
         request, nav="runs", runs=rows, page=page, per=per,
-        total=db.run_count(only_failed=bool(bad), client_id=cid, account_id=aid),
+        total=db.run_count(only_failed=bool(bad), client_id=cid, account_id=aid, **sc),
         bad=bool(bad), deleted=deleted, client=str(client or ""),
         account=str(account or ""), client_id=cid, account_id=aid,
-        clients=db.client_list(), accounts=db.account_list()))
+        clients=db.client_list(),
+        accounts=db.account_list(with_roles=False, **sc)))
 
 
 @router.get("/runs/{run_id}", response_class=HTMLResponse)
 def run_detail(request: Request, run_id: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
     row = db.run_get(run_id)
-    if not row:
+    # 不存在与「不是你的」返回同一个 404 —— 不给普通用户任何「这条记录存在」
+    # 的旁证（否则能拿它枚举出别人跑过多少轮）
+    if not row or not db.run_owned_by(run_id, sc["owner_id"]):
         raise HTTPException(status_code=404, detail="没有这条运行记录")
     # run_get 返回的是单行、没有 join 客户端名，这里补一个展示用的副本
     display = dict(row)
@@ -192,7 +347,10 @@ def run_detail(request: Request, run_id: int):
 
 @router.post("/runs/{run_id}/delete")
 def run_delete(request: Request, run_id: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    if not db.run_owned_by(run_id, sc["owner_id"]):
+        return RedirectResponse("/runs?err=%s" % _q("没有这条运行记录"), status_code=303)
     row = db.run_delete(run_id)
     if row:
         from .routes_agent import _rm_tree
@@ -211,7 +369,10 @@ def run_report(request: Request, run_id: int):
       · 只允许 data: 图片和内联样式
       · 页面本身放进 iframe 里看，避免影响控制台
     """
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    if not db.run_owned_by(run_id, sc["owner_id"]):
+        raise HTTPException(status_code=404, detail="这条运行没有报告")
     art = next((a for a in db.artifact_list(run_id)
                 if a["kind"] == "report"), None)
     if not art:
@@ -231,9 +392,10 @@ def run_report(request: Request, run_id: int):
 
 @router.get("/artifacts/{aid}")
 def artifact_file(request: Request, aid: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
     art = db.artifact_get(aid)
-    if not art:
+    if not art or not db.run_owned_by(int(art["run_id"]), sc["owner_id"]):
         raise HTTPException(status_code=404, detail="没有这个文件")
     path = os.path.join(str(settings.ARTIFACT_DIR), str(art["run_id"]), art["filename"])
     if not os.path.exists(path):
@@ -413,17 +575,22 @@ def _q(s: str) -> str:
 
 @router.get("/jobs", response_class=HTMLResponse)
 def jobs_page(request: Request, created: int = 0, canceled: int = 0, err: str = ""):
-    require_admin(request)
+    u = require_user(request)
+    sc = scope_of(request)
     return templates.TemplateResponse(request, "jobs.html", _ctx(
-        request, nav="jobs", jobs=db.request_list(limit=60),
+        request, nav="jobs",
+        jobs=db.request_list(limit=60, owner_id=sc["owner_id"], own_only=sc["own_only"]),
         allow=settings.ALLOW_RUN_REQUESTS,
         clients=db.client_list(),
-        created=created, canceled=canceled, err=err))
+        my_accounts=db.account_list(with_roles=False, **sc),
+        created=created, canceled=canceled, err=err,
+        is_admin=bool(u.get("is_admin"))))
 
 
 @router.post("/jobs")
 async def job_create(request: Request):
-    require_admin(request)
+    u = require_user(request)
+    sc = scope_of(request)
     if not settings.ALLOW_RUN_REQUESTS:
         return RedirectResponse("/jobs?err=%s" % _q("服务端已关闭「触发任务」功能"), status_code=303)
     form = await request.form()
@@ -437,8 +604,11 @@ async def job_create(request: Request):
         return RedirectResponse("/jobs?err=%s" % _q("指定的客户端不存在"), status_code=303)
     if slot not in ("auto", "00:00", "12:00"):
         slot = "auto"
-    rid = db.request_create(slot, only, dry, current_user(request) or "?", note,
-                            client_id=cid)
+    # 归属：普通用户排的队挂在自己名下（他能在列表里看到并取消）；
+    # 管理员排的是公共的（owner_id=None），普通用户也能看到 —— 见 db.request_list。
+    owner = None if u.get("is_admin") else int(u["id"])
+    rid = db.request_create(slot, only, dry, u["username"], note,
+                            client_id=cid, owner_id=owner)
     # ★ 立刻推给采集端，别让它等到下一拍心跳（最多 30 秒）才知道有活干。
     #   推送只是「提醒」：任务本身已经落库，推不到也会被心跳兜住。
     #   定向任务只推给点名的那台；公共任务谁都能领，所以推给全部在线客户端。
@@ -447,16 +617,29 @@ async def job_create(request: Request):
     else:
         realtime.notify_all("jobs", job=rid)
     target = (db.client_get(cid) or {}).get("name") if cid else "任意客户端"
-    db.event("info", "console", "新建待执行任务 #%d（%s 档，范围=%s，执行者=%s）"
-             % (rid, slot, only or "按档位", target))
+    db.event("info", "console", "新建待执行任务 #%d（%s 档，范围=%s，执行者=%s，排队人=%s）"
+             % (rid, slot, only or "按档位", target, u["username"]))
     return RedirectResponse("/jobs?created=%d" % rid, status_code=303)
 
 
 @router.post("/jobs/{req_id}/cancel")
 def job_cancel(request: Request, req_id: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    row = None
+    with db.tx() as c:
+        row = c.execute("SELECT owner_id,status FROM run_requests WHERE id=?",
+                        (req_id,)).fetchone()
+    if not row:
+        return RedirectResponse("/jobs?err=%s" % _q("没有这条待执行任务"), status_code=303)
+    # 普通用户只能取消自己排的；管理员排的公共任务只有管理员能取消
+    if sc["own_only"]:
+        o = row["owner_id"]
+        if o is None or int(o) != int(sc["owner_id"]):
+            return RedirectResponse("/jobs?err=%s" % _q("只能取消自己排的任务"), status_code=303)
     ok = db.request_cancel(req_id)
-    db.event("info", "console", "取消待执行任务 #%d（%s）" % (req_id, "成功" if ok else "状态不允许"))
+    db.event("info", "console", "取消待执行任务 #%d（%s）"
+             % (req_id, "成功" if ok else "状态不允许"))
     return RedirectResponse("/jobs?canceled=%d" % (1 if ok else 0), status_code=303)
 
 
@@ -475,9 +658,16 @@ def job_cancel(request: Request, req_id: int):
 
 @router.get("/clients", response_class=HTMLResponse)
 def clients_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
-    require_admin(request)
+    """客户端页 —— **只读对普通用户开放**。
+
+    普通用户需要看「机器在不在、跑的是哪个角色」（这决定他的任务什么时候能轮到），
+    所以列表给他看。但改名 / 指派 / 暂停 / 探测 / 删除全归管理员 ——
+    那些是共用主机的调度权，放开等于谁都能把别人的任务掐掉。
+    """
+    u = require_user(request)
+    sc = scope_of(request)
     rows = db.client_list()
-    accounts = db.account_list()
+    accounts = db.account_list(**sc)
     # 客户端行的账号下拉：只显示启用的账号，禁用的一律不出现在选择里
     for c in rows:
         c["_roles"] = [r for r in (db.role_list(int(c["account_id"]))
@@ -488,7 +678,7 @@ def clients_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
     return templates.TemplateResponse(request, "clients.html", _ctx(
         request, nav="clients", clients=rows, accounts=accounts,
         online=db.client_online_count(), ok=ok, err=err, hl=hl,
-        role_list=db.role_list(),
+        role_list=db.role_list(**sc), read_only=not u.get("is_admin"),
     ))
 
 
@@ -598,8 +788,12 @@ def client_delete(request: Request, cid: int):
 
 @router.get("/api/clients")
 def api_clients(request: Request):
-    """给页面自动刷新用：只返回在线状态，轻量。"""
-    require_admin(request)
+    """给页面自动刷新用：只返回在线状态，轻量。
+
+    普通用户也能读 —— 客户端页对他们只读开放，这个接口就是给那页刷新的。
+    返回的字段里**不含**账号/角色指派（那是管理信息），只有在线状态。
+    """
+    require_user(request)
     rows = db.client_list()
     return JSONResponse({
         "online": db.client_online_count(),
@@ -624,8 +818,9 @@ def api_clients(request: Request):
 
 @router.get("/accounts", response_class=HTMLResponse)
 def accounts_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
-    require_admin(request)
-    accounts = db.account_list()
+    require_user(request)
+    sc = scope_of(request)
+    accounts = db.account_list(**sc)
     # 角色的「执行任务模式」在模板里要直接渲染，这里先解析好
     for a in accounts:
         for r in a["roles"]:
@@ -639,8 +834,10 @@ def accounts_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
     return templates.TemplateResponse(request, "accounts.html", _ctx(
         request, nav="accounts", accounts=accounts, ok=ok, err=err, hl=hl,
         users=users, clients=db.client_list(),
+        # 管理员才能在「新增/编辑账号」里改归属；普通用户建号恒归自己，不需要这个下拉
+        all_users=db.user_list() if is_admin(request) else [],
         # 模板里「客户端指派一览」要按 role_id 反查角色名，这里必须传（原来漏了）
-        role_list=db.role_list()))
+        role_list=db.role_list(**sc)))
 
 
 def _plan_from_form(form) -> str:
@@ -662,23 +859,36 @@ def _plan_from_form(form) -> str:
 
 @router.post("/accounts")
 async def account_create(request: Request):
-    require_admin(request)
+    u = require_user(request)
     form = await request.form()
     label = str(form.get("label") or "").strip()
     if not label:
         return RedirectResponse("/accounts?err=%s" % _q("账号名不能为空"), status_code=303)
+    # 归属：普通用户建的账号归他自己；管理员可以显式指定归属（用于代建），
+    # 不指定则为公共（owner_id=None）。
+    # ★ 只有管理员能读 owner_id 这个表单字段 —— 否则普通用户 POST 一个
+    #   owner_id=别人 就能把账号塞进别人名下（或更糟：改成 None 变成公共账号）。
+    owner = None if u.get("is_admin") else int(u["id"])
+    if u.get("is_admin") and "owner_id" in form:
+        raw = str(form.get("owner_id") or "").strip()
+        owner = int(raw) if raw.isdigit() and db.user_get(int(raw)) else None
     aid = db.account_create(label,
                             login_name=str(form.get("login_name") or ""),
                             masked=str(form.get("masked") or ""),
                             tag=str(form.get("tag") or ""),
-                            note=str(form.get("note") or ""))
-    db.event("info", "console", "新增游戏账号「%s」（#%d）" % (label, aid))
+                            note=str(form.get("note") or ""),
+                            owner_id=owner)
+    db.event("info", "console", "新增游戏账号「%s」（#%d，归属=%s）"
+             % (label, aid, u["username"] if owner else "管理员/公共"))
     return RedirectResponse("/accounts?hl=%d&ok=%s" % (aid, _q("账号已添加")), status_code=303)
 
 
 @router.post("/accounts/{aid}/update")
 async def account_update(request: Request, aid: int):
-    require_admin(request)
+    u = require_user(request)
+    sc = scope_of(request)
+    if not db.account_owned_by(aid, sc["owner_id"]):
+        return RedirectResponse("/accounts?err=%s" % _q("没有这个账号"), status_code=303)
     form = await request.form()
     fields: Dict[str, Any] = {}
     for k in ("label", "login_name", "masked", "tag", "note"):
@@ -686,6 +896,10 @@ async def account_update(request: Request, aid: int):
             fields[k] = str(form.get(k) or "").strip()[:400]
     if "enabled" in form or form.get("_has_enabled"):
         fields["enabled"] = 1 if form.get("enabled") is not None else 0
+    # 改归属只归管理员（同上：普通用户能改归属 = 能把账号甩给别人或变成公共）
+    if u.get("is_admin") and "owner_id" in form:
+        raw = str(form.get("owner_id") or "").strip()
+        fields["owner_id"] = int(raw) if raw.isdigit() and db.user_get(int(raw)) else None
     if not str(fields.get("label") or "").strip():
         fields.pop("label", None)
     db.account_update(aid, **fields)
@@ -695,7 +909,10 @@ async def account_update(request: Request, aid: int):
 
 @router.post("/accounts/{aid}/delete")
 def account_delete(request: Request, aid: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    if not db.account_owned_by(aid, sc["owner_id"]):
+        return RedirectResponse("/accounts?err=%s" % _q("没有这个账号"), status_code=303)
     acc = db.account_get(aid)
     db.account_delete(aid)
     db.event("warn", "console", "删除游戏账号 #%d（%s）"
@@ -706,7 +923,10 @@ def account_delete(request: Request, aid: int):
 
 @router.post("/accounts/{aid}/roles")
 async def role_create(request: Request, aid: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    if not db.account_owned_by(aid, sc["owner_id"]):
+        return RedirectResponse("/accounts?err=%s" % _q("没有这个账号"), status_code=303)
     if not db.account_get(aid):
         return RedirectResponse("/accounts?err=%s" % _q("账号不存在"), status_code=303)
     form = await request.form()
@@ -726,7 +946,10 @@ async def role_create(request: Request, aid: int):
 
 @router.post("/roles/{rid}/update")
 async def role_edit(request: Request, rid: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    if not db.role_owned_by(rid, sc["owner_id"]):
+        return RedirectResponse("/accounts?err=%s" % _q("没有这个角色"), status_code=303)
     role = db.role_get(rid)
     if not role:
         return RedirectResponse("/accounts?err=%s" % _q("角色不存在"), status_code=303)
@@ -757,7 +980,10 @@ async def role_save(request: Request, rid: int):
 
     字段：name / tab / server / season（备注）/ enabled / mode / task_* / slot_* / note
     """
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    if not db.role_owned_by(rid, sc["owner_id"]):
+        return RedirectResponse("/roles?err=%s" % _q("没有这个角色"), status_code=303)
     role = db.role_get(rid)
     if not role:
         return RedirectResponse("/roles?err=%s" % _q("角色不存在"), status_code=303)
@@ -800,7 +1026,10 @@ async def role_save(request: Request, rid: int):
 
 @router.post("/roles/{rid}/delete")
 def role_delete(request: Request, rid: int):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
+    if not db.role_owned_by(rid, sc["owner_id"]):
+        return RedirectResponse("/accounts?err=%s" % _q("没有这个角色"), status_code=303)
     role = db.role_get(rid)
     if not role:
         return RedirectResponse("/accounts?err=%s" % _q("角色不存在"), status_code=303)
@@ -822,9 +1051,10 @@ def role_delete(request: Request, rid: int):
 @router.get("/roles", response_class=HTMLResponse)
 def roles_page(request: Request, days: int = 7, hl: int = 0,
                ok: str = "", err: str = "", warn: str = ""):
-    require_admin(request)
+    require_user(request)
+    sc = scope_of(request)
     days = max(1, min(int(days or 7), 30))
-    ov = db.role_daily_overview(days=days)
+    ov = db.role_daily_overview(days=days, **sc)
     return templates.TemplateResponse(request, "roles.html", _ctx(
         request, nav="roles", ov=ov, days=days, hl=hl,
         ok=ok, err=err, warn=warn, clients=db.client_list()))
@@ -856,21 +1086,14 @@ def rotate_token(request: Request):
 
 @router.post("/settings/password")
 async def change_password(request: Request):
-    require_admin(request)
+    """管理员在设置页改自己的口令。
+
+    与 /password 共用 `_apply_password_change` —— 早先这里单独实现，只查了长度，
+    结果是「管理员能把口令改成 12345678，普通用户却不能」，同一条规则两处硬编码。
+    """
+    u = require_admin(request)
     form = await request.form()
-    cur = str(form.get("current") or "")
-    new1 = str(form.get("new1") or "")
-    new2 = str(form.get("new2") or "")
-    user = current_user(request) or "admin"
-    if not security.check_admin(user, cur):
-        return RedirectResponse("/settings?err=%s" % _q("当前口令不对"), status_code=303)
-    if len(new1) < 8:
-        return RedirectResponse("/settings?err=%s" % _q("新口令至少 8 位"), status_code=303)
-    if new1 != new2:
-        return RedirectResponse("/settings?err=%s" % _q("两次输入不一致"), status_code=303)
-    security.set_admin_password(user, new1)
-    db.event("warn", "console", "管理员口令已修改")
-    return RedirectResponse("/settings?ok=%s" % _q("口令已更新"), status_code=303)
+    return _apply_password_change(u, form, "/settings")
 
 
 # ------------------------------------------------------------------ 事件 & JSON
@@ -881,10 +1104,176 @@ def events_page(request: Request):
     return templates.TemplateResponse(request, "events.html", _ctx(request, nav="events", events=db.events_recent(200)))
 
 
+# ================================================================== 用户管理（管理员）
+#
+# 用户是**后台创建**的，没有自助注册 —— 这套系统跑在一台共用的主机上，
+# 谁能用主机是管理员说了算。让任何人自助注册再等审批，等于给管理员凭空加一道
+# 「先看看这人是谁」的活；直接由管理员建号更省事，也更符合实际情况。
+#
+# 「注册」的落点在这里：管理员建号 → 生成初始口令 → 线下发给对方 →
+# 对方首次登录被强制改口令（must_change=1）。这样管理员全程不知道对方最终口令。
+
+@router.get("/users", response_class=HTMLResponse)
+def users_page(request: Request, ok: str = "", err: str = "", hl: int = 0,
+               new_pwd: str = ""):
+    require_admin(request)
+    return templates.TemplateResponse(request, "users.html", _ctx(
+        request, nav="users", users=db.user_list(), ok=ok, err=err, hl=hl,
+        new_pwd=new_pwd, me=current_account(request),
+        min_pwd=8))
+
+
+@router.post("/users")
+async def user_create(request: Request):
+    me = require_admin(request)
+    form = await request.form()
+    username = str(form.get("username") or "").strip()
+    role = str(form.get("role") or db.ROLE_USER)
+    role = db.ROLE_ADMIN if role == db.ROLE_ADMIN else db.ROLE_USER
+
+    if not username:
+        return RedirectResponse("/users?err=%s" % _q("用户名不能为空"), status_code=303)
+    if not re.match(r"^[A-Za-z0-9_.@-]{3,40}$", username):
+        return RedirectResponse("/users?err=%s" % _q(
+            "用户名只能用字母、数字、下划线、点、@、减号，3~40 位"), status_code=303)
+    if db.user_by_name(username):
+        return RedirectResponse("/users?err=%s" % _q("这个用户名已经有人用了"), status_code=303)
+
+    # 口令：管理员没填就自动生成一个（比让管理员自己想一个更省事，
+    # 而且随机生成的一定比人想的长）。生成的一律要求首登改掉。
+    raw = str(form.get("password") or "").strip()
+    if raw:
+        problem = security.password_problem(raw, username)
+        if problem:
+            return RedirectResponse("/users?err=%s" % _q("口令不合格：%s" % problem),
+                                    status_code=303)
+        generated = False
+    else:
+        raw = security.new_token(12)
+        generated = True
+
+    uid = db.user_create(username, security.hash_secret(raw), role=role,
+                         display_name=str(form.get("display_name") or ""),
+                         contact=str(form.get("contact") or ""),
+                         note=str(form.get("note") or ""),
+                         created_by=me["username"], must_change=True)
+    db.event("info", "console", "管理员「%s」新建用户「%s」（#%d，角色=%s）"
+             % (me["username"], username, uid, role))
+    # 初始口令**只在这次跳转的 URL 里带上一次**，页面显示完就让用户自己存。
+    # 不写日志、不入库 —— 库里只有哈希，这也是刻意的（管理员事后也拿不回来）。
+    note = "已创建用户「%s」%s" % (username, "，口令已自动生成" if generated else "")
+    return RedirectResponse("/users?hl=%d&ok=%s&new_pwd=%s"
+                            % (uid, _q(note + "。请把初始口令交给本人（只显示这一次）"),
+                               _q("%s|%s" % (username, raw))),
+                            status_code=303)
+
+
+@router.post("/users/{uid}/update")
+async def user_update(request: Request, uid: int):
+    me = require_admin(request)
+    target = db.user_get(uid)
+    if not target:
+        return RedirectResponse("/users?err=%s" % _q("没有这个用户"), status_code=303)
+    form = await request.form()
+    fields: Dict[str, Any] = {}
+    for k, lim in (("display_name", 40), ("contact", 120), ("note", 400)):
+        if k in form:
+            fields[k] = str(form.get(k) or "").strip()[:lim]
+
+    new_name = str(form.get("username") or "").strip()
+    if new_name and new_name != target["username"]:
+        if not re.match(r"^[A-Za-z0-9_.@-]{3,40}$", new_name):
+            return RedirectResponse("/users?hl=%d&err=%s" % (uid, _q("用户名格式不合法")),
+                                    status_code=303)
+        other = db.user_by_name(new_name)
+        if other and int(other["id"]) != uid:
+            return RedirectResponse("/users?hl=%d&err=%s" % (uid, _q("这个用户名已经有人用了")),
+                                    status_code=303)
+        fields["username"] = new_name
+
+    new_role = str(form.get("role") or target.get("role"))
+    if new_role in (db.ROLE_ADMIN, db.ROLE_USER):
+        # ★ 不能改**自己**的角色。降自己一级会当场丢掉管理员权限 ——
+        #   current_account() 每次请求现查库，所以这个请求一提交，
+        #   你自己的会话立刻就不再是管理员了：想改回来都点不动（要别人来改）。
+        #   要卸任就找另一个管理员，或者用命令行 `demote-user`。
+        if int(uid) == int(me["id"]) and new_role != target.get("role"):
+            return RedirectResponse(
+                "/users?hl=%d&err=%s" % (uid, _q(
+                    "不能改自己的角色 —— 降级会当场丢掉管理员权限，之后连这一页都进不来。"
+                    "要卸任请让另一个管理员来操作")),
+                status_code=303)
+        # ★ 不能把最后一个启用的管理员降级/停用 —— 否则谁也进不了后台，
+        #   只能拿命令行走 CLI 救，属于自锁。
+        if target.get("is_admin") and new_role != db.ROLE_ADMIN:
+            if db.user_count_admins() <= 1:
+                return RedirectResponse(
+                    "/users?hl=%d&err=%s" % (uid, _q(
+                        "这是唯一的管理员，不能改成普通用户 —— 改了就没人能进后台了")),
+                    status_code=303)
+        fields["role"] = new_role
+
+    if form.get("_has_enabled"):
+        want_enabled = form.get("enabled") is not None
+        if not want_enabled and target.get("is_admin") and db.user_count_admins() <= 1:
+            return RedirectResponse(
+                "/users?hl=%d&err=%s" % (uid, _q("这是唯一的管理员，不能停用")),
+                status_code=303)
+        if not want_enabled and int(uid) == int(me["id"]):
+            return RedirectResponse("/users?hl=%d&err=%s" % (uid, _q("不能停用自己")),
+                                    status_code=303)
+        fields["enabled"] = 1 if want_enabled else 0
+
+    db.user_update(uid, **fields)
+    db.event("info", "console", "管理员「%s」更新用户 #%d（%s）"
+             % (me["username"], uid, "、".join(fields.keys()) or "无变化"))
+    return RedirectResponse("/users?hl=%d&ok=%s" % (uid, _q("已保存")), status_code=303)
+
+
+@router.post("/users/{uid}/reset")
+async def user_reset_password(request: Request, uid: int):
+    """管理员重置某用户口令：生成新的临时口令，并标记「首次登录须改」。
+
+    ★ 这里**不**把 must_change 设成可选的。重置口令的典型场景就是
+      「怀疑账号被盗」或「对方忘了」——两种情况下都希望新口令只是一次性的。
+    """
+    me = require_admin(request)
+    target = db.user_get(uid)
+    if not target:
+        return RedirectResponse("/users?err=%s" % _q("没有这个用户"), status_code=303)
+    raw = security.new_token(12)
+    security.set_user_password(uid, raw, must_change=True)
+    db.event("warn", "console", "管理员「%s」重置了用户「%s」的口令"
+             % (me["username"], target["username"]))
+    return RedirectResponse("/users?hl=%d&ok=%s&new_pwd=%s"
+                            % (uid, _q("已重置口令，请交给本人（只显示这一次）"),
+                               _q("%s|%s" % (target["username"], raw))),
+                            status_code=303)
+
+
+@router.post("/users/{uid}/delete")
+def user_delete(request: Request, uid: int):
+    me = require_admin(request)
+    target = db.user_get(uid)
+    if not target:
+        return RedirectResponse("/users?err=%s" % _q("没有这个用户"), status_code=303)
+    if int(uid) == int(me["id"]):
+        return RedirectResponse("/users?err=%s" % _q("不能删掉自己"), status_code=303)
+    if target.get("is_admin") and db.user_count_admins() <= 1:
+        return RedirectResponse("/users?err=%s" % _q("这是唯一的管理员，不能删"), status_code=303)
+    db.user_delete(uid)
+    db.event("warn", "console", "管理员「%s」删除用户「%s」（其游戏账号已收归管理员，未删除）"
+             % (me["username"], target["username"]))
+    return RedirectResponse("/users?ok=%s" % _q(
+        "已删除该用户。他登记的游戏账号已收归管理员名下（没跟着删，可在「账号角色」页处理）"),
+        status_code=303)
+
+
 @router.get("/api/summary")
 def api_summary(request: Request):
-    require_admin(request)
-    stats = db.run_stats(days=7)
+    require_user(request)
+    sc = scope_of(request)
+    stats = db.run_stats(days=7, **sc)
     last = stats.get("last")
     return JSONResponse({
         "total": stats["total"], "ok_runs": stats["ok_runs"], "bad_runs": stats["bad_runs"],
@@ -893,7 +1282,8 @@ def api_summary(request: Request):
             "all_ok": bool(last["all_ok"]), "n_ok": last["n_ok"],
             "n_fail": last["n_fail"], "n_skip": last["n_skip"],
         },
-        "pending_jobs": len(db.request_pending(limit=99)),
+        "pending_jobs": len(db.request_list(limit=99, owner_id=sc["owner_id"],
+                                            own_only=sc["own_only"])),
         "config_version": db.config_current()["version"],
         # 客户端在线情况，给总览页自动刷新用
         "clients": db.client_online_count(),

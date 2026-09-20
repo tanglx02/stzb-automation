@@ -15,6 +15,19 @@
 {% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
 {% if err %}<div class="banner err">{{ err }}</div>{% endif %}
 
+{# 普通用户：这一页只读。他需要知道「机器在不在、当前在跑谁」（这决定他的任务
+   什么时候能轮到），但改名 / 指派 / 暂停 / 探测 / 删除属于共用主机的调度权，
+   放开等于谁都能把别人的任务掐掉。所以下面所有操作按钮都按 read_only 藏起来。
+   ★ 真正的拦截在每个 POST 路由里的 require_admin —— 这里只是不给按钮，
+     不是安全边界（手敲 POST 一样会被 303 弹走）。 #}
+{% if read_only %}
+<div class="banner warn">
+  这一页对你<b>只读</b>：能看到各台机器的在线状态和当前在跑哪个账号 / 角色，
+  但<b>不能</b>改名、指派、暂停或下发指令 —— 那些是对整台主机的调度操作，由管理员统一做。<br>
+  要跑你自己的角色，去 <a href="/jobs">待执行</a> 排一个任务，主机空闲时会自动轮到你。
+</div>
+{% endif %}
+
 <div class="cards">
   <div class="card"><div class="k">在线</div>
     <div class="v" style="color:var(--ok)" id="n-online">{{ online.online }}</div></div>
@@ -60,9 +73,11 @@
       {% if c.agent_version %}· v{{ c.agent_version }}{% endif %}
     </span>
     <span class="spacer"></span>
+    {% if not read_only %}
     <form method="post" action="/clients/{{ c.id }}/toggle" class="inline">
       <button class="lnk" type="submit">{% if c.enabled %}暂停派发{% else %}恢复派发{% endif %}</button>
     </form>
+    {% endif %}
   </div>
 
   <div class="row">
@@ -96,6 +111,22 @@
   {% endif %}
 
   <!-- ---------------- 指派 ---------------- -->
+  {% if read_only %}
+  <h3>当前指派</h3>
+  <div class="row">
+    <div class="kv"><div class="k">游戏账号</div><div class="v">
+      {% set acc = (accounts | selectattr('id', 'equalto', c.account_id) | list | first) %}
+      {% if acc %}{{ acc.label }}{% if acc.masked %} <span class="hint">{{ acc.masked }}</span>{% endif %}
+      {% else %}<span class="muted">未指派</span>{% endif %}
+    </div></div>
+    <div class="kv"><div class="k">角色</div><div class="v">
+      {% if c.role_id %}
+        {% set r = (role_list | selectattr('id', 'equalto', c.role_id) | list | first) %}
+        {{ r.name if r else '（已删除）' }}
+      {% else %}<span class="muted">不限</span>{% endif %}
+    </div></div>
+  </div>
+  {% else %}
   <h3>指派账号 / 角色</h3>
   <form method="post" action="/clients/{{ c.id }}/assign">
     <div class="grid2">
@@ -108,6 +139,7 @@
                     {% if c.account_id == a.id %}selected{% endif %}
                     {% if not a.enabled %}disabled{% endif %}>
               {{ a.label }}{% if a.masked %}（{{ a.masked }}）{% endif %}
+              {% if a.owner_label %} · {{ a.owner_label }}{% endif %}
               {% if not a.enabled %} · 已停用{% endif %}
             </option>
           {% endfor %}
@@ -150,9 +182,11 @@
       </span>
       <span class="hint">{{ c.probe.requested_at }}{% if c.probe.requested_by %} · {{ c.probe.requested_by }}{% endif %}</span>
       <span class="spacer"></span>
+      {% if not read_only %}
       <form method="post" action="/clients/{{ c.id }}/probe/clear" class="inline">
         <button class="lnk" type="submit">清掉</button>
       </form>
+      {% endif %}
     </div>
     {% if c.probe.message %}<div class="probe-msg">{{ c.probe.message }}</div>{% endif %}
     {% if c.probe.result and c.probe.result.lines %}
@@ -206,6 +240,7 @@
       <div class="actions"><button class="danger" type="submit">删除这条客户端记录</button></div>
     </form>
   </details>
+  {% endif %}
 </div>
 {% endfor %}
 {% endif %}

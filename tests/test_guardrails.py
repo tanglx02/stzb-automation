@@ -383,6 +383,117 @@ def test_role_name_vertical_normalized():
     return ok
 
 
+def test_password_rules_are_single_source():
+    """改口令的强度校验必须只有**一处**实现。
+
+    为什么进护栏（2026-09-20 真实分叉）：
+      `/settings/password`（管理员）当初单独实现，只查了 `len(new1) >= 8`，
+      没走 `security.password_problem()`；而 `/password`（普通用户）走了。
+      后果是**同一条规则两个入口两套标准**：管理员能在设置页把口令改成
+      `12345678`，普通用户却改不了。这种「A 能做的事 B 不能」不会报错，
+      只会让人觉得规则随机，属于最难查的一类问题。
+
+    现在两个入口都走 `routes_ui._apply_password_change`。这条测试盯两件事：
+      ① 两处都调用了同一个 helper；
+      ② `_apply_password_change` 里确实调了 `security.password_problem`。
+    """
+    print("== 改口令的强度校验只有一处实现 ==")
+    ok = True
+    import inspect
+    from app import routes_ui as R
+
+    src_all = inspect.getsource(R)
+    helper = getattr(R, "_apply_password_change", None)
+    if helper is None:
+        print("   ✗ 找不到 _apply_password_change")
+        return False
+    if "password_problem" not in inspect.getsource(helper):
+        print("   ✗ _apply_password_change 没走 password_problem（弱口令能过）")
+        ok = False
+    else:
+        print("   ✓ _apply_password_change 走了 password_problem")
+
+    # 两个改密路由都必须转手给同一个 helper，不能各写一套
+    for fn_name, path in (("password_change", "/password"),
+                          ("change_password", "/settings/password")):
+        fn = getattr(R, fn_name, None)
+        if fn is None:
+            print("   ✗ 找不到路由函数 %s" % fn_name)
+            ok = False
+            continue
+        body = inspect.getsource(fn)
+        if "_apply_password_change" not in body:
+            print("   ✗ %s（%s）没走统一 helper，可能又分叉了" % (fn_name, path))
+            ok = False
+        else:
+            print("   ✓ %s（%s）走统一 helper" % (fn_name, path))
+
+    # 反向：路由里不该再出现自己写的长度/弱口令判断
+    for marker in ('len(new1) < 8', 'len(new2) < 8'):
+        if marker in src_all:
+            print("   ✗ 路由里还残留手写的长度校验 %r" % marker)
+            ok = False
+
+    print("   %s" % ("✓ 通过了" if ok else "✗ 失败"))
+    return ok
+
+
+def test_admin_routes_are_guarded():
+    """所有「主机级」POST 路由必须挂 require_admin。
+
+    为什么进护栏：多用户下最容易犯的错是「加了权限判断，但漏了某个路由」。
+    漏一个的后果是越权（普通用户能改客户端指派 / 轮换令牌 / 删别人），
+    而它在页面上完全看不出来 —— 按钮藏了，但 POST 直接打过去照样成立。
+
+    这条用**源码级**检查兜底：扫 `routes_ui.py`，凡路径属于主机级前缀的
+    写操作，函数体里必须出现 require_admin。它不替代隔离测试，
+    但能挡住「新加一个路由忘了加权限」这种最常见的回归。
+    """
+    print("== 主机级写操作都挂了 require_admin ==")
+    ok = True
+    import inspect
+    import re as _re
+    from app import routes_ui as R, db
+
+    src = inspect.getsource(R)
+    # 主机级前缀：客户端调度 / 配置 / 设置 / 用户管理 / 事件
+    GUARDED = ("/clients", "/config", "/settings", "/users")
+    # 拆出每个 @router.<verb>("<path>") 到下一个装饰器之间的函数体
+    chunks = _re.split(r"\n@router\.", src)
+    problems = []
+    checked = 0
+    for ch in chunks:
+        m = _re.match(r'(get|post|delete|put|patch)\("([^"]+)"', ch)
+        if not m:
+            continue
+        verb, path = m.group(1), m.group(2)
+        if verb == "get":
+            continue                      # 读操作另有口径（如 /clients 对普通用户只读开放）
+        base = path.split("/{")[0] or "/"
+        if not any(path.startswith(p) for p in GUARDED):
+            continue
+        checked += 1
+        if "require_admin" not in ch:
+            problems.append("%-6s %-28s 缺 require_admin" % (verb.upper(), path))
+
+    for p in problems:
+        print("   ✗ %s" % p)
+        ok = False
+    if ok:
+        print("   ✓ %d 个主机级写操作都有 require_admin" % checked)
+
+    # 反向：客户端的「指派 / 探测 / 改名 / 删除 / 暂停」一个都不能漏
+    must = ["/clients/{cid}/assign", "/clients/{cid}/probe", "/clients/{cid}/rename",
+            "/clients/{cid}/delete", "/clients/{cid}/toggle",
+            "/settings/rotate-token", "/users"]
+    for path in must:
+        pat = '@router.%s("%s"' % ("post", path)
+        if pat not in src.replace("'", '"'):
+            print("   · 提示：没找到 %s（路径可能改了，请同步本测试）" % path)
+    print("   %s" % ("✓ 通过了" if ok else "✗ 失败"))
+    return ok
+
+
 def main():
     results = []
     for fn in (test_whitelist_matches, test_account_section_is_local_only,
@@ -391,7 +502,9 @@ def main():
                test_no_plaintext_passwords_anywhere,
                test_console_csp_allows_own_scripts,
                test_realtime_contract,
-               test_role_name_vertical_normalized):
+               test_role_name_vertical_normalized,
+               test_password_rules_are_single_source,
+               test_admin_routes_are_guarded):
         try:
             results.append((fn.__name__, fn()))
         except Exception:

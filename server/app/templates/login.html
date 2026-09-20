@@ -7,11 +7,12 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div style="max-width:380px;margin:12vh auto 0;padding:0 20px">
+<div style="max-width:400px;margin:12vh auto 0;padding:0 20px">
   <div class="panel">
     <h1>{{ app_name }}</h1>
     <div class="sub">请登录后管理采集任务</div>
     {% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+    {% if denied %}<div class="banner warn">请先登录。</div>{% endif %}
     <form method="post" action="/login">
       <label class="f"><span class="name">用户名</span>
         <input type="text" name="user" autocomplete="username" autofocus required>
@@ -22,8 +23,16 @@
       <div class="actions"><button class="primary" type="submit">登录</button></div>
     </form>
   </div>
+
+  <div class="note" style="font-size:12.5px">
+    <b>账号由管理员创建</b>（本系统没有自助注册 —— 主机是共用的，谁能用由管理员定）。
+    忘了口令的话，请找管理员在「用户管理」里重置一个临时口令，
+    你用临时口令登录后会被要求立刻改成自己的。
+  </div>
+
   <p class="hint" style="text-align:center">
-    忘了口令：在服务器上执行 <code>docker compose exec app python -m app.cli reset-password</code>
+    服务器上没有管理员可用时，可在主机上执行
+    <code>docker compose exec app python -m app.cli add-user &lt;名字&gt; --admin</code> 救回一个。
   </p>
 </div>
 </body>

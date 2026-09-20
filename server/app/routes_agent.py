@@ -483,13 +483,33 @@ def create_run(request: Request, body: RunIn,
     role = db.role_get(rid) if rid else None
     # 服务端没指派过角色时，按**角色名**把这条记录归位 —— 这样即使没配置指派，
     # 「角色执行」页也能看到这个角色每天跑得怎么样。
+    #
+    # ★ 搜索范围必须限制在「这个账号的归属人」名下：不同用户的角色重名是可能的
+    #   （游戏名在被抢注前谁都能用），在全库范围按名字找会把 A 的运行记录
+    #   错归到 B 的角色上 —— 那等于把 A 的数据泄给了 B。账号已经定下来归属时，
+    #   就按这个归属缩小范围；账号还没定（客户端没指派）时只能全库找，
+    #   但这条记录本身也不属于任何用户（owner_id 会是 NULL）。
+    owner_hint = None
+    if acc:
+        owner_hint = acc.get("owner_id")
     if role is None and (body.role_label or "").strip():
-        hit = db.role_find_by_name(body.role_label)
+        hit = db.role_find_by_name(body.role_label,
+                                   owner_id=owner_hint,
+                                   own_only=acc is not None)
         if hit:
             role = hit
             rid = int(hit["id"])
             if acc is None and hit.get("account_id"):
                 acc = db.account_get(int(hit["account_id"]))
+
+    # ★ 归属快照：从账号抄一份 owner_id 进 runs 行。
+    #   为什么冗余存而不是每次 JOIN 现算 —— 账号被删掉后 runs.account_id 就悬空了，
+    #   而运行历史必须留着（account_label / role_label 也是为了同一个原因存的快照）。
+    #   靠 JOIN 现算的话，删一次账号就会把历史记录从主人的列表里凭空抹掉。
+    owner_id = acc.get("owner_id") if acc else None
+    if owner_id is None and role and role.get("account_id"):
+        a2 = db.account_get(int(role["account_id"]), with_roles=False)
+        owner_id = (a2 or {}).get("owner_id")
 
     rid_run = db.run_create({
         "client_run_id": body.client_run_id,
@@ -499,6 +519,7 @@ def create_run(request: Request, body: RunIn,
         "role_id": (role or {}).get("id"),
         "account_label": (acc or {}).get("label") or body.account_label or "",
         "role_label": (role or {}).get("name") or body.role_label or "",
+        "owner_id": owner_id,
         "slot": body.slot, "dry_run": body.dry_run,
         "started_at": body.started_at, "finished_at": body.finished_at,
         "duration_seconds": body.duration_seconds,

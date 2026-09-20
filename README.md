@@ -277,6 +277,26 @@ venv\Scripts\python.exe agent.py
 - 登录按 IP 限流；所有响应带 `nosniff` / `X-Frame-Options`
 - 采集端到服务端的传输**强制证书校验**，绝不静默降级
 
+**多用户与权限隔离：**
+
+- **没有自助注册**。账号由管理员在「用户管理」页创建（或命令行 `add-user`），
+  生成一次性初始口令线下交给本人；对方首次登录被**强制改口令**，
+  管理员全程不知道对方最终的口令。
+- 两种角色：**管理员**看全部数据 + 独占主机级操作（任务配置 / 设置 / 客户端指派 / 用户管理）；
+  **普通用户**只看自己登记的账号、角色、运行记录与待执行任务。
+- 隔离靠数据层的 `owner_id` 强制生效，不是界面藏起来 ——
+  普通用户手敲 URL 或直接 POST 都会被服务端挡掉。
+- **同名角色不串号**：不同用户的角色可能重名（游戏名在被抢注前谁都能用），
+  采集端上传运行记录、按角色名自动归位时，匹配范围**先圈定在这个账号的归属人名下**；
+  没指派又撞名时**拒绝猜测**，宁可归到「未登记」也不把 A 的数据挂到 B 的角色上。
+- 普通用户可以**自己**添加游戏账号与角色、自己排任务，不需要管理员代劳。
+- 权限变更（停用 / 降级）**立刻生效**：会话里只存 uid，每次请求现查库，
+  不等 4 小时会话过期。
+- 删用户**不连带删**他的游戏账号（改成收归管理员），因为账号上挂着历史记录与角色配置，
+  连带清掉属于「惩罚过重且不可逆」。
+- 系统始终保留**至少一个启用的管理员**：最后一个不能降级 / 停用 / 删除，
+  也不能改自己的角色（降级会当场丢掉权限，之后就点不动了）。
+
 详见 [server/README.md 的安全设计章节](server/README.md)。
 
 ---
@@ -315,14 +335,16 @@ stzb-automation/
 ├─ tools\
 │   ├─ config.py       本机配置工具（交互菜单 + 命令行）
 │   ├─ emu.py          手动开关模拟器
-│   ├─ selftest.py     离线自检（463 项断言）
+│   ├─ selftest.py     离线自检（464 项断言）
 │   ├─ probe_switch*.py 账号/角色切换界面的侦察脚本
 │   └─ ...             侦察 / 排查小工具
 │
 ├─ tests\              自动化测试（不连模拟器，随时可跑）
-│   ├─ test_account.py       账号/角色切换决策（假 Ui 状态机，11 项）
+│   ├─ test_account.py       账号/角色切换决策（假 Ui 状态机，16 项）
 │   ├─ test_realtime.py      实时通道：帧编解码 + 端到端契约（真 socket，36 项）
+│   ├─ test_role_plan.py     角色任务模式：常量一致 / 默认惰性 / 往返编解码（10 项）
 │   ├─ test_guardrails.py    安全边界：CSP / 令牌白名单一致 / 不存密码 / 定向任务不越权
+│   ├─ test_multiuser.py     多用户：隔离 / 越权拦截 / 一次性口令 / 同名角色不串号 / 老库迁移（117 项）
 │   ├─ smoke_api.py          后端 API 冒烟
 │   └─ e2e_client_server.py  客户端↔服务端联调（真 uvicorn + 真客户端，7 项）
 │
@@ -348,9 +370,11 @@ stzb-automation/
 
 ```bat
 rem 1) 不连模拟器就能跑的自动化测试（改后端/切换逻辑后必跑）
-venv\Scripts\python.exe tests\test_account.py        rem 账号/角色切换决策，11 项
+venv\Scripts\python.exe tests\test_account.py        rem 账号/角色切换决策，16 项
 python tests\test_realtime.py                        rem 实时通道：帧编解码 + 端到端契约，36 项
+python tests\test_role_plan.py                       rem 角色任务模式，10 项
 python tests\test_guardrails.py                      rem 安全边界：CSP / 白名单 / 不存密码
+python tests\test_multiuser.py                       rem 多用户隔离与权限，117 项（改鉴权后必跑）
 python tests\smoke_api.py                            rem 后端 API 冒烟（需装 server 依赖）
 python tests\e2e_client_server.py                    rem 客户端↔服务端联调，7 项
 
@@ -374,7 +398,7 @@ venv\Scripts\python.exe run_daily.py --only all --force   rem 真机全量
 自检（`tools\selftest.py`）覆盖：OCR 误认修正、界面判定互斥、颜色/几何判据、安全黑名单、
 模拟器状态解析、报告生成、后端配置下发边界、bat 启动器卫生、冷启动标题页识别、
 前台包名把关（dumpsys mCurrentFocus）、面板 OCR 放大兜底、实时通道帧与契约、
-本机运行状态判据、角色名竖线归一化等 463 项。
+本机运行状态判据、角色名竖线归一化等 464 项。
 
 这个项目的真 bug 一半是自检/联调抓的、一半是真机抓的，**几条腿缺一不可**。
 
@@ -389,7 +413,10 @@ venv\Scripts\python.exe run_daily.py --only all --force   rem 真机全量
 |---|---|
 | `No module named 'cv2'` | 没装依赖，跑一次 `setup.bat` |
 | `ADB 连接失败` | `tools\emu.py status` 看模拟器；MuMu 装在非默认位置的话，路径会自动探测 |
-| 控制台口令忘了 | 服务器上 `docker compose exec app python -m app.cli reset-password` |
+| 控制台口令忘了 | 服务器上 `docker compose exec app python -m app.cli reset-password`（用户不存在会自动建管理员） |
+| 想加一个人用控制台 | 管理员在「用户管理」页建号（或 `python -m app.cli add-user 名字`），把一次性口令给他 |
+| 普通用户看不到某个账号 | 那个账号没归他名下。管理员在「账号角色」页把归属改过去，或他自己重新登记 |
+| 误把唯一管理员降级/停用 | 服务器上 `python -m app.cli promote-user <名字>` 提回来，或 `reset-password` 重建一个 |
 | 报告里任务显示「跳过」 | 正常 ——「已领过 / 冷却中 / 不在这一档」都是跳过，不是失败 |
 | 游戏更新后任务点错位置 | 看报告里那个任务的**截图**，每周三更新后重点检查 |
 | 上传失败 | 不影响本机跑；恢复后 `run_daily.py --upload-last` 补传 |

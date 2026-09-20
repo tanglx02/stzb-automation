@@ -65,6 +65,24 @@ SCHEMA = """
 PRAGMA journal_mode=WAL;
 PRAGMA foreign_keys=ON;
 
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT NOT NULL,               -- 登录名
+    pwd_hash      TEXT NOT NULL,               -- scrypt，见 security.hash_secret
+    role          TEXT NOT NULL DEFAULT 'user',-- admin | user
+    display_name  TEXT,                        -- 界面上的显示名（可空，退回 username）
+    contact       TEXT,                        -- 联系方式（备注用）
+    note          TEXT,
+    enabled       INTEGER NOT NULL DEFAULT 1,  -- 0 = 停用，登录直接被拒
+    must_change   INTEGER NOT NULL DEFAULT 0,  -- 1 = 首次登录/被重置后要求改口令
+    created_by    TEXT,                        -- 谁建的（管理员自己建的就是 admin）
+    last_login_at TEXT,
+    last_login_ip TEXT,
+    created_at    TEXT,
+    updated_at    TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_users_name ON users(username);
+
 CREATE TABLE IF NOT EXISTS clients (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     uid             TEXT NOT NULL,             -- 客户端持久化的稳定标识
@@ -87,6 +105,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_uid ON clients(uid);
 
 CREATE TABLE IF NOT EXISTS game_accounts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- ★ 归属：谁登记的这个游戏账号。
+    --   NULL = 管理员的（历史数据、以及管理员在后台直接建的都算公共）
+    --   非空 = 某个普通用户私有的，除本人与管理员外谁都看不到、改不了
+    owner_id    INTEGER REFERENCES users(id) ON DELETE SET NULL,
     label       TEXT NOT NULL,                 -- 展示名，如「主号」「小号A」
     login_name  TEXT,                          -- 网易账号（手机号/邮箱），仅用于对账展示
     masked      TEXT,                          -- 登录页读到的脱敏账号，如 159****4508
@@ -97,6 +119,7 @@ CREATE TABLE IF NOT EXISTS game_accounts (
     created_at  TEXT,
     updated_at  TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_accounts_owner ON game_accounts(owner_id);
 
 CREATE TABLE IF NOT EXISTS game_roles (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -123,6 +146,10 @@ CREATE TABLE IF NOT EXISTS runs (
     role_id           INTEGER,                 -- 当时用的是哪个角色
     account_label     TEXT,                    -- 快照：账号展示名（账号删了也留痕）
     role_label        TEXT,                    -- 快照：角色名
+    -- ★ 归属快照：入账时从当时那个账号的 owner_id 抄一份，**故意冗余**。
+    --   不能靠 JOIN game_accounts 现算 —— 账号删掉后 runs.account_id 就悬空了，
+    --   而运行历史必须留着（account_label/role_label 也是为同一个原因存的快照）。
+    owner_id          INTEGER,
     slot              TEXT,
     dry_run           INTEGER NOT NULL DEFAULT 0,
     started_at        TEXT,
@@ -139,6 +166,7 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at        TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_client ON runs(client_run_id);
+CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_id, started_at);
 
 CREATE TABLE IF NOT EXISTS task_results (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -181,6 +209,9 @@ CREATE TABLE IF NOT EXISTS run_requests (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at  TEXT,
     created_by  TEXT,
+    -- ★ 归属：谁排的队。NULL = 管理员排的（对所有人可见）。
+    --   普通用户只能看到/取消自己排的，管理员看全部。
+    owner_id    INTEGER,
     client_id   INTEGER,                           -- 指定哪台客户端执行；NULL = 任意一台
     slot        TEXT,
     only_tasks  TEXT,
@@ -194,6 +225,7 @@ CREATE TABLE IF NOT EXISTS run_requests (
 );
 CREATE INDEX IF NOT EXISTS idx_req_status ON run_requests(status);
 CREATE INDEX IF NOT EXISTS idx_req_client ON run_requests(client_id, status);
+CREATE INDEX IF NOT EXISTS idx_req_owner ON run_requests(owner_id, id);
 
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
@@ -255,11 +287,37 @@ _MIGRATIONS = {
         "role_id": "INTEGER",
         "account_label": "TEXT",
         "role_label": "TEXT",
+        "owner_id": "INTEGER",                 # 多用户：归属快照
     },
     "run_requests": {
         "client_id": "INTEGER",
+        "owner_id": "INTEGER",                 # 多用户：谁排的队
     },
+    "game_accounts": {
+        "owner_id": "INTEGER",                 # 多用户：账号归谁
+    },
+    # users 表本身不需要迁移：老库没有它，SCHEMA 里的 CREATE TABLE IF NOT EXISTS
+    # 会直接建出来；老数据（账号全是管理员的）表现为 owner_id 为 NULL。
 }
+
+
+def _indexes(conn: sqlite3.Connection) -> None:
+    """给老库补上新增的索引。
+
+    SCHEMA 里的 `CREATE INDEX IF NOT EXISTS` 只在建表脚本里跑；老库表已存在时
+    那些语句**照样会执行**（IF NOT EXISTS 是幂等的），所以本来不用单独做。
+    但 `_migrate` 补出来的新列需要索引才不拖慢查询，而 SCHEMA 里的索引是写在
+    建列语句旁边的 —— 老库那几列是 ALTER 出来的，索引得单独补一遍。
+    """
+    for stmt in (
+        "CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_id, started_at)",
+        "CREATE INDEX IF NOT EXISTS idx_req_owner ON run_requests(owner_id, id)",
+        "CREATE INDEX IF NOT EXISTS idx_accounts_owner ON game_accounts(owner_id)",
+    ):
+        try:
+            conn.execute(stmt)
+        except Exception:
+            pass
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> set:
@@ -281,6 +339,222 @@ def _migrate(conn: sqlite3.Connection) -> None:
                     conn.execute("ALTER TABLE %s ADD COLUMN %s %s" % (table, col, decl))
                 except Exception:
                     pass
+    _indexes(conn)
+    _migrate_users(conn)
+
+
+def _migrate_users(conn: sqlite3.Connection) -> None:
+    """把「单管理员」时代的老库平滑升级到多用户。
+
+    老库的管理员凭据散在 kv 表里（`admin_user` / `admin_pwd_hash`）。新结构把用户
+    收进 users 表，所以这里做一次**一次性搬迁**：把 kv 里的管理员搬成 users 表里
+    的第一条 role='admin' 记录。
+
+    为什么必须搬而不能「兼容双份」：登录校验、改口令、权限判断三处要各写两套分支，
+    迟早分叉 —— 分叉的后果是「改了正式口令却还能用老口令登录」这种要命的问题。
+
+    幂等保证：users 表里已经有 admin 就不再搬；kv 里的键**保留不删**
+    （万一新逻辑有问题，回滚旧版本还能用老口令进来救场）。
+    """
+    try:
+        have = _columns(conn, "users")
+        if not have:
+            return
+        row = conn.execute("SELECT COUNT(*) AS n FROM users WHERE role='admin'").fetchone()
+        if int(row["n"] or 0) > 0:
+            return
+        kv = {r["k"]: r["v"] for r in conn.execute("SELECT k,v FROM kv").fetchall()}
+        name = (kv.get("admin_user") or "").strip()
+        pwd_hash = (kv.get("admin_pwd_hash") or "").strip()
+        if not name or not pwd_hash:
+            return
+        ts = now()
+        conn.execute(
+            "INSERT INTO users(username,pwd_hash,role,display_name,enabled,must_change,"
+            "created_by,created_at,updated_at) VALUES(?,?,'admin',?,1,0,'migrate',?,?)",
+            (name, pwd_hash, "管理员（由单管理员版本升级）", ts, ts))
+    except Exception:
+        pass                              # 搬迁失败不能挡住启动；bootstrap 会兜底建新账号
+
+
+# ================================================================== 用户
+#
+# 多用户模型（2026-09-20 起）：
+#   · role='admin' —— 看得到全部账号/角色/运行记录，能建用户、能改任何人的东西
+#   · role='user'  —— 只看得到自己登记的游戏账号与角色，以及它们的运行记录
+#
+# 归属判据统一是 `owner_id`：
+#   · game_accounts.owner_id  谁登记的账号；NULL = 管理员的/公共的
+#   · runs.owner_id           入账时从账号抄的快照（账号删了也还认得出是谁的）
+#   · run_requests.owner_id   谁排的队；NULL = 管理员排的，对所有人可见
+#
+# 角色的归属**不看 game_roles**（它没有 owner_id）—— 一律顺着
+# `game_roles.account_id → game_accounts.owner_id` 走。只在一处存归属，
+# 就不会出现「账号给了 A、角色还挂在 B 名下」这种对不上的状态。
+
+ROLE_ADMIN = "admin"
+ROLE_USER = "user"
+
+
+def _row_user(row: Optional[sqlite3.Row], with_hash: bool = False) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    d = dict(row)
+    if not with_hash:
+        d.pop("pwd_hash", None)
+    d["is_admin"] = (d.get("role") == ROLE_ADMIN)
+    d["enabled"] = bool(d.get("enabled"))
+    d["must_change"] = bool(d.get("must_change"))
+    d["display"] = (d.get("display_name") or "").strip() or d.get("username") or ""
+    return d
+
+
+def user_get(uid: int, with_hash: bool = False) -> Optional[Dict[str, Any]]:
+    with tx() as c:
+        row = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    return _row_user(row, with_hash)
+
+
+def user_by_name(username: str, with_hash: bool = False) -> Optional[Dict[str, Any]]:
+    """按登录名查（大小写不敏感 —— 用户在登录框里大小写乱打是常态）。"""
+    u = (username or "").strip()
+    if not u:
+        return None
+    with tx() as c:
+        row = c.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE", (u,)).fetchone()
+    return _row_user(row, with_hash)
+
+
+def user_list() -> List[Dict[str, Any]]:
+    with tx() as c:
+        rows = c.execute("SELECT * FROM users ORDER BY "
+                         "CASE role WHEN 'admin' THEN 0 ELSE 1 END, id").fetchall()
+        # 顺带把每个用户名下有几个账号带出来，用户管理页直接显示，省一次查询
+        counts = {int(r["owner_id"]): int(r["n"]) for r in c.execute(
+            "SELECT owner_id, COUNT(*) AS n FROM game_accounts "
+            "WHERE owner_id IS NOT NULL GROUP BY owner_id").fetchall()}
+        rcounts = {int(r["owner_id"]): int(r["n"]) for r in c.execute(
+            "SELECT owner_id, COUNT(*) AS n FROM runs "
+            "WHERE owner_id IS NOT NULL GROUP BY owner_id").fetchall()}
+    out = []
+    for r in rows:
+        d = _row_user(r) or {}
+        d["n_accounts"] = counts.get(int(d["id"]), 0)
+        d["n_runs"] = rcounts.get(int(d["id"]), 0)
+        out.append(d)
+    return out
+
+
+def user_count_admins() -> int:
+    with tx() as c:
+        row = c.execute("SELECT COUNT(*) AS n FROM users WHERE role=? AND enabled=1",
+                        (ROLE_ADMIN,)).fetchone()
+    return int(row["n"] or 0)
+
+
+def user_create(username: str, pwd_hash: str, role: str = ROLE_USER, *,
+                display_name: str = "", contact: str = "", note: str = "",
+                created_by: str = "", must_change: bool = True,
+                enabled: bool = True) -> int:
+    ts = now()
+    role = ROLE_ADMIN if role == ROLE_ADMIN else ROLE_USER
+    with tx() as c:
+        cur = c.execute(
+            "INSERT INTO users(username,pwd_hash,role,display_name,contact,note,enabled,"
+            "must_change,created_by,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (username.strip()[:40], pwd_hash, role, display_name.strip()[:40],
+             contact.strip()[:120], note.strip()[:400],
+             1 if enabled else 0, 1 if must_change else 0,
+             created_by.strip()[:40], ts, ts))
+        return int(cur.lastrowid)
+
+
+def user_update(uid: int, **fields: Any) -> None:
+    allowed = ("username", "role", "display_name", "contact", "note",
+               "enabled", "must_change", "pwd_hash")
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        sets.append("%s=?" % k)
+        vals.append(v)
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    vals.append(now())
+    vals.append(uid)
+    with tx() as c:
+        c.execute("UPDATE users SET %s WHERE id=?" % ",".join(sets), vals)
+
+
+def user_touch_login(uid: int, ip: str = "") -> None:
+    with tx() as c:
+        c.execute("UPDATE users SET last_login_at=?, last_login_ip=? WHERE id=?",
+                  (now(), ip, uid))
+
+
+def user_delete(uid: int) -> Dict[str, Any]:
+    """删用户。**不删他的游戏账号**，而是转成「管理员的」（owner_id → NULL）。
+
+    为什么不做级联删除：账号上挂着历史运行记录（靠 runs.owner_id 快照认人），
+    而且账号本身是用户辛苦配的（含各角色的任务模式）。一删用户就把这些连带清掉，
+    属于「惩罚过重且不可逆」。改成收归管理员，管理员想清再单独清。
+    """
+    u = user_get(uid) or {}
+    with tx() as c:
+        c.execute("UPDATE game_accounts SET owner_id=NULL WHERE owner_id=?", (uid,))
+        c.execute("UPDATE run_requests SET owner_id=NULL WHERE owner_id=?", (uid,))
+        c.execute("DELETE FROM users WHERE id=?", (uid,))
+    return u
+
+
+# ================================================================== 归属校验
+
+def account_ids_of(owner_id: Optional[int]) -> List[int]:
+    """某个用户名下的账号 id 列表。owner_id=None（管理员视角）返回空列表 —— 调用方据此跳过过滤。"""
+    if owner_id is None:
+        return []
+    with tx() as c:
+        rows = c.execute("SELECT id FROM game_accounts WHERE owner_id=?",
+                         (owner_id,)).fetchall()
+    return [int(r["id"]) for r in rows]
+
+
+def account_owned_by(aid: int, owner_id: Optional[int]) -> bool:
+    """账号是否属于这个用户。owner_id=None（管理员）恒为 True —— 管理员能碰所有东西。"""
+    if owner_id is None:
+        return True
+    with tx() as c:
+        row = c.execute("SELECT owner_id FROM game_accounts WHERE id=?", (aid,)).fetchone()
+    if not row:
+        return False
+    o = row["owner_id"]
+    return o is not None and int(o) == int(owner_id)
+
+
+def role_owned_by(rid: int, owner_id: Optional[int]) -> bool:
+    """角色是否属于这个用户 —— 顺着 account_id 查上去（角色表不单独存归属）。"""
+    if owner_id is None:
+        return True
+    with tx() as c:
+        row = c.execute(
+            "SELECT a.owner_id AS owner_id FROM game_roles g "
+            "JOIN game_accounts a ON a.id=g.account_id WHERE g.id=?", (rid,)).fetchone()
+    if not row:
+        return False
+    o = row["owner_id"]
+    return o is not None and int(o) == int(owner_id)
+
+
+def run_owned_by(run_id: int, owner_id: Optional[int]) -> bool:
+    if owner_id is None:
+        return True
+    with tx() as c:
+        row = c.execute("SELECT owner_id FROM runs WHERE id=?", (run_id,)).fetchone()
+    if not row:
+        return False
+    o = row["owner_id"]
+    return o is not None and int(o) == int(owner_id)
 
 
 # ------------------------------------------------------------------ kv
@@ -346,12 +620,13 @@ def run_create(data: Dict[str, Any]) -> int:
     with tx() as c:
         cur = c.execute(
             "INSERT INTO runs(client_run_id,host,client_id,account_id,role_id,"
-            "account_label,role_label,slot,dry_run,started_at,finished_at,"
+            "account_label,role_label,owner_id,slot,dry_run,started_at,finished_at,"
             "duration_seconds,n_ok,n_fail,n_skip,all_ok,env_json,notes_json,"
             "runner_version,exit_code,created_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (crid, data.get("host"), data.get("client_id"), data.get("account_id"),
              data.get("role_id"), data.get("account_label"), data.get("role_label"),
+             data.get("owner_id"),
              data.get("slot"), 1 if data.get("dry_run") else 0,
              data.get("started_at"), data.get("finished_at"),
              data.get("duration_seconds") or 0,
@@ -387,7 +662,8 @@ def run_tasks(run_id: int) -> List[sqlite3.Row]:
 
 
 def run_list(limit: int = 50, offset: int = 0, only_failed: bool = False,
-             client_id: Optional[int] = None, account_id: Optional[int] = None
+             client_id: Optional[int] = None, account_id: Optional[int] = None,
+             owner_id: Optional[int] = None, own_only: bool = False
              ) -> List[sqlite3.Row]:
     where, params = [], []
     if only_failed:
@@ -398,6 +674,10 @@ def run_list(limit: int = 50, offset: int = 0, only_failed: bool = False,
     if account_id is not None:
         where.append("r.account_id=?")
         params.append(account_id)
+    if own_only:
+        # 用 owner_id 快照过滤，不去 JOIN 账号表 —— 账号删了历史记录也还认得出是谁的
+        where.append("r.owner_id IS ?")
+        params.append(owner_id)
     sql = ("SELECT r.*, c.name AS client_name FROM runs r "
            "LEFT JOIN clients c ON c.id=r.client_id ")
     if where:
@@ -409,7 +689,8 @@ def run_list(limit: int = 50, offset: int = 0, only_failed: bool = False,
 
 
 def run_count(only_failed: bool = False, client_id: Optional[int] = None,
-              account_id: Optional[int] = None) -> int:
+              account_id: Optional[int] = None,
+              owner_id: Optional[int] = None, own_only: bool = False) -> int:
     where, params = [], []
     if only_failed:
         where.append("(all_ok=0 OR n_skip>0)")
@@ -419,6 +700,9 @@ def run_count(only_failed: bool = False, client_id: Optional[int] = None,
     if account_id is not None:
         where.append("account_id=?")
         params.append(account_id)
+    if own_only:
+        where.append("owner_id IS ?")
+        params.append(owner_id)
     sql = "SELECT COUNT(*) AS n FROM runs"
     if where:
         sql += " WHERE " + " AND ".join(where)
@@ -426,18 +710,30 @@ def run_count(only_failed: bool = False, client_id: Optional[int] = None,
         return int(c.execute(sql, params).fetchone()["n"])
 
 
-def run_stats(days: int = 14) -> Dict[str, Any]:
+def run_stats(days: int = 14, owner_id: Optional[int] = None,
+              own_only: bool = False) -> Dict[str, Any]:
     since = (dt.datetime.now() - dt.timedelta(days=days)).isoformat(timespec="seconds")
+    # 三个查询共用同一套归属过滤（普通用户只看自己的，管理员看全部）。
+    # 用 `owner_id IS ?` 而不是 `=`：管理员建账号时 owner_id 可能是 NULL，
+    # 而 NULL = NULL 在 SQL 里恒为假，会把这些公共账号的记录整个漏掉。
+    own = " AND owner_id IS ?" if own_only else ""
+    args: List[Any] = [since] + ([owner_id] if own_only else [])
     with tx() as c:
         row = c.execute(
             "SELECT COUNT(*) AS total, SUM(all_ok) AS ok_runs, "
             "SUM(CASE WHEN all_ok=0 THEN 1 ELSE 0 END) AS bad_runs "
-            "FROM runs WHERE started_at >= ?", (since,)).fetchone()
-        last = c.execute("SELECT * FROM runs ORDER BY started_at DESC, id DESC LIMIT 1").fetchone()
+            "FROM runs WHERE started_at >= ?" + own, args).fetchone()
+        if own_only:
+            last = c.execute("SELECT * FROM runs WHERE owner_id IS ? "
+                             "ORDER BY started_at DESC, id DESC LIMIT 1",
+                             (owner_id,)).fetchone()
+        else:
+            last = c.execute("SELECT * FROM runs ORDER BY started_at DESC, id DESC "
+                             "LIMIT 1").fetchone()
         by_task = c.execute(
             "SELECT key,name,status,COUNT(*) AS n FROM task_results WHERE run_id IN "
-            "(SELECT id FROM runs WHERE started_at >= ?) GROUP BY key,status",
-            (since,)).fetchall()
+            "(SELECT id FROM runs WHERE started_at >= ?" + own + ") GROUP BY key,status",
+            args).fetchall()
     return {
         "days": days,
         "total": int(row["total"] or 0),
@@ -495,27 +791,39 @@ def prune_runs(keep: int) -> List[int]:
 # ------------------------------------------------------------------ 待执行任务
 
 def request_create(slot: str, only_tasks: str, dry_run: bool, by: str, note: str = "",
-                   client_id: Optional[int] = None) -> int:
+                   client_id: Optional[int] = None,
+                   owner_id: Optional[int] = None) -> int:
     with tx() as c:
         cur = c.execute(
-            "INSERT INTO run_requests(created_at,created_by,client_id,slot,only_tasks,"
-            "dry_run,status,note) VALUES(?,?,?,?,?,?,'pending',?)",
-            (now(), by, client_id, slot or "auto", only_tasks or "",
+            "INSERT INTO run_requests(created_at,created_by,owner_id,client_id,slot,"
+            "only_tasks,dry_run,status,note) VALUES(?,?,?,?,?,?,?,'pending',?)",
+            (now(), by, owner_id, client_id, slot or "auto", only_tasks or "",
              1 if dry_run else 0, note))
         return int(cur.lastrowid)
 
 
-def request_list(limit: int = 50, status: Optional[str] = None) -> List[sqlite3.Row]:
+def request_list(limit: int = 50, status: Optional[str] = None,
+                 owner_id: Optional[int] = None, own_only: bool = False
+                 ) -> List[sqlite3.Row]:
+    where, params = [], []
+    if status:
+        where.append("r.status=?")
+        params.append(status)
+    if own_only:
+        # 普通用户看得到「自己排的」+「管理员排的公共任务」——
+        # 后者是共用同一台主机的日常巡检，瞒着用户反而让人以为没在跑。
+        where.append("(r.owner_id IS ? OR r.owner_id IS NULL)")
+        params.append(owner_id)
+    sql = ("SELECT r.*, c.name AS client_name, c.host AS client_host, "
+           "u.username AS owner_name FROM run_requests r "
+           "LEFT JOIN clients c ON c.id=r.client_id "
+           "LEFT JOIN users u ON u.id=r.owner_id ")
+    if where:
+        sql += "WHERE " + " AND ".join(where) + " "
+    sql += "ORDER BY r.id DESC LIMIT ?"
+    params.append(limit)
     with tx() as c:
-        if status:
-            return c.execute(
-                "SELECT r.*, c.name AS client_name, c.host AS client_host FROM run_requests r "
-                "LEFT JOIN clients c ON c.id=r.client_id "
-                "WHERE r.status=? ORDER BY r.id DESC LIMIT ?", (status, limit)).fetchall()
-        return c.execute(
-            "SELECT r.*, c.name AS client_name, c.host AS client_host FROM run_requests r "
-            "LEFT JOIN clients c ON c.id=r.client_id "
-            "ORDER BY r.id DESC LIMIT ?", (limit,)).fetchall()
+        return c.execute(sql, params).fetchall()
 
 
 def request_pending(limit: int = 10, client_id: Optional[int] = None) -> List[sqlite3.Row]:
@@ -826,12 +1134,46 @@ def client_online_count() -> Dict[str, int]:
 
 # ================================================================== 游戏账号 / 角色
 
-def account_list(with_roles: bool = True) -> List[Dict[str, Any]]:
+def account_list(with_roles: bool = True,
+                 owner_id: Optional[int] = None,
+                 own_only: bool = False) -> List[Dict[str, Any]]:
+    """列游戏账号。
+
+    owner_id / own_only 是**多用户隔离**的开关：
+      · own_only=False（默认）—— 不过滤，管理员视角，看全部
+      · own_only=True         —— 只看 owner_id 这个人名下的（普通用户视角）
+
+    ★ 为什么要一个额外的 own_only 而不是「owner_id=None 就是不过滤」：
+      管理员的 owner_id 也是 None，但语义完全不同（管理员 = 看全部；
+      没有归属的公共账号 = 谁都看得见）。两种 None 混在一个参数里
+      迟早会出现「普通用户 owner_id 恰好是 None 于是看到全部」这种越权。
+    """
+    where, params = [], []
+    if own_only:
+        where.append("a.owner_id IS ?")
+        params.append(owner_id)
+    # 带上归属人名字：管理员看到的是一张混着所有人的表，不写归属根本分不清
+    # 「这个是张三的小号还是李四的」。普通用户视角下这个名字恒等于他自己，
+    # 模板按 own_only 决定要不要显示。
+    sql = ("SELECT a.*, u.username AS owner_name, u.display_name AS owner_display "
+           "FROM game_accounts a LEFT JOIN users u ON u.id=a.owner_id")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY a.sort_order, a.id"
     with tx() as c:
-        rows = c.execute("SELECT * FROM game_accounts "
-                         "ORDER BY sort_order, id").fetchall()
-        roles = c.execute("SELECT * FROM game_roles ORDER BY sort_order, id").fetchall()
+        rows = c.execute(sql, params).fetchall()
+        rsql = "SELECT * FROM game_roles"
+        rparams: List[Any] = []
+        if own_only:
+            rsql += (" WHERE account_id IN (SELECT id FROM game_accounts "
+                     "WHERE owner_id IS ?)")
+            rparams.append(owner_id)
+        rsql += " ORDER BY sort_order, id"
+        roles = c.execute(rsql, rparams).fetchall()
     out = [dict(r) for r in rows]
+    for a in out:
+        a["owner_label"] = (a.get("owner_display") or "").strip() \
+            or a.get("owner_name") or ""
     if with_roles:
         bucket: Dict[int, List[Dict[str, Any]]] = {}
         for r in roles:
@@ -854,20 +1196,33 @@ def account_get(aid: int, with_roles: bool = True) -> Optional[Dict[str, Any]]:
 
 
 def account_create(label: str, login_name: str = "", masked: str = "",
-                   tag: str = "", note: str = "") -> int:
+                   tag: str = "", note: str = "",
+                   owner_id: Optional[int] = None) -> int:
+    """新建账号。owner_id 就是归属：普通用户建的就是他自己的。
+
+    sort_order 按「同一归属内」往下排，而不是全局 —— 否则每个用户的
+    账号列表都会从管理员的最大值开始，看着像空了几十行。
+    """
     ts = now()
     with tx() as c:
-        nxt = c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM game_accounts").fetchone()["n"]
+        if owner_id is None:
+            nxt = c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n "
+                            "FROM game_accounts WHERE owner_id IS NULL").fetchone()["n"]
+        else:
+            nxt = c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n "
+                            "FROM game_accounts WHERE owner_id=?",
+                            (owner_id,)).fetchone()["n"]
         cur = c.execute(
-            "INSERT INTO game_accounts(label,login_name,masked,tag,note,sort_order,"
-            "enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,1,?,?)",
-            (label.strip()[:60] or "未命名账号", login_name.strip()[:120],
+            "INSERT INTO game_accounts(owner_id,label,login_name,masked,tag,note,sort_order,"
+            "enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",
+            (owner_id, label.strip()[:60] or "未命名账号", login_name.strip()[:120],
              masked.strip()[:40], tag.strip()[:40], note.strip()[:400], int(nxt), ts, ts))
         return int(cur.lastrowid)
 
 
 def account_update(aid: int, **fields: Any) -> None:
-    allowed = ("label", "login_name", "masked", "tag", "note", "sort_order", "enabled")
+    allowed = ("label", "login_name", "masked", "tag", "note", "sort_order",
+               "enabled", "owner_id")
     sets, vals = [], []
     for k, v in fields.items():
         if k not in allowed:
@@ -891,13 +1246,22 @@ def account_delete(aid: int) -> None:
         c.execute("UPDATE clients SET account_id=NULL, role_id=NULL WHERE account_id=?", (aid,))
 
 
-def role_list(account_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def role_list(account_id: Optional[int] = None,
+              owner_id: Optional[int] = None,
+              own_only: bool = False) -> List[Dict[str, Any]]:
+    where, params = [], []
+    if account_id is not None:
+        where.append("account_id=?")
+        params.append(account_id)
+    if own_only:
+        where.append("account_id IN (SELECT id FROM game_accounts WHERE owner_id IS ?)")
+        params.append(owner_id)
+    sql = "SELECT * FROM game_roles"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY sort_order, id"
     with tx() as c:
-        if account_id is None:
-            rows = c.execute("SELECT * FROM game_roles ORDER BY sort_order, id").fetchall()
-        else:
-            rows = c.execute("SELECT * FROM game_roles WHERE account_id=? "
-                             "ORDER BY sort_order, id", (account_id,)).fetchall()
+        rows = c.execute(sql, params).fetchall()
     return [dict(r) for r in rows]
 
 
@@ -956,7 +1320,8 @@ def assignment(cid: int) -> Dict[str, Any]:
     return {"client": cli, "account": acc, "role": role}
 
 
-def role_find_by_name(name: str) -> Optional[Dict[str, Any]]:
+def role_find_by_name(name: str, owner_id: Optional[int] = None,
+                      own_only: bool = False) -> Optional[Dict[str, Any]]:
     """按**角色名**反查已登记的角色。
 
     ★ 为什么按名字而不是区服：区服会随合服 / 转服变化（X6014 今天叫「X6014」，
@@ -971,13 +1336,26 @@ def role_find_by_name(name: str) -> Optional[Dict[str, Any]]:
 
     用途：运行记录上传时如果后端没指派过角色，就靠客户端自报的角色名
     把这条记录归到正确的角色上，让「角色每日执行情况」不漏数据。
+
+    own_only=True 时只在 `owner_id` 这个人名下的角色里找。上传路径要传 True ——
+    ★ 不同用户的角色重名是有可能的（游戏名在被抢注前谁都能用），
+    在全库范围内按名字找会把 A 的运行记录错归到 B 的角色上，
+    等于把别人的数据泄给了 A。所以必须先按归属圈定范围再匹配名字。
     """
     want = role_key(name)
     if not want:
         return None
+    where, params = [], []
+    if own_only:
+        where.append("a.owner_id IS ?")
+        params.append(owner_id)
+    sql = ("SELECT g.* FROM game_roles g JOIN game_accounts a ON a.id=g.account_id")
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY g.id"
     hits: List[sqlite3.Row] = []
     with tx() as c:
-        for r in c.execute("SELECT * FROM game_roles ORDER BY id").fetchall():
+        for r in c.execute(sql, params).fetchall():
             if role_key(r["name"]) == want:
                 hits.append(r)
                 if len(hits) > 1:
@@ -990,7 +1368,8 @@ def role_find_by_name(name: str) -> Optional[Dict[str, Any]]:
     return dict(hits[0])
 
 
-def role_daily_overview(days: int = 7) -> Dict[str, Any]:
+def role_daily_overview(days: int = 7, owner_id: Optional[int] = None,
+                        own_only: bool = False) -> Dict[str, Any]:
     """按角色聚合最近几天的执行情况（「角色执行」页的数据源）。
 
     返回::
@@ -1008,14 +1387,20 @@ def role_daily_overview(days: int = 7) -> Dict[str, Any]:
 
     归属规则：优先按服务端指派（`runs.role_id`）；没有指派时按客户端自报的
     角色名（`runs.role_label`）匹配登记的角色名 —— 就是上面那条「按名字识别」。
+
+    own_only=True（普通用户）：只看他自己的角色与他名下的运行记录。
+    ★ 未登记角色的兜底分支（`key[0] != "id"`）也必须过滤 ——
+      那是「跑了但没登记」的角色名，同样只该出现在它所属用户的页面上。
     """
     days = max(1, min(int(days or 7), 30))
     today = dt.date.today()
     dates = [(today - dt.timedelta(days=i)).isoformat() for i in range(days)]
     since = dates[-1] + "T00:00:00"
 
-    roles = role_list()
-    accounts = {int(a["id"]): a for a in account_list(with_roles=False)}
+    roles = role_list(owner_id=owner_id, own_only=own_only)
+    accounts = {int(a["id"]): a
+                for a in account_list(with_roles=False, owner_id=owner_id,
+                                      own_only=own_only)}
     clients = client_list()
 
     by_name: Dict[str, Dict[str, Any]] = {}
@@ -1033,12 +1418,14 @@ def role_daily_overview(days: int = 7) -> Dict[str, Any]:
     for k in _ambiguous:
         by_name.pop(k, None)
 
+    own = " AND owner_id IS ?" if own_only else ""
+    args: List[Any] = [since] + ([owner_id] if own_only else [])
     with tx() as c:
         runs = c.execute(
             "SELECT id,started_at,slot,all_ok,n_ok,n_fail,n_skip,role_id,role_label,"
             "account_id,account_label,client_id,duration_seconds,env_json "
-            "FROM runs WHERE started_at >= ? ORDER BY started_at ASC, id ASC",
-            (since,)).fetchall()
+            "FROM runs WHERE started_at >= ?" + own +
+            " ORDER BY started_at ASC, id ASC", args).fetchall()
         tasks_by_run: Dict[int, List[Dict[str, Any]]] = {}
         if runs:
             ids = [int(x["id"]) for x in runs]

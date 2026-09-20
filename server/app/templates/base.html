@@ -65,14 +65,24 @@
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
              stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5a5.5 5.5 0 0 0-5.5 5.5c0 4-1.5 5.5-1.5 5.5h14s-1.5-1.5-1.5-5.5A5.5 5.5 0 0 0 12 3.5Z"/><path d="M10.2 18a2 2 0 0 0 3.6 0"/></svg>
         事件</a>
+      {# 「用户管理」只给管理员看。普通用户即使手敲 /users 也会被 303 弹回总览，
+         所以这里藏掉只是省得他点一次再被拒 —— 权限判断在服务端，不靠这个。 #}
+      {% if is_admin %}
+      <a href="/users" class="{% if nav=='users' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M2.5 19.5c0-3.1 2.9-5 6.5-5s6.5 1.9 6.5 5"/><circle cx="17.5" cy="9" r="2.4"/><path d="M16 14.6c2.9.2 5 2 5 4.9"/></svg>
+        用户管理</a>
+      {% endif %}
       <a href="/settings" class="{% if nav=='settings' %}on{% endif %}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
              stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.2a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.6 1.6 0 0 0 4.6 15H4.4a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.1-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.6 1.6 0 0 0 11 4.6V4.4a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 2.8 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.8h.2a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.5 1Z"/></svg>
         设置</a>
     </nav>
 
+    {# 改动口令入口。任何登录用户都有这一页 —— 被管理员重置口令后
+       （must_change=1）会被强制跳到这里，没有它普通用户就永远出不来了。 #}
     <div class="side-foot">
-      <span class="who">{{ user or '未登录' }}</span>
+      <a class="who" href="/password" title="改我自己的登录口令">{{ user or '未登录' }}</a>
       <form method="post" action="/logout"><button class="lnk" type="submit">退出</button></form>
     </div>
   </aside>

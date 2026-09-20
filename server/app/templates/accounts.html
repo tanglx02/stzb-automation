@@ -4,11 +4,26 @@
 
 <h1>游戏账号与角色</h1>
 <div class="sub">
-  把你有多少个账号、每个账号下有哪些角色登记在这里，然后在
-  <a href="/clients">客户端</a> 页把 <b>哪台机器负责哪个账号/角色</b> 指派下去，
-  客户端跑任务前会自动切过去。<b>每个角色跑哪些任务</b>在
-  <a href="/roles">角色执行</a> 页单独配置。
+  {% if is_admin %}
+    这里是<b>所有用户</b>登记的游戏账号。把 <b>哪台机器负责哪个账号/角色</b> 指派下去，
+    客户端跑任务前会自动切过去。<b>每个角色跑哪些任务</b>在
+    <a href="/roles">角色执行</a> 页单独配置。
+  {% else %}
+    把<b>你自己的</b>游戏账号、每个账号下的角色登记在这里（别人看不到你的账号，
+    你也看不到别人的）。<b>每个角色跑哪些任务</b>在
+    <a href="/roles">角色执行</a> 页单独配置。
+  {% endif %}
 </div>
+
+{% if is_admin %}
+<div class="note">
+  <b>管理员视角：</b>这张表混着所有人的账号，所以每张卡片头部标了归属人。
+  普通用户只能看到自己的 —— 隔离靠 <code>owner_id</code> 在数据层强制生效，
+  不是靠界面藏起来。<br>
+  想给人开账号，先到 <a href="/users">用户管理</a> 建人，再让他自己登录来登记账号
+  （或者你代建，然后在卡片上把归属改过去）。
+</div>
+{% endif %}
 
 <div class="note">
   <b>关于「切换」的实测结论（决定了这里该怎么填）：</b>
@@ -30,6 +45,18 @@
 <h2>新增账号</h2>
 <form method="post" action="/accounts">
   <div class="panel">
+    {% if is_admin %}
+    <label class="f">
+      <span class="name">归属用户</span>
+      <select name="owner_id">
+        <option value="">公共（不属于任何人，谁都能用）</option>
+        {% for u in all_users or [] %}
+          <option value="{{ u.id }}">{{ u.username }}{% if u.display and u.display != u.username %}（{{ u.display }}）{% endif %}</option>
+        {% endfor %}
+      </select>
+      <div class="hint">管理员代建的账号要选好归属，否则普通用户看不到它。</div>
+    </label>
+    {% endif %}
     <div class="grid2">
       <label class="f">
         <span class="name">账号名（你自己认得出的名字）</span>
@@ -62,7 +89,10 @@
 <h2>账号列表</h2>
 
 {% if not accounts %}
-<div class="panel empty">还没有登记任何账号。先用上面的表单加一个。</div>
+<div class="panel empty">
+  {% if is_admin %}还没有任何账号登记过。可以自己新增，也可以让用户登录后自己加。
+  {% else %}你还没有登记任何账号。用上面的表单加一个。{% endif %}
+</div>
 {% endif %}
 
 {% for a in accounts %}
@@ -73,6 +103,10 @@
     {% if a.tag %}<span class="pill gray">{{ a.tag }}</span>{% endif %}
     {% if not a.enabled %}<span class="pill skip">已停用</span>{% endif %}
     <span class="hint">{{ a.roles|length }} 个角色</span>
+    {% if is_admin %}
+      {% if a.owner_label %}<span class="pill info">归属：{{ a.owner_label }}</span>
+      {% else %}<span class="pill gray">公共（无归属）</span>{% endif %}
+    {% endif %}
     {% if users.get(a.id) %}
     <span class="pill ok">被 {{ users[a.id]|length }} 台客户端使用</span>
     {% endif %}
@@ -150,6 +184,18 @@
       </div>
       <label class="f"><span class="name">备注</span>
         <input type="text" name="note" value="{{ a.note or '' }}"></label>
+      {% if is_admin %}
+      <label class="f"><span class="name">归属用户</span>
+        <select name="owner_id">
+          <option value="">公共（不属于任何人）</option>
+          {% for u in all_users or [] %}
+            <option value="{{ u.id }}" {% if a.owner_id == u.id %}selected{% endif %}>
+              {{ u.username }}{% if u.display and u.display != u.username %}（{{ u.display }}）{% endif %}</option>
+          {% endfor %}
+        </select>
+        <div class="hint">改成某个用户后，只有他自己（和你）能看到这个账号。</div>
+      </label>
+      {% endif %}
       <label class="f cbrow">
         <input type="checkbox" name="enabled" value="1" {% if a.enabled %}checked{% endif %}>
         <span class="name">启用（停用后不会被指派、也不会派任务）</span>

@@ -5,6 +5,10 @@
 <h1>待执行请求</h1>
 <div class="sub">
   在这里排一个「下次跑什么」。脚本启动时会把它领走并执行，跑完自动回执。
+  {% if not is_admin %}
+    <br>你看到的是<b>自己排的</b>请求，外加管理员排的公共巡检任务 ——
+    主机是共用的，轮到你需要等它空闲。
+  {% endif %}
 </div>
 
 {% if created %}<div class="banner ok">已新建请求 #{{ created }}。脚本下次启动会领走它。</div>{% endif %}
@@ -14,6 +18,13 @@
 
 {% if not allow %}
 <div class="banner warn">服务端已关闭「触发任务」功能（环境变量 STZB_ALLOW_RUN_REQUESTS=0）。</div>
+{% endif %}
+
+{% if not is_admin and not my_accounts %}
+<div class="banner warn">
+  你还没有登记任何游戏账号，排的任务没有<code>角色</code>可跑。
+  先到 <a href="/accounts">账号角色</a> 添加账号与角色。
+</div>
 {% endif %}
 
 {% if allow %}
@@ -63,7 +74,8 @@
 <h2>请求列表</h2>
 <table>
   <thead><tr>
-    <th class="num">#</th><th>创建时间</th><th>执行客户端</th><th>档位</th><th>范围</th><th>状态</th>
+    <th class="num">#</th><th>创建时间</th>{% if is_admin %}<th>排队人</th>{% endif %}
+    <th>执行客户端</th><th>档位</th><th>范围</th><th>状态</th>
     <th>关联运行</th><th>备注</th><th></th>
   </tr></thead>
   <tbody>
@@ -72,6 +84,10 @@
     <tr>
       <td class="num">{{ j.id }}</td>
       <td>{{ j.created_at }}</td>
+      {% if is_admin %}
+      <td>{% if j.owner_name %}<span class="pill info">{{ j.owner_name }}</span>
+          {% else %}<span class="muted">公共</span>{% endif %}</td>
+      {% endif %}
       <td>{% if j.client_id %}<span class="pill skip">{{ j.client_name or j.client_host or ('#' ~ j.client_id) }}</span>
           {% else %}<span class="muted">任意</span>{% endif %}</td>
       <td>{{ j.slot }}{% if j.dry_run %} <span class="pill gray">预演</span>{% endif %}</td>
@@ -87,7 +103,8 @@
       <td class="muted">{{ j.note or '' }}</td>
       <td>
         {% if j.status in ('pending', 'taken') %}
-        <form method="post" action="/jobs/{{ j.id }}/cancel">
+        <form method="post" action="/jobs/{{ j.id }}/cancel"
+              data-confirm="取消这条待执行请求？脚本还没领走的话就不会再跑它了。">
           <button class="lnk" type="submit">取消</button>
         </form>
         {% endif %}
@@ -95,7 +112,9 @@
     </tr>
   {% endfor %}
   {% if not jobs %}
-    <tr><td colspan="9" class="muted">还没有任何请求。</td></tr>
+    <tr><td colspan="{% if is_admin %}10{% else %}9{% endif %}" class="muted">
+      {% if is_admin %}还没有任何请求。{% else %}你还没有排过任务。上面新建一条试试。{% endif %}
+    </td></tr>
   {% endif %}
   </tbody>
 </table>
@@ -104,7 +123,9 @@
   说明：脚本每次启动会先领走队列里最老的一条 <b>待领取</b> 请求，按它的档位和范围执行；
   执行完把结果和报告上传后，这条请求会变成「已完成」并链接到那一轮记录。<br>
   <b>定向 vs 公共：</b>指定了「执行客户端」的任务只有那台机器能领到，适合「这台机器专门跑那个小号」；
-  不指定的就是公共任务，哪台先来心跳哪台领走。
+  不指定的就是公共任务，哪台先来心跳哪台领走。<br>
+  {% if is_admin %}你排的任务是<b>公共</b>的（不属于任何用户），用来做全机巡检最合适。
+  {% else %}你排的任务挂在你自己名下，只有你能取消；管理员排的公共巡检你也能看到（毕竟机器是共用的）。{% endif %}
 </p>
 
 {% endblock %}
