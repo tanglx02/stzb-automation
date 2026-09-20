@@ -11,7 +11,7 @@
 
 | 脚本 | 干什么 |
 |---|---|
-| `selftest.py` | **离线自检（405 项断言）**。改完代码必跑，必须全绿 |
+| `selftest.py` | **离线自检（420 项断言）**。改完代码必跑，必须全绿 |
 | `config.py` | 本机配置工具，跟 `config_tool.bat` 是同一个东西（菜单 + 命令行） |
 | `emu.py` | 手动开关模拟器：`status` / `start` / `stop` / `kill` / `restart` / `game-stop` |
 

@@ -73,6 +73,9 @@ NN_LOGIN_BTN = (959, 683)
 BTN_SURVEY_CONTINUE = (427, 837)
 AD_CLOSE = (1849, 222)         # 活动广告弹窗右上 ✕
 DOWNLOAD_CLOSE = (1534, 233)   # 「资源下载」弹窗右上 ✕（绝不点「开始下载」）
+# 「军情批阅」战报弹窗（挂机一段时间再回来必弹）底部的「批阅」按钮。
+# OCR 实测 box (1184,870)-(1275,907)，中心 (1229,888)。
+BTN_JUNQING = (1229, 888)
 
 # 招募
 RECRUIT_PACK_XIAOJI = (1680, 850)   # 魏晋名将卡包
@@ -365,6 +368,41 @@ class Ui:
             time.sleep(1.5)
             return "info_popup"
 
+        # ★ 「军情批阅」战报弹窗（2026-09-20 实跑发现）。
+        #   每次「离开一段时间再回来」游戏都会弹它汇报这段时间的势力变化，
+        #   所以**挂机过夜后的每轮开机都必然遇到**。它的麻烦在于既没有
+        #   「取消/跳过/关闭」也没有「确定/知道了」，于是 boot 循环一路走到
+        #   「认不出的界面」分支、白等 8 轮（实测 ~70 秒）才强制清屏 ——
+        #   而其实只差一个「批阅」。
+        #   处理方式照玩家的做法：点「批阅」把战报收掉。
+        #   ⚠️ 绝不勾「今日不再弹出」那个复选框 —— 那是玩家自己的游戏设置，
+        #      脚本无权替他改（宁可每轮多点一次）。
+        #   ⚠️ 判据不能只用「批阅」二字：正文里有一整句「如下事情，请批阅！」。
+        #      所以要用「军情总览/军情批阅」这类只属于本弹窗的标题词，
+        #      而按钮则要求 norm 后**完全等于**「批阅」（正文那句归一化后是
+        #      「如下事情请批阅」，不会误命中）。
+        is_junqing = self.has(items, "军情批阅", "军情比阅", "军情扌比阅") \
+            or (self.has(items, "军情总览") and self.has(items, "批阅"))
+        if is_junqing:
+            # 安全阀：出现任何消费字样就绝不动手（沿用 close_info_popup 的思路）。
+            danger = ("购买", "充值", "支付", "花费", "元宝", "续期", "¥", "￥")
+            if any(d in norm(it.text) for it in items for d in danger):
+                self.log("    ! 「军情批阅」弹窗上出现消费字样，保守放弃不点")
+                return ""
+            btn = None
+            for it in items:
+                if norm(it.text) == "批阅":
+                    btn = it
+                    break
+            if btn is not None:
+                self.log("    · 「军情批阅」战报弹窗 → 点「批阅」@%s" % (btn.center,))
+                self.tap(*btn.center)
+            else:
+                self.log("    · 「军情批阅」战报弹窗 → 用固定坐标点「批阅」")
+                self.tap(*BTN_JUNQING)
+            time.sleep(1.5)
+            return "junqing"
+
         # 广告弹窗：文案里带「来网易游戏中心」（「精彩活动」是活动面板标题，不能当弹窗）
         if self.has(items, "来网易游戏中心"):
             self.log("    · 检测到广告弹窗，点右上关闭")
@@ -505,7 +543,8 @@ class Ui:
                     time.sleep(10)          # 这一下之后要加载登录页/资源，给足时间
                     continue
             sig = self.guard(items)
-            if sig in ("exit_confirm", "download", "ad", "login", "info_popup"):
+            if sig in ("exit_confirm", "download", "ad", "login", "info_popup",
+                       "junqing"):
                 continue
             if sig == "hufu_lack":
                 self.close_hufu_dialog(items)

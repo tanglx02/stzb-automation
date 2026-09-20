@@ -19,11 +19,12 @@ from stzb.ui import Ui                                                   # noqa:
 from stzb.tasks import (_FallbackBtn, _band_jade_frac, _band_price,       # noqa: E402
                         _block_has_ink, _block_in_row, _block_labels,
                         _find_free_zz, _find_hufu_buy, _find_sweep_entry,
-                        _find_sweep_icon, _got_reward, _has_done_stamp,
-                        _has_discount_ribbon, _has_free_badge,
+                        _find_sweep_icon, _free_claim_is_trustworthy, _got_reward,
+                        _has_done_stamp, _has_discount_ribbon, _has_free_badge,
                         _hufu_exchange_ok, _is_free_zz_txt, _is_sweep_dialog,
                         _parse_clock, _parse_free_countdown,
-                        _pick_free_button, _price_left_of, _price_under_btn,
+                        _pick_free_button, _price_in_btn_row, _price_left_of,
+                        _price_under_btn,
                         _shop_blocks, _sweep_claim_button, _sweep_countdown)
 
 PASS = 0
@@ -2224,6 +2225,86 @@ def test_panel_ocr_fallback():
         _ui.ocr_image_scaled = orig
 
 
+def test_junqing_and_recruit():
+    print("\n[31] 军情批阅战报弹窗 + 招募「免费」误判 / 价格横行读取")
+    # ---- ① 「军情批阅」战报弹窗（2026-09-20 实跑发现）----
+    # 每次「离开一段时间再回来」游戏都会弹它，所以挂机过夜后的每轮开机必遇到。
+    # 它既没有「取消/跳过/关闭」也没有「确定/知道了」，认不出就会一路走到
+    # boot 的「认不出的界面」分支、白等 8 轮（实测 ~70 秒）才强制清屏。
+    ui = FakeUi()
+    ui.tapped = []
+    ui.log = lambda *a: None
+    ui.tap = lambda x, y: ui.tapped.append((x, y))
+    junqing = [
+        itc("军情比阅", 319, 200),          # 标题常把「批」读成「比」
+        itc("主公，在你离开的4小时", 487, 557),
+        itc("军情总览", 1230, 142),
+        itc("资源收获", 1230, 593),
+        itc("如下事情，请批阅！", 453, 625),   # 正文里也有「批阅」二字
+        itc("批阅", 1229, 888),              # 真正的按钮
+        itc("今日不再弹出", 1462, 995),       # ★ 绝不勾它
+    ]
+    sig = ui.guard(junqing)
+    check("识别为 junqing", sig == "junqing", repr(sig))
+    check("点的是「批阅」按钮，不是复选框",
+          ui.tapped == [(1229, 888)], str(ui.tapped))
+
+    # 反例：内政主界面（有「税收/市井」等入口）不该触发
+    ui.tapped = []
+    nz = [itc("政策", 540, 390), itc("市井", 1045, 700), itc("可领取0/3", 1743, 769)]
+    check("内政面板不触发军情批阅", ui.guard(nz) == "", "误触发")
+    check("内政面板没被点任何东西", ui.tapped == [], str(ui.tapped))
+
+    # 安全阀：军情批阅的变体上出现消费字样 → 绝不动手
+    ui.tapped = []
+    danger = [itc("军情总览", 1230, 142), itc("批阅", 1229, 888),
+              itc("花费100玉符", 900, 700)]
+    check("带消费字样的战报弹窗不动手", ui.guard(danger) == "", "动手了")
+    check("消费变体没有发生点击", ui.tapped == [], str(ui.tapped))
+
+    # ---- ② 绿标签「免费」误判：那是付费按钮左边的绿色货币图标 ----
+    # 实测（2026-09-20 12:57 半价轮）：按钮 (731,912)，左边 (556,856) 挂着「打折」。
+    # 真免费帧的绿标签 40x32/面积 639，付费货币图标 34x40/面积 658 —— 分不开。
+    ui2 = FakeUi()
+    ui2.log = lambda *a: None
+    btn_paid = itc("招募1次", 731, 912)
+    paid_items = [btn_paid, itc("打折", 556, 856)]
+    check("紧邻「打折」时 → 不认这个绿标签为免费",
+          _free_claim_is_trustworthy(ui2, paid_items, btn_paid, False) is False)
+
+    btn_free = itc("招募1次", 1405, 504)
+    free_items = [btn_free, itc("免费次数1", 1061, 915)]
+    check("真免费帧（近旁没有「打折」）→ 绿标签可信",
+          _free_claim_is_trustworthy(ui2, free_items, btn_free, False) is True)
+
+    # ★ 半径不能放大：旁边卡包卡片上的「打折」不能把真免费那轮误杀
+    far = [btn_free, itc("打折", 1405 - 430, 504)]      # dx=430 > 240
+    check("远处（dx=430）的「打折」不影响真免费帧",
+          _free_claim_is_trustworthy(ui2, far, btn_free, False) is True)
+    check("红色「打折」丝带同样否掉免费声明（ribbon=True）",
+          _free_claim_is_trustworthy(ui2, free_items, btn_free, True) is False)
+
+    # ---- ③ 价格横行读取（卡包详情页：100 / 招募1次）----
+    # 价格在这一屏是**横排**的，不在按钮下方，_price_under_btn 读不到；
+    # 放大 2 倍后整条读成「》@100/招募1次」。
+    b100 = itc("》@100/招募1次", 706, 906)
+    check("从「100/招募1次」读出 100", _price_in_btn_row([b100], b100) == 100)
+    b950 = itc("《@950/招募5次", 1176, 909)
+    check("从「950/招募5次」读出 950", _price_in_btn_row([b950], b950) == 950)
+    # ★ 最危险的一种：1x 的「@1佣/招募1次」里那个「1」绝不能被当成价格
+    #   （读成 1 比读不出来更糟 —— 「价格 ≤ 上限」会永远通过）
+    b_garbled = itc("@1佣/招募1次", 731, 912)
+    check("1x 的「@1佣/招募1次」读不出价格（绝不能读成 1）",
+          _price_in_btn_row([b_garbled], b_garbled) is None)
+    b_bare = itc("招募1次", 700, 900)
+    check("裸「招募1次」不会被读成价格",
+          _price_in_btn_row([b_bare], b_bare) is None)
+    # 离得太远的数字不认（避免吃到页面别处的价格）
+    far_num = itc("》@100/招募1次", 700 + 500, 906)
+    check("远处（dx=500）的价格不算在按钮头上",
+          _price_in_btn_row([far_num], itc("招募1次", 700, 906)) is None)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -2262,6 +2343,7 @@ if __name__ == "__main__":
     test_foreground_guard()
     test_cleanup()
     test_panel_ocr_fallback()
+    test_junqing_and_recruit()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)

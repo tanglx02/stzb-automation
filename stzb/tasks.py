@@ -230,24 +230,94 @@ def _price_under_btn(items: Sequence[TextItem], btn: TextItem) -> Optional[int]:
     return min(nums) if nums else None
 
 
+# 「100 / 招募1次」这种**横排**价格：数字紧挨在「/ 招募 N 次」前面。
+# 为什么不能直接扫这一行里的所有数字：实测 OCR 会把价格和按钮文字并成一条
+# 「》@100/招募1次」，里面的「1次」也带数字，直接取 min 会读成 1 —— 比真实价
+# 小两个数量级，安全阀「价格 ≤ 上限」就永远通过了，比读不出来还危险。
+# 所以必须用「数字 + / + 招募N次」这个结构去锚定。
+RC_PRICE_ROW_RE = re.compile(r"(\d{2,4})\s*[-~〜]?\s*/\s*招募\s*[1-5]\s*次")
+RC_PRICE_ROW_DX = 400      # 相对按钮中心：同一横行往左右找多远
+RC_PRICE_ROW_DY = 70
+# 绿标签交叉验证的搜索半径（见 _free_claim_is_trustworthy）
+RC_BADGE_CROSS_DX = 240
+RC_BADGE_CROSS_DY = 150
+
+
+def _price_in_btn_row(items: Sequence[TextItem], btn: TextItem) -> Optional[int]:
+    """从按钮**同一横行**抠价格（形态：`100 / 招募1次`）。
+
+    实测（2026-09-20）：卡包详情页的价格是横向排的「100 / 招募1次」，
+    不在按钮下方，所以 _price_under_btn 永远读不到 —— 半价轮会因此判定
+    「读不出价格」而放弃，配置里开着的半价抽卡等于白开。
+    放大 2 倍后整条能读成 `》@100/招募1次`，用下面的结构正则一抠就出来。
+
+    ⚠️ 这里**不能**跳过 btn 自己：价格和「招募1次」经常被 OCR 并进同一条，
+    btn 那条里就带着价格。正则要求「数字紧挨 /招募N次」，所以裸的
+    「招募1次」不会被误读成价格。
+    """
+    best: Optional[int] = None
+    for it in items:
+        if abs(it.center[1] - btn.center[1]) > RC_PRICE_ROW_DY:
+            continue
+        if abs(it.center[0] - btn.center[0]) > RC_PRICE_ROW_DX:
+            continue
+        m = RC_PRICE_ROW_RE.search(it.text)
+        if m:
+            val = int(m.group(1))
+            if best is None or val < best:
+                best = val
+    return best
+
+
+def _free_claim_is_trustworthy(ui: Ui, items: Sequence[TextItem], btn: TextItem,
+                               ribbon: bool) -> bool:
+    """绿标签说「免费」时，再确认它不是**付费按钮左边的绿色货币图标**。
+
+    ★ 为什么必须有这一层（2026-09-20 实跑抓到，会花掉真金白银）：
+      「免费」二字 OCR 读不出来，只能靠绿标签的颜色+形状认，而那个判据会误命中
+      付费按钮左边的绿色货币图标。实测两个样张：
+          真免费标签   40x32 / 面积 639
+          付费货币图标 34x40 / 面积 658
+      判据区间「面积≥250、宽 22~80、高 18~55」把两者完全覆盖，分不开。
+      一旦误判，半价轮的三个安全阀（打折丝带 / 读价格 / 价格≤上限）会被整段
+      跳过（代码走 `if is_free` 分支），脚本就盲点了一个付费按钮 —— 实测当场
+      撞上「虎符不足」并兑了 100 虎符，换来的是一次**未经价格校验**的抽取。
+
+    判据：按钮紧邻处出现「打折」→ 以付费为准。
+    半径刻意比半价安全阀的 460 小得多：太大就会把旁边卡包卡片上的「打折」也
+    吃进来，反过来把真免费的那一轮误杀（那会白丢一次免费抽）。
+    实测半价帧：按钮(731,912)、「打折」(556,856) → dx=-175, dy=-56。
+    """
+    if ui.near(items, "打折", btn, dx=RC_BADGE_CROSS_DX, dy=RC_BADGE_CROSS_DY) is not None:
+        return False
+    return not ribbon
+
+
 def _read_recruit_price(ui: Ui, items: Sequence[TextItem], btn: TextItem,
                         path: str, tag: str) -> Optional[int]:
-    """三重手段读价格：帧内直读 → 放大 2 倍整图 OCR → 放大 3 倍整图 OCR。
+    """多重手段读价格：帧内直读 → 放大整图再 OCR；每轮都试两种排布。
+
+    两种排布都要试，因为游戏有**两套招募 UI**：
+      · 招募列表页：价格在按钮**下方**（_price_under_btn）；
+      · 卡包详情页：价格在按钮**同一横行、文字左侧**（_price_in_btn_row）。
 
     放大用整图（ocr_image_scaled），不要先裁再放 —— Windows 原生 OCR 对小于
     约 480x270 的图会静默返回 0 行，裁出来的小图放大也没用。
     """
-    p = _price_under_btn(items, btn)
-    if p is not None:
-        return p
+    getters = (_price_under_btn, _price_in_btn_row)
+    for getter in getters:
+        p = getter(items, btn)
+        if p is not None:
+            return p
     for f in RC_PRICE_SCALES:
         try:
             big = ocr_image_scaled(path, factor=f, tmp_path=ui.dev.shot_path("%s_z%d" % (tag, f)))
         except Exception:
             continue
-        p = _price_under_btn(big, btn)
-        if p is not None:
-            return p
+        for getter in getters:
+            p = getter(big, btn)
+            if p is not None:
+                return p
     return None
 
 
@@ -1261,6 +1331,16 @@ def _recruit_once(ui: Ui, log, want_free: bool, allow_buy: bool,
     discount = ui.near(items, "打折", btn, dx=460, dy=170)
     # 兜底信号：卡包列表里那一列会写「100（半价1次）」，字比丝带大，OCR 读得到
     offer_txt = any("半价" in norm(it.text) for it in items)
+
+    # ★ 交叉验证（2026-09-20 实跑抓到的假阳性，会花掉真金白银）：
+    #   上面那枚「绿标签」判定是纯颜色+形状的，会误命中付费按钮左边的绿色货币图标
+    #   （实测真免费 40x32/639  vs  付费货币图标 34x40/658，判据区间完全重叠）。
+    #   误判后果：半价轮的三个安全阀会被整段跳过，脚本盲点付费按钮。
+    #   详见 _free_claim_is_trustworthy 的注释。
+    if is_free and not _free_claim_is_trustworthy(ui, items, btn, ribbon):
+        log("    · 绿标签旁同时有「打折」→ 判为付费按钮（那是货币图标，不是免费标签）")
+        is_free = False
+
     cap = price_max if price_max is not None else buy_max
     price: Optional[int] = None
 
