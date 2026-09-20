@@ -119,7 +119,9 @@ CREATE TABLE IF NOT EXISTS game_accounts (
     created_at  TEXT,
     updated_at  TEXT
 );
-CREATE INDEX IF NOT EXISTS idx_accounts_owner ON game_accounts(owner_id);
+-- ⚠ owner_id 的索引不在这里建：老库的 game_accounts 表已存在但没有这一列，
+--   建表语句被 IF NOT EXISTS 跳过、建索引却照样执行 → no such column。
+--   统一挪到 _indexes()，等 _migrate 加完列再建（见那里的详细说明）。
 
 CREATE TABLE IF NOT EXISTS game_roles (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -166,7 +168,7 @@ CREATE TABLE IF NOT EXISTS runs (
     created_at        TEXT
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_runs_client ON runs(client_run_id);
-CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_id, started_at);
+-- idx_runs_owner (owner_id, started_at) 同理挪到 _indexes()：owner_id 是老库没有的新列
 
 CREATE TABLE IF NOT EXISTS task_results (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -224,8 +226,8 @@ CREATE TABLE IF NOT EXISTS run_requests (
     note        TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_req_status ON run_requests(status);
-CREATE INDEX IF NOT EXISTS idx_req_client ON run_requests(client_id, status);
-CREATE INDEX IF NOT EXISTS idx_req_owner ON run_requests(owner_id, id);
+-- idx_req_client (client_id, status) 与 idx_req_owner (owner_id, id) 都引用了
+-- 老库没有的新列（client_id / owner_id），一起挪到 _indexes() 里建
 
 CREATE TABLE IF NOT EXISTS kv (
     k TEXT PRIMARY KEY,
@@ -302,16 +304,32 @@ _MIGRATIONS = {
 
 
 def _indexes(conn: sqlite3.Connection) -> None:
-    """给老库补上新增的索引。
+    """建「引用了迁移补出来的列」的那些索引 —— 必须在 _migrate 加完列之后跑。
 
-    SCHEMA 里的 `CREATE INDEX IF NOT EXISTS` 只在建表脚本里跑；老库表已存在时
-    那些语句**照样会执行**（IF NOT EXISTS 是幂等的），所以本来不用单独做。
-    但 `_migrate` 补出来的新列需要索引才不拖慢查询，而 SCHEMA 里的索引是写在
-    建列语句旁边的 —— 老库那几列是 ALTER 出来的，索引得单独补一遍。
+    ★ 为什么这些索引不能写在 SCHEMA 里（曾经踩过的坑，真崩过）：
+
+      SCHEMA 是先 `CREATE TABLE IF NOT EXISTS` 再 `CREATE INDEX IF NOT EXISTS`。
+      对**老库**来说表已经存在，建表语句被跳过 —— 但建索引语句**照样会执行**。
+      而老库的表里根本没有 owner_id / client_id 这些列（它们是多用户改造时
+      靠 ALTER TABLE 补上去的），于是建索引直接报
+      `sqlite3.OperationalError: no such column: owner_id`，
+      **整个服务起不来**。
+
+      为什么会踩：一开始以为 `IF NOT EXISTS` 是幂等的、老库上跑一遍没事，
+      忽略了「索引的幂等性」和「它依赖的列存在」是两件事。
+
+    所以规则很简单：**索引只要引用了迁移新增的列，就必须走这里**。
+    写在 SCHEMA 里的索引只能引用建表时就有的列（client_run_id / status /
+    account_id / run_id / at 这些）。
+
+    逐条容错（try/except pass）：万一某张表结构更旧、连列都补不上，
+    也不该为了建不出一个索引就挡住整个服务启动 —— 索引只影响查询快慢，
+    不影响正确性，缺一个顶多是慢一点。
     """
     for stmt in (
         "CREATE INDEX IF NOT EXISTS idx_runs_owner ON runs(owner_id, started_at)",
         "CREATE INDEX IF NOT EXISTS idx_req_owner ON run_requests(owner_id, id)",
+        "CREATE INDEX IF NOT EXISTS idx_req_client ON run_requests(client_id, status)",
         "CREATE INDEX IF NOT EXISTS idx_accounts_owner ON game_accounts(owner_id)",
     ):
         try:

@@ -95,10 +95,14 @@ docker compose logs app | head -40
 ### 5. 验证
 
 ```bash
-curl -s https://你的域名/healthz          # {"ok":true,...}
+curl -s http://127.0.0.1:8000/api/agent/ping -H "X-Agent-Token: <你的令牌>"   # {"ok":true,...}
 ```
 
-浏览器打开 `https://你的域名`，用上面的账号登录。
+浏览器打开 `http://127.0.0.1:8000`（同局域网的其他设备用 `http://<本机内网IP>:8000`），
+用上面的账号登录。
+
+> 内网部署**不需要**域名和 HTTPS。文档里凡出现 `https://你的域名` 的地方，
+> 内网场景一律替换成 `http://<内网IP>:8000`。
 
 ### 6. 把令牌填到采集脚本
 
@@ -107,19 +111,22 @@ curl -s https://你的域名/healthz          # {"ok":true,...}
 ```json
 "cloud": {
   "enabled": true,
-  "base_url": "https://你的域名",
+  "base_url": "http://127.0.0.1:8000",
   "token": "stzb_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 }
 ```
+
+> 后端和采集端跑在**同一台机器**上时用 `127.0.0.1`；
+> 分处两台机器时改成后端那台的 `http://<内网IP>:8000`。
 
 然后本机执行一次补传，把历史报告推上去，顺便验证链路：
 
 ```bat
 cd /d E:\Project\率土自动化
-"C:\Users\tangl\.workbuddy\binaries\python\envs\default\Scripts\python.exe" run_daily.py --upload-last
+"venv\Scripts\python.exe" run_daily.py --upload-last
 ```
 
-看到 `✓ 后台控制台：https://你的域名/runs/1` 就成了。
+看到 `✓ 后台控制台：http://127.0.0.1:8000/runs/1` 就成了。
 
 ---
 
