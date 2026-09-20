@@ -1212,10 +1212,15 @@ def test_cloud_upload():
 
 
 def test_run_mode():
-    """独立运行 / 后端托管 的判定。用户明确要求「不绑后端也能直接跑」，这条必须守住。"""
+    """后端绑定判定。2026-09-20 起独立模式已按用户要求移除，只剩「绑上了 / 还没绑」。
+
+    要守住的两条：
+      1. **没绑后端也必须能照常跑完任务**，本机报告完整，不许卡住、不许报错退出；
+      2. 只要 base_url + token 齐了就是托管，**不再看 cloud.enabled**（该字段已废弃）。
+    """
     import run_daily as rd
 
-    print("\n[25] 运行模式（独立运行 vs 后端托管）")
+    print("\n[25] 后端绑定（托管 vs 未绑定）")
 
     logs = []
     lg = logs.append
@@ -1223,109 +1228,114 @@ def test_run_mode():
     def cfg_of(cloud):
         return {"cloud": cloud}
 
-    # 1) 默认（enabled 缺失）就是独立运行 —— 这是最关键的一条
-    m = rd.resolve_mode(cfg_of({}), offline=False, log=lg)
-    check("cloud 段为空时是独立运行", m == rd.MODE_STANDALONE, m)
+    ok_pair = {"base_url": "https://x", "token": "t"}
 
-    m = rd.resolve_mode(cfg_of({"enabled": False, "base_url": "https://x", "token": "t"}),
-                        offline=False, log=lg)
-    check("cloud.enabled=false 时是独立运行（哪怕地址令牌都填了）", m == rd.MODE_STANDALONE, m)
+    # 1) 配全了就是托管 —— 这是唯一一种「绑上了」的情形
+    m = rd.resolve_mode(cfg_of(dict(ok_pair)), offline=False, log=lg)
+    check("base_url + token 齐全 → 后端托管", m == rd.MODE_MANAGED, m)
 
-    # 2) --offline 优先级最高：即使后端配好了也不连
-    m = rd.resolve_mode(cfg_of({"enabled": True, "base_url": "https://x", "token": "t"}),
-                        offline=True, log=lg)
-    check("--offline 能压住已启用的后端", m == rd.MODE_STANDALONE, m)
+    # 2) enabled=false 但地址令牌齐全 → 依然是托管（该字段已废弃，不再参与判定）
+    m = rd.resolve_mode(cfg_of(dict(ok_pair, enabled=False)), offline=False, log=lg)
+    check("enabled=false 不再影响判定（废弃字段）", m == rd.MODE_MANAGED, m)
 
-    # 3) 配全了才是托管
-    m = rd.resolve_mode(cfg_of({"enabled": True, "base_url": "https://x", "token": "t"}),
-                        offline=False, log=lg)
-    check("enabled=true 且地址令牌齐全 → 后端托管", m == rd.MODE_MANAGED, m)
+    # 3) offline 参数已废弃：传 True 也不再能把托管压成未绑定
+    m = rd.resolve_mode(cfg_of(dict(ok_pair)), offline=True, log=lg)
+    check("offline 参数已废弃，传 True 仍判定为托管", m == rd.MODE_MANAGED, m)
 
-    # 4) 开了但没填全 → 降级为独立运行，且要告警
-    for bad, why in (({"enabled": True, "token": "t"}, "缺 base_url"),
-                     ({"enabled": True, "base_url": "https://x"}, "缺 token"),
-                     ({"enabled": True, "base_url": "   ", "token": "t"}, "base_url 只有空白"),
-                     ({"enabled": True, "base_url": "https://x", "token": ""}, "token 是空串")):
+    # 4) 缺任意一半 → 未绑定，且日志要**明确告警**
+    for bad, why in (({}, "cloud 段为空"),
+                     ({"token": "t"}, "缺 base_url"),
+                     ({"base_url": "https://x"}, "缺 token"),
+                     ({"base_url": "   ", "token": "t"}, "base_url 只有空白"),
+                     ({"base_url": "https://x", "token": ""}, "token 是空串")):
         logs.clear()
         m = rd.resolve_mode(cfg_of(dict(bad)), offline=False, log=lg)
-        check("配不全（%s）→ 降级为独立运行并告警" % why,
-              m == rd.MODE_STANDALONE and any("不完整" in x for x in logs), m)
+        check("未绑定（%s）→ MODE_UNBOUND 并告警" % why,
+              m == rd.MODE_UNBOUND and any("还没绑定后端" in x for x in logs), m)
 
-    # 5) 说明文字里要写清会不会连后端（用户看日志就能分辨）
-    s = rd.describe_mode(cfg_of({}), rd.MODE_STANDALONE)
-    check("独立运行的说明写明「不连后端」", "不连后端" in s, s)
+    # 5) 说明文字要能一眼分辨绑没绑（用户看日志/控制台就能判断）
+    s = rd.describe_mode(cfg_of({}), rd.MODE_UNBOUND)
+    check("未绑定的说明写明「只留在本机」", "只留在本机" in s, s)
     d = rd.describe_mode(cfg_of({"base_url": "https://abc.example"}), rd.MODE_MANAGED)
     check("托管模式的说明里带上了后端地址", "https://abc.example" in d, d)
 
-    # 6) 独立运行时上传必须直接返回，一个字节都不发
+    # 6) 未绑定时上传必须直接返回，一个字节都不发
     calls = []
 
     class BoomClient:
         def __getattr__(self, name):
             def _f(*a, **kw):
                 calls.append(name)
-                raise AssertionError("独立运行模式不该碰后端！调用了 %s" % name)
+                raise AssertionError("未绑定后端不该碰任何远端！调用了 %s" % name)
             return _f
 
-    rc = rd._do_upload({"cloud": {"enabled": False}}, None, {"html": "x.html"},
-                       None, None, lg, disabled=True, reason="独立运行模式（不连后端）")
-    check("独立运行时 _do_upload 返回 None 且不做任何请求", rc is None and not calls)
-    check("独立运行时会打印报告留在本机的位置",
+    rc = rd._do_upload({"cloud": {}}, None, {"html": "x.html"},
+                       None, None, lg, disabled=True, reason="未绑定后端")
+    check("未绑定时 _do_upload 返回 None 且不做任何请求", rc is None and not calls)
+    check("未绑定时会打印报告留在本机的位置",
           any("报告只留在本机" in x for x in logs), str(logs[-1:]))
 
     # client=None（托管但初始化失败）同样安全
-    rc2 = rd._do_upload({"cloud": {"enabled": True}}, None, {"html": "x.html"},
+    rc2 = rd._do_upload({"cloud": dict(ok_pair)}, None, {"html": "x.html"},
                         None, None, lg, disabled=False)
     check("client 为 None 时也不崩、不请求", rc2 is None and not calls)
 
-    # 7) --offline 下的 --upload-last 要明确拒绝，而不是偷偷去连
+    # 7) 未绑定时 --upload-last 要明确拒绝，并指引怎么绑，而不是偷偷去连
     import io as _io
     import contextlib
+    import subprocess
     buf = _io.StringIO()
     with contextlib.redirect_stdout(buf):
-        code = rd.cmd_upload_last({"cloud": {"enabled": True, "base_url": "https://x",
-                                             "token": "t"}}, offline=True)
-    check("--offline 时 --upload-last 被拒绝并给出解释",
-          code == 1 and "不会连接后端" in buf.getvalue(), buf.getvalue()[:80])
+        code = rd.cmd_upload_last({"cloud": {}})
+    check("未绑定时 --upload-last 被拒绝并给出绑定指引",
+          code == 1 and "还没绑定后端" in buf.getvalue(), buf.getvalue()[:120])
 
-    # 8) 命令行真的有这个开关
-    import subprocess
+    # 8) 命令行里 --offline/--standalone 必须**已经不存在**
     out = subprocess.run([sys.executable, os.path.join(ROOT, "run_daily.py"), "--help"],
                          capture_output=True, text=True, errors="ignore")
-    check("--help 里列出了 --offline", "--offline" in (out.stdout or ""))
+    helptxt = out.stdout or ""
+    check("--help 里已不再出现 --offline",
+          "--offline" not in helptxt and "--standalone" not in helptxt)
 
-    # 9) 默认 config.json 必须是独立运行（拷到别的机器不配任何东西也能跑）
+    # 9) 源码里不许再留 MODE_STANDALONE（防止漏改回退）
+    with open(os.path.join(ROOT, "run_daily.py"), encoding="utf-8") as f:
+        src = f.read()
+    check("run_daily.py 里已无 MODE_STANDALONE", "MODE_STANDALONE" not in src)
+
+    # 10) 出厂 config.json 是「未绑定」—— 拷到别的机器不配任何东西也能直接跑
     from stzb.config import load as _load
     cfg = _load()
-    check("出厂 config.json 的 cloud.enabled 是 False",
-          cfg.get("cloud.enabled") is False,
-          str(cfg.get("cloud.enabled")))
     m = rd.resolve_mode(cfg, offline=False, log=lg)
-    check("★ 出厂配置下判定为独立运行（开箱即可独立跑）", m == rd.MODE_STANDALONE, m)
+    check("★ 出厂配置判定为未绑定（开箱即可照常跑任务）", m == rd.MODE_UNBOUND, m)
 
-    # 10) 本机必备段在默认值里都有兜底（config.json 丢了也能跑）
+    # 11) 本机必备段在默认值里都有兜底（config.json 丢了也能跑）
     for sec in ("device", "emulator", "cloud", "logging", "safety", "tasks"):
         check("DEFAULTS 里有 %s 段兜底" % sec, sec in cfg)
 
-    # 11) --status 也必须尊重 --offline。
-    #     这个接线漏过一次：函数里写死了 offline=False，实测才发现 --status --offline
-    #     仍然报「后端托管」。所以用子进程走一遍真实命令行，而不是只测 resolve_mode。
+    # 12) ★ 真命令行走一遍：配了假后端地址，--status 也必须**快速返回**，
+    #     不许卡在连不上的后端上（这是「后端挂了不能拖垮本机任务」的底线）。
     env = dict(os.environ)
-    env.update({"STZB_CLOUD_ENABLED": "1",
-                "STZB_CLOUD_BASE_URL": "http://127.0.0.1:9",
+    env.update({"STZB_CLOUD_BASE_URL": "http://127.0.0.1:9",
                 "STZB_CLOUD_TOKEN": "t"})
     try:
-        out = subprocess.run([sys.executable, os.path.join(ROOT, "run_daily.py"),
-                              "--status", "--offline"],
+        out = subprocess.run([sys.executable, os.path.join(ROOT, "run_daily.py"), "--status"],
                              capture_output=True, text=True, errors="ignore",
                              env=env, timeout=90)
         txt = (out.stdout or "") + (out.stderr or "")
-        check("★ --status --offline 报「独立运行」而不是「后端托管」",
-              "独立运行" in txt and "后端托管" not in txt, txt[-260:])
-        check("--status --offline 会解释是命令行指定的",
-              "命令行给了 --offline" in txt, txt[-260:])
+        check("★ --status 报「后端托管」且不卡住", "后端托管" in txt, txt[-260:])
     except subprocess.TimeoutExpired:
-        check("--status --offline 应在 90 秒内返回（不该去连后端）", False, "超时")
+        check("--status 应在 90 秒内返回（不该去连后端）", False, "超时")
+
+    # 13) 环境变量注入必须是「不带 enabled 也能生效」的（enabled 已废弃）
+    env2 = dict(os.environ)
+    env2.pop("STZB_CLOUD_BASE_URL", None)
+    env2.pop("STZB_CLOUD_TOKEN", None)
+    out = subprocess.run([sys.executable, os.path.join(ROOT, "run_daily.py"), "--status"],
+                         capture_output=True, text=True, errors="ignore",
+                         env=env2, timeout=90)
+    txt = (out.stdout or "") + (out.stderr or "")
+    check("★ 没有环境变量时 --status 报「未绑定」",
+          "未绑定" in txt, txt[-260:])
 
 
 def test_screenshot_retry():
@@ -1461,10 +1471,12 @@ def test_config_tool():
     check("选项项接受 auto/always/never",
           all(tool.coerce(f_choice, c)[1] == c for c in ("auto", "always", "never")))
 
-    f_bool = tool.ALL_FIELDS["cloud.enabled"]
+    f_bool = tool.ALL_FIELDS["cloud.pull_jobs"]
     check("布尔项认 true/false/是/否/1/0",
           [tool.coerce(f_bool, s)[1] for s in ("true", "否", "1", "off")]
           == [True, False, True, False])
+    check("★ cloud.enabled 已从配置项里移除（独立模式废弃）",
+          "cloud.enabled" not in tool.ALL_FIELDS)
 
     f_url = tool.ALL_FIELDS["cloud.base_url"]
     check("URL 项拒绝没有协议的写法", tool.coerce(f_url, "stzb.example.com")[0] is False)
@@ -1596,13 +1608,13 @@ def test_config_tool():
 
         # 走一遍「后端托管」子菜单（未绑定时选解绑，应提示无需解绑，然后返回）
         out = run_menu(cfg2, "1\n3\n\n0\n0\n", os.path.join(tmp2, "bak"))
-        check("后端子菜单能进能出（选解绑时提示本来就是独立运行）",
-              "独立运行" in out and "本来就是独立运行" in out, out[-200:])
+        check("后端子菜单能进能出（选解绑时提示本来就没绑）",
+              "本来就没绑后端" in out, out[-200:])
 
         # 「查看全部配置」「磁盘占用与清理」「备份与恢复」三个菜单项都要可达。
         # 编号按「实际列出的段数」算，加菜单项时这里的数字要跟着变。
         out = run_menu(cfg2, "12\n\n13\n0\n14\n1\n\n0\n0\n", os.path.join(tmp2, "bak"))
-        check("菜单项「查看全部配置」可达", "cloud.enabled" in out)
+        check("菜单项「查看全部配置」可达", "cloud.base_url" in out)
         check("菜单项「磁盘占用与清理」可达", "磁盘占用与清理" in out and "截图" in out)
         check("菜单项「备份与恢复」可达并真的备份了",
               "已备份到" in out and len(os.listdir(os.path.join(tmp2, "bak"))) >= 1)

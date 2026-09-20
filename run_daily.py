@@ -189,7 +189,7 @@ def wait_game_ready(dev: Device, pkg: str, timeout: float = 90.0,
     return False
 
 
-def cmd_status(cfg, offline: bool = False):
+def cmd_status(cfg):
     """只看状态，不动任何东西。"""
     e = cfg.get("emulator", {}) or {}
     emu = MuMu(manager=e.get("manager"), vmindex=e.get("vmindex", 0),
@@ -212,19 +212,18 @@ def cmd_status(cfg, offline: bool = False):
     print("今天已跑档位：%s" % (", ".join(st.get("slots", []))
                             if st.get("date") == dt.date.today().isoformat() else "无"))
 
-    # ---- 运行模式：这一条最容易被搞混，必须写清楚 ----
+    # ---- 后端绑定状态：这一条最容易被搞混，必须写清楚 ----
     cloud = cfg.get("cloud") or {}
-    mode = resolve_mode(cfg, offline=offline, log=lambda m: None)
+    mode = resolve_mode(cfg, offline=False, log=lambda m: None)
     print("")
-    print("运行模式：%s" % describe_mode(cfg, mode))
-    if mode == MODE_STANDALONE:
-        if offline:
-            print("           （命令行给了 --offline；就算配了后端也不连）")
-        elif not cloud.get("enabled"):
-            print("           （config.json 里 cloud.enabled = false；要绑定后端就改成 true）")
+    print("后端模式：%s" % describe_mode(cfg, mode))
+    if mode == MODE_UNBOUND:
+        if not cloud.get("base_url"):
+            print("           （缺 base_url —— 还没在 config_tool.bat 的「后端托管」里填地址）")
         else:
-            print("           （cloud.enabled 是 true，但 base_url / token 没填全）")
+            print("           （缺 token —— 后端「设置」页可以重新生成，再填回本机）")
         print("           本轮不会连任何外部服务，报告只留在本机 logs\\reports\\")
+        print("           注意：这样后台控制台看不到这台机器，也没法远程派活。")
     else:
         token = str(cloud.get("token") or "")
         shown = ("%s…%s" % (token[:8], token[-4:])) if len(token) > 12 else "已配置"
@@ -245,58 +244,68 @@ def cmd_status(cfg, offline: bool = False):
 
 
 def _apply_cloud_env(cfg) -> None:
-    """用环境变量覆盖后端设置，方便测试、也方便把令牌放到系统里而不写进 config.json。"""
+    """用环境变量覆盖后端设置，方便测试、也方便把令牌放到系统里而不写进 config.json。
+
+    ★ `STZB_CLOUD_ENABLED` 已随「独立模式」一起废弃（2026-09-20）：
+      现在只看 base_url + token 齐不齐，`enabled` 这个开关不再参与任何判定。
+      旧环境变量留着不报错，只是被忽略 —— 免得写死的部署脚本一夜之间全挂。
+    """
     cloud = cfg.setdefault("cloud", {})
     for env, key, cast in (("STZB_CLOUD_BASE_URL", "base_url", str),
-                           ("STZB_CLOUD_TOKEN", "token", str),
-                           ("STZB_CLOUD_ENABLED", "enabled",
-                            lambda v: str(v).strip().lower() in ("1", "true", "yes", "on"))):
+                           ("STZB_CLOUD_TOKEN", "token", str)):
         v = os.environ.get(env)
         if v not in (None, ""):
             cloud[key] = cast(v)
 
 
-MODE_STANDALONE = "standalone"
 MODE_MANAGED = "managed"
+MODE_UNBOUND = "unbound"        # 没配后端地址/令牌 —— 不是「模式」，是「还没绑上」
 
 
 def resolve_mode(cfg, offline: bool, log) -> str:
-    """决定这一轮是「独立运行」还是「后端托管」。
+    """本脚本**只有一种模式：后端托管**（2026-09-20 起，独立模式已按用户要求移除）。
 
-    **独立运行是默认且安全的那一端**：不拉远端配置、不领待执行任务、不上传任何东西，
-    除了游戏和模拟器之外不碰任何外部服务。整套脚本拷到另一台机器、不配任何后端也能直接跑。
+    所以这里不再返回「独立/托管」两种模式，而是返回一个**连接状态**：
 
-    判定顺序：
-      1. 命令行给了 --offline        → 独立运行（优先级最高，用来临时脱离后端）
-      2. cloud.enabled 不是 true     → 独立运行（默认值就是 false）
-      3. 开了但 base_url/token 没填全 → 降级成独立运行，并明确告警
-      4. 其余                        → 后端托管
+      · `MODE_MANAGED` —— 后端地址与令牌都配齐了，正常托管；
+      · `MODE_UNBOUND` —— 缺 base_url 或 token（还没在配置工具里绑后端）。
+        这**不是**一种运行模式，而是「还没绑上」的中间状态：
+        脚本照常跑任务、报告照常留在本机，只是拉不到远端配置、领不到待执行任务、
+        也上传不了。日志里会明确告警，而不是像以前那样静默当成「独立模式」。
+
+    ★ 为什么要保留 `MODE_UNBOUND` 而不是直接报错退出：
+      后端临时连不上（断电、重启、网线掉了）时，**已经到点的日常任务不能白跑**。
+      本机报告始终完整，网络恢复后用 `--upload-last` 补传。这是刻意的取舍。
+
+    `offline` 参数已废弃（保留签名只为不破坏老调用），传什么都当 False。
     """
     cloud = cfg.get("cloud") or {}
-    if offline:
-        return MODE_STANDALONE
-    if not cloud.get("enabled"):
-        return MODE_STANDALONE
-    if not str(cloud.get("base_url") or "").strip() or not str(cloud.get("token") or "").strip():
-        log("  ! 后端配置不完整（缺 base_url 或 token）→ 本轮按独立运行处理")
-        return MODE_STANDALONE
+    url = str(cloud.get("base_url") or "").strip()
+    tok = str(cloud.get("token") or "").strip()
+    if not url or not tok:
+        log("  ! 还没绑定后端（缺 base_url 或 token）—— 本轮照常跑，"
+            "但拉不到配置、领不到任务、也上传不了")
+        log("    绑后端：双击 config_tool.bat → 「后端托管」；或设环境变量 "
+            "STZB_CLOUD_BASE_URL / STZB_CLOUD_TOKEN")
+        return MODE_UNBOUND
     return MODE_MANAGED
 
 
 def describe_mode(cfg, mode: str) -> str:
-    if mode == MODE_STANDALONE:
-        return "独立运行（不连后端，报告只留在本机）"
-    return "后端托管 %s（拉配置 / 领任务 / 上传结果）" % (
-        (cfg.get("cloud") or {}).get("base_url") or "")
+    url = (cfg.get("cloud") or {}).get("base_url") or ""
+    if mode == MODE_UNBOUND:
+        return "未绑定后端（照常跑任务，报告只留在本机）"
+    return "后端托管 %s（拉配置 / 领任务 / 上传结果）" % url
 
 
 def _cloud_ready(cfg, log) -> bool:
     """给 --upload-last 这类「只有连后端才有意义」的命令用。"""
     cloud = (cfg.get("cloud") or {})
-    if not cloud.get("enabled"):
+    if not str(cloud.get("base_url") or "").strip():
+        log("  ! 还没绑定后端（缺 base_url），跳过上传（本机报告不受影响）")
         return False
     if not cloud.get("token"):
-        log("  ! cloud.enabled=true 但没填 token，跳过上传（本机报告不受影响）")
+        log("  ! 还没绑定后端（缺 token），跳过上传（本机报告不受影响）")
         return False
     return True
 
@@ -467,13 +476,9 @@ def _state_reporter(client, cfg, slot: str, dry_run: bool, identity) -> Callable
     return fn
 
 
-def cmd_upload_last(cfg, offline: bool = False) -> int:
+def cmd_upload_last(cfg) -> int:
     """只补传本地最近一份报告，不跑任务。网络恢复后用它兜底。"""
     print("· 补传本地最近一份报告…")
-    if offline:
-        print("!! 指定了 --offline（独立运行模式），不会连接后端。")
-        print("   想补传就别加 --offline。")
-        return 1
     got = load_last_report(REPORT_DIR)
     if not got:
         print("!! logs/reports/latest.json 不存在，没有可补传的东西")
@@ -482,8 +487,8 @@ def cmd_upload_last(cfg, offline: bool = False) -> int:
     print("· 本地报告：%s" % (paths.get("html") or "（没有 html）"))
     print("· 轮次：%s 档位 %s" % (stub._data.get("started_at"), stub.slot))
     if not _cloud_ready(cfg, print):
-        print("!! 后端未启用。请在 config.json 的 cloud 段填好 base_url 与 token，")
-        print("   或设环境变量 STZB_CLOUD_ENABLED=1 / STZB_CLOUD_BASE_URL / STZB_CLOUD_TOKEN。")
+        print("!! 还没绑定后端。双击 config_tool.bat → 「后端托管」填地址与令牌，")
+        print("   或设环境变量 STZB_CLOUD_BASE_URL / STZB_CLOUD_TOKEN。")
         return 1
     res = upload_run(cfg, stub, paths, logger=print,
                      shots_per_task=int((cfg.get("cloud") or {}).get("upload_shots_per_task", 4)))
@@ -550,7 +555,8 @@ def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason="",
     这是刻意的：上报告是尽力而为。网络断了、服务器挂了，已经跑完的任务不能白跑 ——
     本机 logs/reports/ 里那份永远完整，网络恢复后用 --upload-last 补传即可。
 
-    独立运行模式下这里直接返回，**一个字节都不往外发**。
+    `disabled`（没绑后端 / 显式 --no-upload）或 `client is None`（托管但初始化失败）时
+    这里直接返回，**一个字节都不往外发**。
     """
     if disabled or client is None:
         if disabled:
@@ -599,9 +605,6 @@ def main():
     ap.add_argument("--no-remote-config", action="store_true", help="不从后端拉配置，只用本地")
     ap.add_argument("--no-switch", action="store_true",
                     help="不做账号/角色切换，用当前已经在线的账号直接跑")
-    ap.add_argument("--offline", "--standalone", dest="offline", action="store_true",
-                    help="独立运行：完全不连后端（不拉配置、不领任务、不上传），"
-                         "优先级高于 config.json")
     ap.add_argument("--upload-last", action="store_true",
                     help="只把本机最近一份报告补传到后端，不跑任务")
     ap.add_argument("--job-only", action="store_true",
@@ -632,7 +635,7 @@ def main():
     os.makedirs(shot_dir, exist_ok=True)
 
     if args.status:
-        return cmd_status(cfg, offline=args.offline)
+        return cmd_status(cfg)
 
     if args.cleanup_only:
         print("清理前：%s" % summary_line(ROOT))
@@ -652,7 +655,7 @@ def main():
         return 0
 
     if args.upload_last:
-        return cmd_upload_last(cfg, offline=args.offline)
+        return cmd_upload_last(cfg)
 
     log = Logger(os.path.join(LOG_DIR, "run_%s.log" % dt.date.today().isoformat()))
     today = dt.date.today().isoformat()
@@ -670,17 +673,17 @@ def main():
     dry_run = args.dry_run
     force = args.force
 
-    # ------------------------------------------------ 运行模式 + 后端：拉配置 / 领任务
+    # ------------------------------------------------ 后端绑定 + 拉配置 / 领任务
     # 必须放在「今天这一档跑过没」的判断**之前**：后端排的请求优先级最高，
     # 哪怕今天已经跑过，只要有人在控制台点了一次「执行」，就要照跑。
-    mode = resolve_mode(cfg, args.offline, log)
+    mode = resolve_mode(cfg, False, log)
     managed = (mode == MODE_MANAGED)
-    log("· 运行模式：%s" % describe_mode(cfg, mode))
-    # 跳过上传时要说清是「模式决定」还是「命令行显式要求」，否则日志里看不出区别
-    upload_skip_reason = "独立运行模式（不连后端）" if not managed else "按 --no-upload 跳过上传"
+    log("· 后端：%s" % describe_mode(cfg, mode))
+    # 跳过上传时要说清是「没绑后端」还是「命令行显式要求」，否则日志里看不出区别
+    upload_skip_reason = "未绑定后端" if not managed else "按 --no-upload 跳过上传"
 
     if args.job_only and not managed:
-        log("!! --job-only 只在「后端托管」模式下有意义，当前是独立运行 → 直接退出")
+        log("!! --job-only 需要连后端才能领到任务，当前还没绑定后端 → 直接退出")
         return 0
 
     client = None

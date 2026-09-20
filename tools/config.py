@@ -12,12 +12,12 @@
   命令行（给脚本 / 自动化用，也可用于远程指导）：
       python tools/config.py show                     看全部配置（标注来源）
       python tools/config.py show --section cloud
-      python tools/config.py get cloud.enabled
+      python tools/config.py get cloud.base_url
       python tools/config.py set recruit.half_price false
       python tools/config.py set device.adb "D:\\MuMu\\adb.exe"
       python tools/config.py reset recruit.half_price 恢复该项为出厂默认
       python tools/config.py bind --url https://xx --token stzb_xx   绑定并当场验证
-      python tools/config.py unbind                   解除绑定，回到独立运行
+      python tools/config.py unbind                   解除绑定（清掉地址与令牌）
       python tools/config.py verify                   只验证后端连通性
       python tools/config.py backup                   手动备份 config.json
       python tools/config.py restore                  从备份恢复（列出可选）
@@ -118,10 +118,9 @@ class Field:
 
 # 分组顺序 = 菜单顺序。每一组是一个菜单项。
 GROUPS: List[Tuple[str, str, List[Field]]] = [
-    ("cloud", "后端托管（是否绑定服务器）", [
-        Field("cloud.enabled", "是否托管到服务器", "bool",
-              "false = 独立运行（不连任何外部服务，报告只留本机）；true = 托管"),
+    ("cloud", "后端托管（绑定服务器）", [
         Field("cloud.base_url", "服务器地址", "url",
+              "留空 = 未绑定（不连任何外部服务，报告只留本机）；"
               "例如 https://stzb.example.com，不要带结尾斜杠"),
         Field("cloud.token", "采集端令牌", "str",
               "在服务器控制台的「设置」页可以轮换，形如 stzb_xxxx"),
@@ -293,6 +292,12 @@ def set_value(path: str, value: Any, quiet: bool = False) -> None:
         cur = nxt
     old = cur.get(parts[-1], "<未设置>")
     cur[parts[-1]] = value
+    # ★ 写 cloud.* 时顺手清掉历史遗留的 cloud.enabled。
+    #   该开关 2026-09-20 已废弃（独立模式移除，只看 base_url + token 齐不齐）；
+    #   留着只会让 config.json 出现「enabled=false 但地址令牌齐全」这种自相矛盾的状态，
+    #   排查时最容易把人带沟里。
+    if path.startswith("cloud.") and isinstance(data.get("cloud"), dict):
+        data["cloud"].pop("enabled", None)
     backup()
     save_raw(data)
     if not quiet:
@@ -525,13 +530,21 @@ def verify_backend(base_url: str, token: str, timeout: int = 15) -> Tuple[bool, 
 # --------------------------------------------------------------------------- 展示
 
 def mode_summary() -> Tuple[str, str]:
-    """返回 (模式短名, 一句话说明)。"""
+    """返回 (绑定状态短名, 一句话说明)。
+
+    ★ 没有「独立模式」这个概念了（2026-09-20）：本脚本只有一种模式 = 后端托管。
+      没绑后端只是「还没绑上」，脚本照常跑任务，报告留本机。
+    """
     cloud = effective().get("cloud") or {}
-    if not cloud.get("enabled"):
-        return "独立运行", "不连任何外部服务，报告只留在本机"
-    if not cloud.get("base_url") or not cloud.get("token"):
-        return "独立运行", "cloud.enabled 是 true，但地址或令牌没填全 → 自动按独立运行处理"
-    return "后端托管", "地址 %s" % cloud.get("base_url")
+    url = str(cloud.get("base_url") or "").strip()
+    tok = str(cloud.get("token") or "").strip()
+    if not url and not tok:
+        return "未绑定后端", "照常跑任务，报告只留在本机；绑上后端才能远程派活、在控制台看结果"
+    if not url:
+        return "未绑定后端", "缺服务器地址 → 用「后端绑定」补上（令牌已有）"
+    if not tok:
+        return "未绑定后端", "缺采集端令牌 → 用「后端绑定」补上（地址已有）"
+    return "后端托管", "地址 %s" % url
 
 
 def remote_override_note() -> str:
@@ -663,11 +676,12 @@ def cmd_set(args) -> int:
             print(note)
             print()
     set_value(f.path, value)
-    if f.path == "cloud.enabled" and value:
+    if f.path in ("cloud.base_url", "cloud.token"):
         cloud = effective().get("cloud") or {}
-        if not cloud.get("token"):
-            print("  ! 还差一步：令牌没填，用 bind 命令或菜单里的「后端绑定」补上，"
-                  "否则仍会按独立运行处理。")
+        if not str(cloud.get("base_url") or "").strip():
+            print("  ! 还差服务器地址：用「后端绑定」或 bind 命令补上，否则仍算未绑定。")
+        elif not str(cloud.get("token") or "").strip():
+            print("  ! 还差采集端令牌：用「后端绑定」或 bind 命令补上，否则仍算未绑定。")
     return 0
 
 
@@ -720,7 +734,6 @@ def cmd_bind(args) -> int:
     print()
     set_value("cloud.base_url", url, quiet=True)
     set_value("cloud.token", token, quiet=True)
-    set_value("cloud.enabled", True, quiet=True)
     print("  ✓ 已写入 config.json 并启用托管")
     print()
     print("  下次跑任务时会：拉远端配置 → 领待执行任务 → 跑完上传结果与截图。")
@@ -730,18 +743,18 @@ def cmd_bind(args) -> int:
 
 
 def cmd_unbind(args) -> int:
-    print("· 解除后端绑定，回到独立运行…")
+    print("· 解除后端绑定…")
     ok = False
-    for p in ("cloud.enabled", "cloud.base_url", "cloud.token"):
+    for p in ("cloud.base_url", "cloud.token"):
         if is_explicit(p):
             unset_value(p, quiet=True)
             ok = True
-    set_value("cloud.enabled", False, quiet=True)
-    print("  ✓ cloud.enabled = false（并清掉了地址与令牌）" if ok
-          else "  ✓ cloud.enabled = false")
+    print("  ✓ 已清掉地址与令牌（脚本不再连后端）" if ok
+          else "  ! 本来就没绑后端，无需解绑")
     print()
-    print("  从现在起脚本不连任何外部服务，报告只留在本机 logs\\reports\\。")
+    print("  脚本照常跑任务，报告只留在本机 logs\\reports\\。")
     print("  已经跑过的记录和报告不受影响。")
+    print("  想重新绑上：python tools/config.py bind --url https://你的域名 --token stzb_xxxx")
     return 0
 
 
@@ -895,13 +908,15 @@ def menu_edit_field(f: Field) -> None:
                 input("  按回车重试…")
                 continue
         set_value(f.path, value)
-        if f.path == "cloud.enabled":
+        if f.path in ("cloud.base_url", "cloud.token"):
             print()
-            if value:
-                print("  已启用托管。接下去要点「后端绑定」把地址和令牌填上并验证，")
-                print("  否则仍会按独立运行处理。")
+            cloud = effective().get("cloud") or {}
+            if str(cloud.get("base_url") or "").strip() and str(cloud.get("token") or "").strip():
+                print("  地址与令牌都齐了 → 现在是「后端托管」。")
+                print("  建议回上一级点「验证当前绑定」测一下连通性。")
             else:
-                print("  已切回独立运行：不连任何外部服务，报告只留在本机。")
+                print("  还差半步：地址与令牌要**同时**有值才算绑上。")
+                print("  没齐之前脚本照常跑任务，只是报告只留在本机、控制台看不到这台机器。")
         input("  按回车继续…")
         return
 
@@ -914,13 +929,13 @@ def menu_backend() -> None:
         print(LINE)
         print("  后端绑定")
         print(LINE)
-        print("  当前模式：%s  —— %s" % (mode, why))
+        print("  当前状态：%s  —— %s" % (mode, why))
         print("  服务器  ：%s" % (eff.get("base_url") or "（未设置）"))
         print("  令牌    ：%s" % (fmt(eff.get("token")) if eff.get("token") else "（未设置）"))
         print()
         print("  1) 绑定 / 更换服务器（填地址与令牌，当场验证，通过才写入）")
         print("  2) 验证当前绑定（只测试连通，不改配置）")
-        print("  3) 解除绑定，回到独立运行")
+        print("  3) 解除绑定（清掉地址与令牌；任务照常跑，报告留本机）")
         print("  0) 返回")
         c = ask("选择")
         if c is None or c == "0":
@@ -947,8 +962,7 @@ def menu_backend() -> None:
                   % (detail.get("app"), detail.get("version"), detail.get("config_version")))
             set_value("cloud.base_url", url, quiet=True)
             set_value("cloud.token", token, quiet=True)
-            set_value("cloud.enabled", True, quiet=True)
-            print("  ✓ 已绑定并启用托管")
+            print("  ✓ 已绑定（地址与令牌都齐了，脚本进入后端托管）")
             input("  按回车继续…")
         elif c == "2":
             if not eff.get("base_url") or not eff.get("token"):
@@ -963,17 +977,16 @@ def menu_backend() -> None:
                          "、".join(detail.get("payload_sections") or []) or "还没配过"))
             input("  按回车继续…")
         elif c == "3":
-            if not eff.get("enabled"):
-                print("  ! 本来就是独立运行，无需解绑")
+            if not eff.get("base_url") and not eff.get("token"):
+                print("  ! 本来就没绑后端，无需解绑")
                 input("  按回车继续…")
                 continue
-            c2 = ask("确认解除绑定并回到独立运行？(y/n)", "n")
+            c2 = ask("确认解除绑定（清掉地址与令牌）？(y/n)", "n")
             if c2 and parse_bool(c2):
                 for p in ("cloud.base_url", "cloud.token"):
                     if is_explicit(p):
                         unset_value(p, quiet=True)
-                set_value("cloud.enabled", False, quiet=True)
-                print("  ✓ 已解除绑定。从现在起不连任何外部服务。")
+                print("  ✓ 已解除绑定。脚本不再连后端，任务照跑、报告留本机。")
             input("  按回车继续…")
 
 
@@ -1007,14 +1020,14 @@ def menu_main() -> int:
         print(LINE)
         print("  率土之滨自动化 · 本机配置工具")
         print(LINE)
-        print("  运行模式：%s  —— %s" % (mode, why))
+        print("  后端绑定状态：%s  —— %s" % (mode, why))
         print("  配置文件：%s" % CONFIG_PATH)
         note = remote_override_note()
         if note:
             print()
             print("  " + note.replace("\n", "\n  "))
         print()
-        print("  1) 后端托管        绑定 / 验证 / 解绑（不做就默认独立运行）")
+        print("  1) 后端托管        绑定 / 验证 / 解绑（不绑也能跑，只是控制台看不到这台机器）")
         # 编号必须连续：cloud 段不单独列菜单，所以「段菜单」的编号要按
         # **实际列出的段数**排，不能按 GROUPS 总长算 —— 否则段菜单和后面的
         # 「查看全部配置」会撞号（实测撞过：两者都是 12）。
@@ -1231,7 +1244,7 @@ def main() -> int:
   python tools/config.py show --section cloud   只看后端那一段
   python tools/config.py set recruit.half_price false
   python tools/config.py bind --url https://stzb.example.com --token stzb_xxx
-  python tools/config.py unbind                 回到独立运行
+  python tools/config.py unbind                 解除绑定（清掉地址与令牌）
   python tools/config.py verify                 只验证连通
   python tools/config.py backup / restore        备份与恢复
 """)
@@ -1266,7 +1279,7 @@ def main() -> int:
     p.add_argument("--timeout", type=int, default=20)
     p.set_defaults(fn=cmd_bind)
 
-    p = sub.add_parser("unbind", help="解除绑定，回到独立运行")
+    p = sub.add_parser("unbind", help="解除后端绑定（清掉地址与令牌）")
     p.set_defaults(fn=cmd_unbind)
 
     p = sub.add_parser("verify", help="只验证后端连通性")

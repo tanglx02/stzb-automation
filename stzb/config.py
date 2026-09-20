@@ -27,7 +27,9 @@ DEFAULTS: Dict[str, Any] = {
         "cold_restart": False,
     },
     "cloud": {
-        "enabled": False,
+        # ★ 没有 enabled 开关了（2026-09-20）：独立模式已移除，只剩「后端托管」一种模式。
+        #   「绑没绑上」纯看 base_url + token 填齐没有 —— 填齐即托管，缺任意一个即未绑定。
+        #   老 config.json 里残留的 cloud.enabled 会被忽略（tools/config.py 写入时顺手清掉）。
         "base_url": "",
         "token": "",
         "timeout": 90,

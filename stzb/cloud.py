@@ -359,10 +359,15 @@ def upload_run(cfg: Dict[str, Any], report, paths: Dict[str, str],
     任务白跑 —— 本机 logs/reports/ 里那份报告始终是完整的。
     """
     cloud = (cfg.get("cloud") or {})
-    result: Dict[str, Any] = {"enabled": bool(cloud.get("enabled")),
+    # ★ 2026-09-20：cloud.enabled 已废弃（独立模式移除）。判定统一为「地址 + 令牌齐不齐」，
+    #   与 run_daily.resolve_mode 保持同一口径 —— 否则会出现「脚本认为托管、上传认为没启用」
+    #   这种两边打架的情况。
+    bound = bool(str(cloud.get("base_url") or "").strip()
+                 and str(cloud.get("token") or "").strip())
+    result: Dict[str, Any] = {"enabled": bound,
                               "ok": False, "run_id": None, "error": "",
                               "shots_ok": 0, "shots_fail": 0, "report_ok": False}
-    if not result["enabled"]:
+    if not bound:
         return result
     if not report:
         result["error"] = "没有可上传的报告对象"

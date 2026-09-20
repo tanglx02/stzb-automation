@@ -21,10 +21,10 @@
     "cold_restart": false
   },
   "cloud": {
-    "_说明": "后端控制台（可选）。★ 不填就是「独立运行」：脚本不连任何外部服务，报告只留在本机 logs\\reports\\，拷到别的机器也能直接跑。填了并置 enabled=true 才是「后端托管」：启动时拉配置、领待执行任务，跑完上传结果与截图。",
-    "_模式": "想临时脱离后端跑一次，不用改这里，命令行加 --offline 就行（优先级最高）。反过来，临时连后端也可以用环境变量：STZB_CLOUD_ENABLED=1 / STZB_CLOUD_BASE_URL / STZB_CLOUD_TOKEN。",
-    "_安全": "enabled/base_url/token 属于本机凭据，永远不会被服务端下发覆盖；填错也只是上不了报，不影响本机跑任务。想看当前是什么模式：run_daily.py --status",
-    "enabled": false,
+    "_说明": "后端控制台（★ 本脚本只有一种模式：后端托管）。base_url 与 token **同时**填齐 = 已绑定：启动时拉配置、领待执行任务，跑完上传结果与截图、控制台能看到这台机器。两者缺任意一个 = 未绑定：脚本照常跑任务，报告只留在本机 logs\\reports\\，控制台看不到这台机器、也没法远程派活。",
+    "_绑定": "推荐双击 config_tool.bat →「后端托管」→「绑定 / 更换服务器」，会先验证连通再写入。命令行等价写法：python tools/config.py bind --url https://你的域名 --token stzb_xxxx。也可用环境变量临时覆盖：STZB_CLOUD_BASE_URL / STZB_CLOUD_TOKEN。",
+    "_历史": "早期版本有 cloud.enabled 开关与 --offline 命令行选项，2026-09-20 随「独立模式」一起移除；老配置里残留的 enabled 会被忽略（写入时顺手清掉）。",
+    "_安全": "base_url/token 属于本机凭据，永远不会被服务端下发覆盖；填错也只是上不了报，不影响本机跑任务。想看当前绑定状态：run_daily.py --status",
     "base_url": "",
     "token": "",
     "timeout": 90,
