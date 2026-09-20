@@ -2377,6 +2377,81 @@ def test_current_role():
           _A.ROLE_NAME_ANCHOR == "势力值")
 
 
+def test_role_dialog():
+    print("\n[33] 「选择角色」对话框：按角色名识别 / 点选")
+    # ★★★ 2026-09-20 实机发现：这才是「按角色名识别」唯一可靠的地方。
+    # 「选择服务器」面板里全是区服名（X6014龙兴之/备战区/S21815…），
+    # 真正的角色列表在**点开始游戏之后**弹的这个对话框里。
+    # 下面四条文本/坐标抄自真实帧 bz_go_19_020.png。
+    import stzb.account as _A
+
+    dlg = [
+        itc("选择角色", 961, 231),      # 标题
+        itc("执剑丨青山", 960, 362),     # 条目 1
+        itc("鸡波长", 959, 462),        # 条目 2
+        itc("确定", 960, 818),          # 按钮
+    ]
+
+    class _U:
+        def __init__(self, items):
+            self._items = items
+            self.tapped = []
+
+        def ocr(self, tag="x"):
+            return self._items, ""
+
+        def tap(self, x, y, delay=0.7):
+            self.tapped.append((x, y))
+
+        def log(self, msg):
+            pass
+
+    u = _U(dlg)
+    check("认出这是「选择角色」对话框", _A.is_role_dialog(u, dlg) is True)
+    check("列出角色名（标题和「确定」不算条目）",
+          _A.list_role_dialog(u, dlg) == ["执剑丨青山", "鸡波长"],
+          repr(_A.list_role_dialog(u, dlg)))
+    check("条目按屏幕从上到下排序",
+          [e.center[1] for e in _A._role_dialog_entries(dlg)] == [362, 462],
+          repr([e.center[1] for e in _A._role_dialog_entries(dlg)]))
+
+    # 不在这一屏时必须如实说「不在」，不能拿别处的文字硬凑
+    home = [itc("云魇丨奈子", 376, 19), itc("势力值154", 297, 51)]
+    check("主城帧不算「选择角色」对话框", _A.is_role_dialog(_U(home), home) is False)
+    check("不在对话框上时列出空列表", _A.list_role_dialog(_U(home), home) == [])
+
+    ok, why = _A.pick_role_dialog(_U(home), "执剑丨青山", home)
+    check("不在对话框上时点选必须失败并说明原因", ok is False and "不在" in why,
+          "%r %r" % (ok, why))
+
+    # 目标角色不在列表里 → 如实报错，并把现有角色列出来（绝不瞎点一个）
+    u2 = _U(dlg)
+    ok2, why2 = _A.pick_role_dialog(u2, "张三", dlg)
+    check("找不到目标角色时不点任何东西",
+          ok2 is False and u2.tapped == [], "%r %r" % (ok2, u2.tapped))
+    check("报错里带上现有角色名，便于用户核对",
+          "执剑丨青山" in why2 and "鸡波长" in why2, repr(why2))
+
+    # 同名歧义 → 不猜（用两条同名的条目，这是最容易翻车的场景）
+    amb = [itc("选择角色", 961, 231),
+           itc("执剑丨青山", 960, 362), itc("执剑丨青山", 960, 462),
+           itc("确定", 960, 818)]
+    u3 = _U(amb)
+    ok3, why3 = _A.pick_role_dialog(u3, "执剑丨青山", amb)
+    check("两条同名时不猜（点错=在别人号上跑任务）",
+          ok3 is False and u3.tapped == [], "%r %r" % (ok3, u3.tapped))
+
+    # 正向：唯一命中时才会真的去点，并点条目 + 确定两下
+    uni = [itc("选择角色", 961, 231),
+           itc("执剑丨青山", 960, 362), itc("鸡波长", 959, 462),
+           itc("确定", 960, 818)]
+    u4 = _U(uni)
+    ok4, why4 = _A.pick_role_dialog(u4, "鸡波长", uni)
+    check("唯一命中时点中该条目并点确定",
+          ok4 is True and u4.tapped == [(959, 462), (960, 818)],
+          "%r %r" % (ok4, u4.tapped))
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -2417,6 +2492,7 @@ if __name__ == "__main__":
     test_panel_ocr_fallback()
     test_junqing_and_recruit()
     test_current_role()
+    test_role_dialog()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)

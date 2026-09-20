@@ -840,6 +840,133 @@ def _press_confirm(ui) -> None:
     _safe_tap(ui, SRV_CONFIRM, "确定（固定坐标）", delay=2.5)
 
 
+# ================================================================== 「选择角色」对话框
+#
+# ★★★ 2026-09-20 实机发现：**这一屏才是「按角色名识别」唯一可靠的地方。**
+#
+# 之前一直以为「选择服务器」面板里能按角色名找（`_find_role` 就是这么写的），
+# 但实测扫遍那个面板的 6 个页签组合，**列表里全是区服/区域名**（X6014龙兴之 /
+# 备战区 / S21815 / 509区攻无坚陈 …），一个角色名都没有。
+#
+# 真正的角色列表在**点「开始游戏」之后**弹的这个「选择角色」对话框里 ——
+# 前提是那个区服/区域下有**多个**角色（比如备战区）。实测该账号进备战区后弹出：
+#
+#     选择角色
+#     ┌──────────────┐
+#     │  执剑丨青山    │   ← 条目 1
+#     ├──────────────┤
+#     │  鸡波长        │   ← 条目 2
+#     └──────────────┘
+#            [确定]
+#
+# 所以「切角色」的正路是：
+#     选好区服（或备战区）→ 点开始游戏 → **在「选择角色」里按名字点** → 确定
+#     → 进游戏后用 current_role() 回读角色名做最终校验。
+ROLE_DLG_KW = ("选择角色", "逃择角色", "选择角", "选角色")
+ROLE_DLG_LIST_X = (700, 1250)      # 条目横向区间（面板居中）
+ROLE_DLG_LIST_Y = (300, 700)       # 条目纵向区间
+ROLE_DLG_CONFIRM = (960, 818)      # 「确定」按钮（实测）
+ROLE_DLG_TITLE_Y = 280             # 标题在这条线以上，不算条目
+
+
+def is_role_dialog(ui, items: Optional[Sequence[TextItem]] = None) -> bool:
+    """当前是不是「选择角色」对话框。"""
+    if items is None:
+        items, _ = ui.ocr("rd_chk")
+    for it in items:
+        if it.center[1] < ROLE_DLG_TITLE_Y + 60 and _has([it], *ROLE_DLG_KW):
+            return True
+    return False
+
+
+def _role_dialog_entries(items: Sequence[TextItem]) -> List[TextItem]:
+    """挑出对话框里像「角色条目」的那些文字（按屏幕从上到下）。"""
+    out = []
+    for it in items:
+        if not (ROLE_DLG_LIST_X[0] <= it.center[0] <= ROLE_DLG_LIST_X[1]):
+            continue
+        if not (ROLE_DLG_LIST_Y[0] <= it.center[1] <= ROLE_DLG_LIST_Y[1]):
+            continue
+        t = _clean_role_name(it.text)
+        if len(t) < 2 or t.isdigit():
+            continue
+        # 标题/按钮一类的固定词不算条目
+        if _has([it], *ROLE_DLG_KW) or _has([it], *KW_CONFIRM):
+            continue
+        out.append(it)
+    out.sort(key=lambda x: x.center[1])
+    return out
+
+
+def list_role_dialog(ui, items: Optional[Sequence[TextItem]] = None) -> List[str]:
+    """把「选择角色」对话框里的角色名全列出来（按屏幕顺序）。
+
+    这是「识别这个账号下有哪些角色」的正解 —— 名字直接来自游戏，不靠猜。
+    返回空列表表示「当前不在这一屏，或者这一屏没有条目」。
+    """
+    if items is None:
+        items, _ = ui.ocr("rd_list")
+    if not is_role_dialog(ui, items):
+        return []
+    return [_clean_role_name(it.text) for it in _role_dialog_entries(items)]
+
+
+def pick_role_dialog(ui, role: str,
+                     items: Optional[Sequence[TextItem]] = None
+                     ) -> Tuple[bool, str]:
+    """在「选择角色」对话框里按**名字**点中目标角色，并点确定。
+
+    只认名字，绝不按位置猜（点错角色 = 在别人的号上跑任务）。
+    同名歧义（两个分数接近）时不猜，如实报错。
+
+    返回 (是否成功, 说明)。
+    """
+    want = (role or "").strip()
+    if not want:
+        return False, "没给目标角色名"
+    variants = _name_variants(want)
+    if not variants:
+        return False, "角色名太短，无法唯一定位"
+
+    if items is None:
+        items, _ = ui.ocr("rd_pick")
+    if not is_role_dialog(ui, items):
+        return False, "当前不在「选择角色」对话框上"
+
+    entries = _role_dialog_entries(items)
+    if not entries:
+        return False, "「选择角色」里没读到任何条目"
+
+    scored: List[Tuple[float, TextItem]] = []
+    for it in entries:
+        sc = max((_one_score(it.text, k) for k in variants), default=0.0)
+        if sc > 0:
+            scored.append((sc, it))
+    scored.sort(key=lambda x: -x[0])
+
+    names = [_clean_role_name(e.text) for e in entries]
+    if not scored or scored[0][0] < 0.62:
+        return False, ("「选择角色」里没有像「%s」的角色（现有：%s）"
+                       % (want, "、".join(names)))
+    best_sc, best = scored[0]
+    if len(scored) > 1 and scored[1][0] >= 0.62 and (best_sc - scored[1][0]) < 0.15:
+        return False, ("「%s」和「%s」都像目标角色，不敢替你猜是哪一个"
+                       % (_clean_role_name(best.text),
+                          _clean_role_name(scored[1][1].text)))
+
+    _safe_tap(ui, best.center, "角色 %s" % _clean_role_name(best.text), delay=1.2)
+    # 点条目之后再点「确定」提交选择
+    items2, _ = ui.ocr("rd_confirm")
+    hit = None
+    for it in items2:
+        if it.center[1] > 700 and _has([it], *KW_CONFIRM):
+            hit = it
+            break
+    _safe_tap(ui, hit.center if hit is not None else ROLE_DLG_CONFIRM,
+              "确定", delay=3.0)
+    return True, "已在「选择角色」里选中「%s」" % _clean_role_name(best.text)
+
+
 # ================================================================== 统一入口
 
 def ensure_target(ui, assignment: Dict[str, Any], *,
