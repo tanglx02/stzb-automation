@@ -4,9 +4,10 @@
 
 <h1>客户端</h1>
 <div class="sub">
-  服务端在公网、客户端在内网，服务端<b>连不上</b>客户端。
-  所以这里的「在线」是客户端每 {{ heartbeat_interval }} 秒主动上报一次心跳算出来的；
+  采集脚本跑在哪台机器上，这里就会自动登记哪台。后端<b>不会</b>主动去连采集端
+  —— 所以这里的「在线」是客户端每 {{ heartbeat_interval }} 秒主动上报一次心跳算出来的；
   「探测」是把指令挂到那台客户端上，等它下次心跳（最多 {{ heartbeat_interval }} 秒）自己执行再回报。
+  就算后端和采集端就在同一台机器上，也是这套机制，行为一致。
 </div>
 
 {% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
@@ -124,7 +125,7 @@
     <div class="actions">
       <button class="primary" type="submit">保存指派</button>
       {% if c.account_id %}
-      <span class="hint">当前：<b>{{ c.status.current.masked or '未上报' }}</b>
+      <span class="hint">当前：<b>{{ c.status.get('current', {}).get('masked') or '未上报' }}</b>
         —— 保存后客户端下次心跳会自动切过去</span>
       {% endif %}
     </div>

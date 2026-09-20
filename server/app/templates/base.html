@@ -5,30 +5,80 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{% block title %}{{ app_name }}{% endblock %}</title>
 <link rel="stylesheet" href="/static/style.css">
+{% block head %}{% endblock %}
 </head>
 <body>
-<header class="top">
-  <span class="brand">{{ app_name }}</span>
-  <nav>
-    <a href="/" class="{% if nav=='dash' %}on{% endif %}">总览</a>
-    <a href="/clients" class="{% if nav=='clients' %}on{% endif %}">客户端{% if nav_badge.online %}
-      <span class="badge on">{{ nav_badge.online }}</span>{% endif %}</a>
-    <a href="/accounts" class="{% if nav=='accounts' %}on{% endif %}">账号角色</a>
-    <a href="/runs" class="{% if nav=='runs' %}on{% endif %}">运行记录</a>
-    <a href="/config" class="{% if nav=='config' %}on{% endif %}">任务配置</a>
-    <a href="/jobs" class="{% if nav=='jobs' %}on{% endif %}">待执行</a>
-    <a href="/events" class="{% if nav=='events' %}on{% endif %}">事件</a>
-    <a href="/settings" class="{% if nav=='settings' %}on{% endif %}">设置</a>
-  </nav>
-  <span class="who">
-    {{ user }}
-    <form method="post" action="/logout"><button class="lnk" type="submit">退出</button></form>
-  </span>
-</header>
-<div class="wrap">
-{% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
-{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
-{% block body %}{% endblock %}
+<div class="shell">
+
+  <aside class="side">
+    <div class="side-brand">
+      <span class="mark">率</span>
+      <span class="txt"><b>率土自动化</b><i>控制台</i></span>
+    </div>
+
+    <nav class="side-nav">
+      <div class="nav-group">概览</div>
+      <a href="/" class="{% if nav=='dash' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg>
+        总览</a>
+      <a href="/roles" class="{% if nav=='roles' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M12 3 4 6.5v5c0 4.4 3.2 8.4 8 9.5 4.8-1.1 8-5.1 8-9.5v-5L12 3Z"/><path d="M9.5 12.2l1.9 1.9 3.6-3.7"/></svg>
+        角色执行{% if nav_badge.roles_attention %}
+          <span class="badge nav-badge">{{ nav_badge.roles_attention }}</span>{% endif %}</a>
+
+      <div class="nav-group">设备</div>
+      <a href="/clients" class="{% if nav=='clients' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/></svg>
+        客户端{% if nav_badge.online %}
+          <span class="badge nav-badge on">{{ nav_badge.online }}</span>{% endif %}</a>
+
+      <div class="nav-group">数据</div>
+      <a href="/accounts" class="{% if nav=='accounts' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="3.2"/><path d="M3 19.5c0-3.1 2.7-5 6-5s6 1.9 6 5"/><path d="M17 4.5v6M14.5 7h5"/></svg>
+        账号角色</a>
+      <a href="/runs" class="{% if nav=='runs' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M4 5.5h16M4 12h16M4 18.5h10"/></svg>
+        运行记录</a>
+
+      <div class="nav-group">控制</div>
+      <a href="/config" class="{% if nav=='config' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M5 6h14M5 12h14M5 18h14"/><circle cx="9.5" cy="6" r="2"/><circle cx="15" cy="12" r="2"/><circle cx="8" cy="18" r="2"/></svg>
+        任务配置</a>
+      <a href="/jobs" class="{% if nav=='jobs' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>
+        待执行</a>
+
+      <div class="nav-group">系统</div>
+      <a href="/events" class="{% if nav=='events' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><path d="M12 3.5a5.5 5.5 0 0 0-5.5 5.5c0 4-1.5 5.5-1.5 5.5h14s-1.5-1.5-1.5-5.5A5.5 5.5 0 0 0 12 3.5Z"/><path d="M10.2 18a2 2 0 0 0 3.6 0"/></svg>
+        事件</a>
+      <a href="/settings" class="{% if nav=='settings' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.6 1.6 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.6 1.6 0 0 0-2.7 1.1v.2a2 2 0 1 1-4 0v-.1a1.6 1.6 0 0 0-2.8-1.1l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1A1.6 1.6 0 0 0 4.6 15H4.4a2 2 0 1 1 0-4h.2a1.6 1.6 0 0 0 1.1-2.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1A1.6 1.6 0 0 0 11 4.6V4.4a2 2 0 1 1 4 0v.2a1.6 1.6 0 0 0 2.8 1.1l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.6 1.6 0 0 0 1.1 2.8h.2a2 2 0 1 1 0 4h-.2a1.6 1.6 0 0 0-1.5 1Z"/></svg>
+        设置</a>
+    </nav>
+
+    <div class="side-foot">
+      <span class="who">{{ user or '未登录' }}</span>
+      <form method="post" action="/logout"><button class="lnk" type="submit">退出</button></form>
+    </div>
+  </aside>
+
+  <main class="main">
+    {% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
+    {% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+    {% if warn %}<div class="banner warn">{{ warn }}</div>{% endif %}
+    {% block body %}{% endblock %}
+  </main>
+
 </div>
 </body>
 </html>

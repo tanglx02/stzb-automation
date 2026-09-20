@@ -1,9 +1,10 @@
 @echo off
-rem Start the console on Windows (bare metal). ASCII-only.
+rem Start the console on Windows (bare metal, intranet). ASCII-only.
 rem
 rem Reads config from server\.env (copy .env.example to .env and edit it first).
-rem Listens on 127.0.0.1:8000 by default - put a reverse proxy (Caddy / Nginx /
-rem IIS) in front of it if you need HTTPS on a public domain.
+rem Binds 0.0.0.0:8000 so any device on the same LAN can open it, e.g.
+rem     http://192.168.1.23:8000
+rem No domain / HTTPS / reverse proxy needed for intranet use.
 setlocal
 cd /d "%~dp0"
 
@@ -24,8 +25,19 @@ if not exist ".env" (
   echo.
 )
 
-echo Starting STZB console on http://127.0.0.1:8000 ...
-echo Press Ctrl+C to stop.
+rem --- figure out this machine's LAN address (no packet is actually sent) ---
+set LANIP=
+for /f "usebackq delims=" %%i in (`"%PY%" -c "import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(('8.8.8.8',80));print(s.getsockname()[0]);s.close()" 2^>nul`) do set LANIP=%%i
+
+echo ============================================================
+echo   STZB console - starting (intranet mode)
+echo ============================================================
 echo.
-"%PY%" -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+echo   This machine : http://127.0.0.1:8000
+if defined LANIP echo   Same LAN     : http://%LANIP%:8000
+echo.
+echo   Open the "Same LAN" address on your phone / other PC.
+echo   Press Ctrl+C to stop.
+echo.
+"%PY%" -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 pause

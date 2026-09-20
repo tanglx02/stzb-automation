@@ -106,6 +106,34 @@ SURVEY = [
     T("继续游戏", 427, 837, 200),
 ]
 
+# 「选择服务器」面板 —— 合服后区服编号变了，但角色名没变
+PANEL_RENAMED = [
+    T("选择服务器", 960, 150, 220),
+    T("已有角色", 235, 249, 160), T("经典服", 503, 248, 130), T("青春服", 783, 249, 130),
+    T("最近登录", 246, 325, 160),
+    T("X6021龙兴之", 651, 416, 300),      # ← X6014 → X6021（合服换了编号）
+    T("确定", 960, 895, 140),
+]
+
+# 面板上有两个都像目标的条目 → 绝不能猜
+PANEL_AMBIGUOUS = [
+    T("选择服务器", 960, 150, 220),
+    T("已有角色", 235, 249, 160),
+    T("最近登录", 246, 325, 160),
+    T("X6014龙兴之", 651, 416, 300),
+    T("X6035龙兴之", 651, 539, 300),
+    T("确定", 960, 895, 140),
+]
+
+# 面板上只有区服编号，没有目标角色名 → 区服对上了也不能算命中
+PANEL_SERVER_ONLY = [
+    T("选择服务器", 960, 150, 220),
+    T("已有角色", 235, 249, 160),
+    T("最近登录", 246, 325, 160),
+    T("X6014", 651, 416, 300),
+    T("确定", 960, 895, 140),
+]
+
 
 # ------------------------------------------------------------------ 假 Ui（状态机）
 
@@ -347,7 +375,7 @@ def test_role_found_and_confirmed():
     """角色存在 → 点角色 + 点确定 + 回到登录页。"""
     print("\n== 找到角色 → 点角色 + 确定 ==")
     ui = FakeUi({"login": LOGIN, "srv": PANEL_OK}, start="login")
-    r = A.switch_role(ui, "X6014龙兴之", server="X6014", max_rounds=2)
+    r = A.switch_role(ui, "X6014龙兴之", max_rounds=2)
     print("   ok=%s reason=%s" % (r.ok, r.reason))
     for s in r.steps:
         print("     步骤: %s" % s)
@@ -357,6 +385,79 @@ def test_role_found_and_confirmed():
     tapped_ok = any(ui._near(p, A.SRV_CONFIRM) for p in ui.taps)
     print("   点了角色: %s  点了确定: %s" % (tapped_role, tapped_ok))
     good = r.ok and tapped_role and tapped_ok
+    print("   %s" % ("✓ 通过了" if good else "✗ 失败"))
+    return good
+
+
+def test_role_located_by_name_only():
+    """★ 只填角色名（不带区服）也能定位到「X6014龙兴之」这种连读条目。"""
+    print("\n== 只给角色名 → 仍能定位（面板常把区服和名字连读） ==")
+    ui = FakeUi({"login": LOGIN, "srv": PANEL_OK}, start="login")
+    r = A.switch_role(ui, "龙兴之", max_rounds=2)      # ← 只给名字
+    tapped_role = any(ui._near(p, (651, 416)) for p in ui.taps)
+    print("   ok=%s reason=%s 点了角色=%s" % (r.ok, r.reason, tapped_role))
+    good = r.ok and tapped_role
+    print("   %s" % ("✓ 通过了" if good else "✗ 失败"))
+    return good
+
+
+def test_role_survives_server_rename():
+    """★ 合服后区服编号变了（X6014 → X6021），仍然按名字找得到。
+
+    这是这次改动的核心目的：区服会变，角色名不会。
+    两种登记写法（只填名字 / 连旧区服一起填）都必须能命中。
+    """
+    print("\n== 合服改了区服编号 → 仍能按名字命中 ==")
+    ui1 = FakeUi({"login": LOGIN, "srv": PANEL_RENAMED}, start="login")
+    r1 = A.switch_role(ui1, "龙兴之", max_rounds=2)
+    ui2 = FakeUi({"login": LOGIN, "srv": PANEL_RENAMED}, start="login")
+    r2 = A.switch_role(ui2, "X6014龙兴之", max_rounds=2)   # 带着旧的区服前缀
+    print("   只填名字      : ok=%s reason=%s" % (r1.ok, r1.reason))
+    print("   带旧区服前缀  : ok=%s reason=%s" % (r2.ok, r2.reason))
+    good = r1.ok and r2.ok
+    print("   %s" % ("✓ 通过了" if good else "✗ 失败"))
+    return good
+
+
+def test_role_ambiguous_not_guessed():
+    """★ 两个条目都像目标 → 不猜，如实报错（点错角色 = 在别人的号上跑任务）。"""
+    print("\n== 同名歧义 → 绝不猜 ==")
+    ui = FakeUi({"login": LOGIN, "srv": PANEL_AMBIGUOUS}, start="login")
+    r = A.switch_role(ui, "龙兴之", max_rounds=1)
+    print("   ok=%s reason=%s" % (r.ok, r.reason))
+    tapped_role = [p for p in ui.taps if ui._near(p, (651, 416))
+                   or ui._near(p, (651, 539))]
+    print("   点过的角色条目: %s" % tapped_role)
+    good = (not r.ok) and ("不止一个" in (r.reason or "")) and (not tapped_role)
+    print("   %s" % ("✓ 通过了" if good else "✗ 失败"))
+    return good
+
+
+def test_server_value_never_used_for_identification():
+    """★ 区服的具体值绝不参与识别。
+
+    面板上只有「X6014」这个区服、没有目标角色名时，绝不能因为
+    「区服字符串对上了」就点下去 —— 那正是这次要拿掉的旧行为。
+    """
+    print("\n== 区服对上了但名字没对上 → 不算命中 ==")
+    ui = FakeUi({"login": LOGIN, "srv": PANEL_SERVER_ONLY}, start="login")
+    r = A.switch_role(ui, "龙兴之", max_rounds=1)
+    tapped_role = [p for p in ui.taps if ui._near(p, (651, 416))]
+    print("   ok=%s reason=%s" % (r.ok, r.reason))
+    print("   点过的角色条目: %s" % tapped_role)
+    good = (not r.ok) and (not tapped_role)
+    print("   %s" % ("✓ 通过了" if good else "✗ 失败"))
+    return good
+
+
+def test_single_char_name_not_substring_matched():
+    """★ 单字角色名不做子串匹配 —— 否则「之」这种字在面板上到处都能命中。"""
+    print("\n== 单字角色名 → 不做子串匹配 ==")
+    ui = FakeUi({"login": LOGIN, "srv": PANEL_OK}, start="login")
+    r = A.switch_role(ui, "之", max_rounds=1)
+    tapped_role = [p for p in ui.taps if ui._near(p, (651, 416))]
+    print("   面板上有「X6014龙兴之」含「之」；结果 ok=%s 点了=%s" % (r.ok, tapped_role))
+    good = (not r.ok) and (not tapped_role)
     print("   %s" % ("✓ 通过了" if good else "✗ 失败"))
     return good
 
@@ -374,7 +475,11 @@ def test_ensure_target_dry_run():
 
 
 def test_ensure_target_already_right():
-    """账号角色都已经对 → 零点击、ok。"""
+    """账号角色都已经对 → ok。
+
+    注意 assignment 里仍然带着 server —— 它现在只是备注，
+    传了也不会被拿去识别（见 test_server_value_never_used_for_identification）。
+    """
     print("\n== 目标已就位 → 应零点击 ==")
     ui = FakeUi({"login": LOGIN, "srv": PANEL_OK}, start="login")
     r = A.ensure_target(ui, {"masked": "159****4508", "role": "X6014龙兴之",
@@ -396,6 +501,12 @@ def main():
                test_switch_account_happy_path,
                test_never_taps_dangerous,
                test_role_not_found, test_role_found_and_confirmed,
+               # ↓ 这几条盯的是「角色只按名字识别」这条规则
+               test_role_located_by_name_only,
+               test_role_survives_server_rename,
+               test_role_ambiguous_not_guessed,
+               test_server_value_never_used_for_identification,
+               test_single_char_name_not_substring_matched,
                test_ensure_target_dry_run, test_ensure_target_already_right):
         try:
             results.append((fn.__name__, fn()))

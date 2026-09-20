@@ -10,7 +10,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
-from . import db, managed, security, settings
+from . import db, managed, plan, security, settings
 
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
@@ -30,6 +30,18 @@ def require_admin(request: Request) -> str:
     return u
 
 
+def _nav_badge(request: Request) -> Dict[str, Any]:
+    """左侧导航上的角标数字。"""
+    if not current_user(request):
+        return {}
+    d: Dict[str, Any] = dict(db.client_online_count())
+    try:
+        d["roles_attention"] = len(db.role_daily_overview(days=1).get("attention") or [])
+    except Exception:
+        d["roles_attention"] = 0
+    return d
+
+
 def _ctx(request: Request, **kw) -> Dict[str, Any]:
     base = {
         "request": request,
@@ -41,7 +53,12 @@ def _ctx(request: Request, **kw) -> Dict[str, Any]:
         # 在线探测相关：模板里到处要用，统一放这儿，免得每页都传一遍
         "heartbeat_interval": settings.HEARTBEAT_INTERVAL,
         "offline_after": settings.CLIENT_OFFLINE_AFTER,
-        "nav_badge": db.client_online_count() if current_user(request) else {},
+        "nav_badge": _nav_badge(request),
+        # 角色任务模式：账户/角色页与角色执行页都要用
+        "plan_modes": plan.MODE_LABEL,
+        "plan_task_keys": plan.TASK_KEYS,
+        "plan_slots": plan.SLOTS,
+        "task_name": {t["key"]: t["name"] for t in managed.TASK_META},
     }
     base.update(kw)
     return base
@@ -434,7 +451,8 @@ def job_cancel(request: Request, req_id: int):
 
 # ================================================================== 客户端（在线探测）
 #
-# 拓扑：服务端在公网、客户端在内网 → 服务端**连不上**客户端。
+# 拓扑：后端与采集端可能不在同一台机器（也可能就在同一台），但后端一律
+# **不主动连**采集端 —— 所有交互都由采集端发起。
 # 所以「在线」= 客户端心跳的 last_seen 距今多久；「探测」= 把指令挂到客户端那行，
 # 等它下次心跳（最多 30 秒）带走执行，再把结果报回来。
 # 界面上写清楚了这一点，免得用的人以为是实时的。
@@ -575,6 +593,11 @@ def api_clients(request: Request):
 def accounts_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
     require_admin(request)
     accounts = db.account_list()
+    # 角色的「执行任务模式」在模板里要直接渲染，这里先解析好
+    for a in accounts:
+        for r in a["roles"]:
+            r["plan"] = plan.loads_plan(r.get("task_plan"))
+            r["plan_text"] = plan.summary_text(r.get("task_plan"))
     # 每个账号下挂了几台客户端（用于提示「删了会影响谁」）
     users: Dict[int, List[Any]] = {}
     for c in db.client_list():
@@ -582,7 +605,26 @@ def accounts_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
             users.setdefault(int(c["account_id"]), []).append(c)
     return templates.TemplateResponse(request, "accounts.html", _ctx(
         request, nav="accounts", accounts=accounts, ok=ok, err=err, hl=hl,
-        users=users, clients=db.client_list()))
+        users=users, clients=db.client_list(),
+        # 模板里「客户端指派一览」要按 role_id 反查角色名，这里必须传（原来漏了）
+        role_list=db.role_list()))
+
+
+def _plan_from_form(form) -> str:
+    """从表单里读「执行任务模式」，整成 JSON 文本。
+
+    表单里没有 `plan_mode` 这个字段时返回空串 —— 表示「本次不涉及任务模式」，
+    调用方要据此**保持原值**而不是覆盖成默认值。
+    （新增角色表单里就没有这一项，只有专门的配置表单才有。）
+    """
+    if "plan_mode" not in form:
+        return ""
+    mode = str(form.get("plan_mode") or plan.MODE_INHERIT)
+    tasks = {k: (form.get("task_%s" % k) is not None) for k in plan.TASK_KEYS}
+    slots = [s for s, f in (("00:00", "slot_00"), ("12:00", "slot_12"))
+             if form.get(f) is not None]
+    return plan.dumps_plan({"mode": mode, "tasks": tasks, "slots": slots,
+                            "note": str(form.get("plan_note") or "")[:200]})
 
 
 @router.post("/accounts")
@@ -643,7 +685,8 @@ async def role_create(request: Request, aid: int):
                          server=str(form.get("server") or ""),
                          season=str(form.get("season") or ""),
                          tab=str(form.get("tab") or ""),
-                         note=str(form.get("note") or ""))
+                         note=str(form.get("note") or ""),
+                         task_plan=_plan_from_form(form))
     db.event("info", "console", "账号 #%d 新增角色「%s」（#%d）" % (aid, name, rid))
     return RedirectResponse("/accounts?hl=%d&ok=%s" % (aid, _q("角色已添加")), status_code=303)
 
@@ -663,10 +706,61 @@ async def role_edit(request: Request, rid: int):
         fields["enabled"] = 1 if form.get("enabled") is not None else 0
     if not str(fields.get("name") or "").strip():
         fields.pop("name", None)
+    tp = _plan_from_form(form)
+    if tp:
+        fields["task_plan"] = tp
     db.role_update(rid, **fields)
     db.event("info", "console", "更新角色 #%d" % rid)
     return RedirectResponse("/accounts?hl=%d&ok=%s"
                             % (int(role["account_id"]), _q("角色已保存")), status_code=303)
+
+
+@router.post("/roles/{rid}/save")
+async def role_save(request: Request, rid: int):
+    """保存单个角色的全部设置（在「角色执行」页上配置）。
+
+    这是「每个游戏角色跑什么任务」的唯一入口，保存后不需要动客户端配置 ——
+    客户端下一次心跳就会拿到新的 task_plan。
+
+    字段：name / tab / server / season（备注）/ enabled / mode / task_* / slot_* / note
+    """
+    require_admin(request)
+    role = db.role_get(rid)
+    if not role:
+        return RedirectResponse("/roles?err=%s" % _q("角色不存在"), status_code=303)
+    form = await request.form()
+
+    fields: Dict[str, Any] = {}
+    for k in ("name", "server", "season", "tab"):
+        if k in form:
+            fields[k] = str(form.get(k) or "").strip()[:60]
+    if not str(fields.get("name") or "").strip():
+        fields.pop("name", None)        # 名字空着就保持原值，绝不写空
+    # 有 name 输入框但为空 → 上面已剔除；这里处理启停
+    if form.get("_has_enabled") or "enabled" in form:
+        fields["enabled"] = 1 if form.get("enabled") is not None else 0
+
+    tp = _plan_from_form(form)
+    if tp:
+        fields["task_plan"] = tp
+    db.role_update(rid, **fields)
+
+    p = plan.loads_plan(tp or role.get("task_plan"))
+    if p["mode"] == plan.MODE_CUSTOM and not plan.selected_tasks(p):
+        db.event("warn", "console",
+                 "角色「%s」被设为「自定义」，但一个任务都没勾 —— 它不会执行任何任务"
+                 % role.get("name"))
+        return RedirectResponse(
+            "/roles?hl=%d#r%d&warn=%s" % (rid, rid, _q(
+                "已保存，但注意：「自定义」模式下没勾选任何任务，这个角色不会执行任何任务")),
+            status_code=303)
+    db.event("info", "console", "角色「%s」已保存：%s"
+             % (fields.get("name") or role.get("name"), plan.summary_text(tp or role.get("task_plan"))))
+    return RedirectResponse("/roles?hl=%d#r%d&ok=%s"
+                            % (rid, rid, _q("「%s」已保存：%s"
+                                            % (fields.get("name") or role.get("name"),
+                                               plan.summary_text(tp or role.get("task_plan"))))),
+                            status_code=303)
 
 
 @router.post("/roles/{rid}/delete")
@@ -681,8 +775,27 @@ def role_delete(request: Request, rid: int):
     return RedirectResponse("/accounts?hl=%d&ok=%s" % (aid, _q("角色已删除")), status_code=303)
 
 
-# ------------------------------------------------------------------ 设置
+# ================================================================== 角色执行情况
+#
+# 用户最关心的两件事，都收敛在这一页：
+#   1. **每个角色跑什么任务**（执行任务模式）—— 直接在这里勾选，保存即下发
+#   2. **每个角色每天跑得怎么样** —— 按天、按档位、按任务列出结果
+#
+# 数据来源：runs 表按角色聚合（db.role_daily_overview）。
+# 归属优先看服务端指派，没指派时按客户端自报的角色名匹配 —— 见 db.role_find_by_name。
 
+@router.get("/roles", response_class=HTMLResponse)
+def roles_page(request: Request, days: int = 7, hl: int = 0,
+               ok: str = "", err: str = "", warn: str = ""):
+    require_admin(request)
+    days = max(1, min(int(days or 7), 30))
+    ov = db.role_daily_overview(days=days)
+    return templates.TemplateResponse(request, "roles.html", _ctx(
+        request, nav="roles", ov=ov, days=days, hl=hl,
+        ok=ok, err=err, warn=warn, clients=db.client_list()))
+
+
+# ------------------------------------------------------------------ 设置
 @router.get("/settings", response_class=HTMLResponse)
 def settings_page(request: Request, ok: str = "", err: str = "", token: str = ""):
     require_admin(request)

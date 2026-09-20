@@ -1,6 +1,10 @@
-# Debian 上一条命令起全套：应用 + Caddy（自动 HTTPS）。
+# 【可选进阶】公网部署：应用 + Caddy（自动 HTTPS）。
 #
-#   cd server && cp .env.example .env    # 改成你的域名，按需填初始口令
+# 默认的内网部署用不到这个文件 —— 内网直接跑 start_server.bat 即可
+# （绑定 0.0.0.0:8000，同局域网的手机/电脑用 http://<内网IP>:8000 访问）。
+#
+# 只有当你确实要把控制台暴露到公网时才用这套：
+#   cd server && cp .env.example .env    # 填回 STZB_DOMAIN / ACME_EMAIL
 #   docker compose up -d
 #
 # 首次启动会在日志里打印管理员口令与 agent 令牌（只打印一次）：

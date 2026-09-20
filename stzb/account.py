@@ -8,6 +8,10 @@
    面板里有页签（已有角色 / 经典服 / 青春服）和子页签（最近登录 / 经典服角色…），
    角色列表要按页签找。
 
+   ★ **定位角色只认「角色名」**：区服会随合服改名（今天的 X6014，合服后可能变成
+     别的编号），拿区服 / 赛季当判据迟早全线失效。所以 `switch_role()` 不接受
+     server / season 参数，`_find_role()` 也不做任何区服比较。
+
 2. **换账号 —— 免密，但只能用「已登录过的账户」**
    登录页左上角图标 (60,62) →「用户中心」→「切换账号」(1566,288)
    → 落到**网易统一登录页**：上面有「常用」页签 (1340,432)、当前账号
@@ -194,6 +198,224 @@ def current_account(ui) -> Tuple[Optional[str], List[TextItem]]:
     return find_masked(items), items
 
 
+# ------------------------------------------------------------------ 游戏内角色名
+#
+# ★★ 为什么必须能读「游戏内角色名」（2026-09-20 实测确认，很关键）：
+#   游戏里**只有「区服」是可选的，角色名根本不出现在登录链路上**：
+#     · 网易统一登录页：只有脱敏账号 + 常用列表；
+#     · 游戏自己的登录页：只有「[经典服] X6014 龙兴之地 征服 | 点击换区」；
+#     · 「选择服务器」面板：**列表里全是区服名**（X6014龙兴之 / 备战区 /
+#       S21815 / 509区攻无坚陈 …），一个字都没提角色名。
+#   而角色名只出现在**进游戏之后**的主城左上角（「势力值」正上方那一行）。
+#
+#   所以「按角色名识别」只能这么落地：
+#     ① 角色名是**身份**（登记、对账、去重都用它）；
+#     ② 区服只是**到达手段**，可以随便变（合服改名也不怕）；
+#     ③ 切过去之后必须**回读主城左上角的角色名做校验** —— 这才是真正
+#        「按角色名识别」，而不是「按区服猜」。
+ROLE_NAME_ANCHOR = "势力值"      # 角色名就在它的正上方
+ROLE_NAME_TOP_Y = 60             # 角色名在屏幕最顶部这一带
+
+
+def _clean_role_name(s: str) -> str:
+    """清掉角色名前后沾上的图标/装饰噪声（如「》忄势力值154」这种前缀）。"""
+    t = re.sub(r"^[^\w\u4e00-\u9fff]+", "", (s or "").strip())
+    t = re.sub(r"[^\w\u4e00-\u9fff]+$", "", t)
+    return t.strip()
+
+
+def _name_likeness(t: str) -> float:
+    """这个串「有多像角色名」。
+
+    实测教训（2026-09-20）：主城顶栏同一横行上还挤着资源计数
+    （「·19／35」「65094／85000」「18：24：31」「400亞」…），
+    它们和角色名处在**同一个竖直带**里，光按 y 排序会把它们当成名字。
+    区分点：角色名是中文（率土之滨的昵称至少含汉字），
+    而顶栏那些是数字/斜杠/冒号为主的计数。
+    所以用「中文字数 - 数字个数」当像名度。
+    """
+    t = _clean_role_name(t)
+    cjk = sum(1 for ch in t if "\u4e00" <= ch <= "\u9fff")
+    digits = sum(1 for ch in t if ch.isdigit())
+    return cjk * 2.0 - digits
+
+
+def current_role(ui, items: Optional[Sequence[TextItem]] = None
+                 ) -> Optional[str]:
+    """读**游戏内当前角色名**（主城左上角，「势力值」正上方那一行）。
+
+    返回 None 表示「当前不在能读到角色名的界面」（比如还停在登录页/面板里），
+    调用方应当如实说明，绝不要瞎猜一个名字。
+
+    判据设计（都来自实测帧的坐标）：
+      · 用「势力值」当锚点 —— 它紧贴在角色名下方（实测名字 y≈19、势力值 y≈51）；
+      · 在锚点**正上方一小段距离内**找，且**限定屏幕左半边**：
+        顶栏右半边全是资源计数，不加这个限制会被它们抢走
+        （实测就踩过：读成了右上角的「400亞」）；
+      · 再用「像名度」排序，中文多的优先 —— 把「·19／35」这类计数挤下去；
+      · 实在找不到锚点时，退一步取屏幕最顶部、偏左、像名字的那条。
+    """
+    if items is None:
+        items, _ = ui.ocr("currole")
+
+    def _ok(t: str) -> bool:
+        t = _clean_role_name(t)
+        if len(t) < 2 or len(t) > 20:
+            return False
+        if t.isdigit():
+            return False
+        for bad in ("公告", "玩家交流社区", "任务", "活动", "荣誉", "势力值",
+                    "画像", "分享"):
+            if bad in t:
+                return False
+        return True
+
+    # ① 用「势力值」锚点定位
+    anchor = None
+    for it in items:
+        if it.center[1] < 140 and _one_score(it.text, ROLE_NAME_ANCHOR) >= 0.62:
+            anchor = it
+            break
+
+    if anchor is not None:
+        # ①a 名字和「势力值」被 OCR 并进同一条的情况（如「云魇丨奈子势力值154」）
+        raw = re.split(ROLE_NAME_ANCHOR, anchor.text)[0]
+        if _ok(raw) and _name_likeness(raw) > 0:
+            return _clean_role_name(raw)
+
+        # ①b 取锚点正上方、左半边、最像名字的那条
+        cands = [it for it in items
+                 if anchor.center[1] - 70 < it.center[1] < anchor.center[1] - 4
+                 and it.center[0] < 900 and _ok(it.text)]
+        if cands:
+            best = max(cands, key=lambda x: (_name_likeness(x.text),
+                                             -abs(x.center[0] - anchor.center[0])))
+            if _name_likeness(best.text) > 0:
+                return _clean_role_name(best.text)
+
+    # ② 兜底：屏幕最顶部、偏左、像名字的那条
+    cands = [it for it in items
+             if it.center[1] < ROLE_NAME_TOP_Y and it.center[0] < 900
+             and _ok(it.text)]
+    if cands:
+        best = max(cands, key=lambda x: (_name_likeness(x.text), -x.center[1]))
+        if _name_likeness(best.text) > 0:
+            return _clean_role_name(best.text)
+    return None
+
+
+def restart_game_to_login(ui, *, log: Optional[Callable[[str], None]] = None,
+                          max_wait: float = 180.0) -> Tuple[bool, str]:
+    """强制重启游戏进程，停在**游戏自己的登录页**（有「开始游戏」「点击换区」那一屏）。
+
+    ★ 为什么必须重启（2026-09-20 实测，这是本次发现的关键事实）：
+      主城上**没有**回登录页的入口 ——
+        · 左上角 (60,62) 在主城落到「**任务**」按钮上（它只比「任务」高 40px）；
+        · 「用户中心」那个入口**只存在于标题页 / 登录页**。
+      所以 `_open_user_center()` 拿 (60,62) 从主城出发必然点开「任务」，
+      然后报「打不开用户中心」—— 这就是「切不了账号/角色」的真正原因。
+
+      而重启**游戏进程**只要十几秒（不必重启模拟器，那是 1~2 分钟），
+      落地就是标题页 → 点中央 → 登录页，全程走的都是已验证过的路径。
+
+    流程：force-stop → launch → 标题页（模板匹配）点中央 → 必要时点「登录」 → 登录页。
+    """
+    from .ui import TITLE_TAP
+
+    say = log or ui.log
+    try:
+        ui.dev.force_stop(ui.pkg)
+    except Exception as e:
+        return False, "关不掉游戏进程：%r" % (e,)
+    time.sleep(2.0)
+    try:
+        ui.dev.launch(ui.pkg)
+    except Exception as e:
+        return False, "拉不起游戏：%r" % (e,)
+
+    end = time.time() + max_wait
+    n = 0
+    while time.time() < end:
+        n += 1
+        items, path = ui.ocr("glpr_%02d" % n)
+        if guard_survey(ui, items):
+            continue
+        if _has(items, *KW_START_GAME) or _has(items, *KW_AREA_ENTRY):
+            return True, "重启后第 %d 帧回到游戏登录页" % n
+        # 冷启动标题页：全屏 OCR 常读到 0~3 行，必须靠模板匹配认
+        if len(items) <= 3:
+            tp = ui.title_page_hit(path)
+            if tp is not None:
+                say("  · 标题页 → 点屏幕中央")
+                ui.tap(*TITLE_TAP, delay=0.0)
+                time.sleep(10)
+                continue
+        # 网易统一登录页 → 点「登录」回游戏登录页
+        if _has(items, *KW_OTHER_LOGIN) or _has(items, *KW_COMMON_TAB) \
+                or find_masked(items) is not None:
+            say("  · 网易统一登录页 → 点「登录」")
+            hit = find_login_button(items)
+            ui.tap(*(hit.center if hit else NN_LOGIN_BTN))
+            time.sleep(3.0)
+            continue
+        time.sleep(3.0)
+    return False, "重启后 %d 秒仍没看到游戏登录页" % int(max_wait)
+
+
+def ensure_game_login_page(ui, *, max_rounds: int = 3) -> Tuple[bool, str]:
+    """把界面带到**游戏自己的登录页**（有「开始游戏」和「点击换区」那一屏）。
+
+    ★ 为什么必须有这一步（2026-09-20 实测踩到）：
+      登录链路上有**两屏**长得都像「登录页」，极容易混：
+
+        ① **网易统一登录页**：只有「网易游戏」logo、脱敏账号（159****4508）、
+           「常用」页签、「登录」、「其他账号登录」。**没有**「点击换区」。
+        ② **游戏自己的登录页**：底部一条「[经典服] X6014 龙兴之地 征服 | 点击换区」，
+           加一个「开始游戏」。**「点击换区」只在这一屏上**。
+
+      所以任何「切区服 / 列角色 / 切角色」的动作，都必须先确保站在第 ② 屏 ——
+      否则 `_open_server_panel` 一定点空（实测就是这样白跑一轮）。
+
+    从主城出发的路径：
+        主城 →(用户中心)→(切换账号)→ 第①屏 →(登录)→ 第②屏
+
+    返回 (是否到达, 说明)。**不按 Android 返回键**，全程只走界面按钮。
+    """
+    def _on_game_login(items) -> bool:
+        return _has(items, *KW_START_GAME) or _has(items, *KW_AREA_ENTRY)
+
+    for rnd in range(1, max_rounds + 1):
+        items, _ = ui.ocr("glp_%d" % rnd)
+        if guard_survey(ui, items):
+            continue
+        if _on_game_login(items):
+            return True, "已在游戏登录页"
+
+        on_netease = _has(items, *KW_OTHER_LOGIN) or _has(items, *KW_COMMON_TAB) \
+            or find_masked(items) is not None
+
+        if on_netease:
+            # 第①屏 → 点「登录」回第②屏（当前账号已选中，不需要密码）
+            hit = find_login_button(items)
+            if hit is not None:
+                _safe_tap(ui, hit.center, "登录", delay=3.0)
+            else:
+                _safe_tap(ui, NN_LOGIN_BTN, "登录（固定坐标）", delay=3.0)
+            continue
+
+        # 在游戏里（主城/某个面板）→ 走用户中心 → 切换账号。
+        # ⚠️ 「用户中心」入口只在标题页/登录页上有：主城上 (60,62) 会点到「任务」。
+        #    所以这里失败是**预期内的**，直接退回「重启游戏」这条稳路。
+        if not _open_user_center(ui):
+            return restart_game_to_login(ui)
+        if not _tap_switch_account(ui):
+            return restart_game_to_login(ui)
+    items, _ = ui.ocr("glp_last")
+    if _on_game_login(items):
+        return True, "已在游戏登录页"
+    return False, "重试 %d 轮仍没能回到游戏登录页" % max_rounds
+
+
 def switch_account(ui, target_masked: str, *, max_rounds: int = 5) -> SwitchResult:
     """切到 target_masked 这个账号。
 
@@ -294,7 +516,15 @@ def _same_account(a: str, b: str) -> bool:
 
 
 def _open_user_center(ui) -> bool:
-    """打开用户中心面板。"""
+    """打开用户中心面板。
+
+    ⚠️ **只在标题页 / 登录页上有效**（2026-09-20 实测确认）：
+       LOGIN_ACCOUNT_ICON = (60,62) 是**登录页左上角的账号图标**，
+       而主城左上角同一个位置是「**任务**」按钮（两者只差 40px）。
+       从主城调这个函数会点开「任务」面板然后返回 False。
+       需要「从游戏里回登录页」时，请用 `restart_game_to_login()`
+       （主城上没有任何回登录页的入口，只能重启游戏）。
+    """
     items, _ = ui.ocr("uc_open")
     if _has(items, *KW_USER_CENTER):
         return True
@@ -396,18 +626,23 @@ _TAB_POINTS = {
 }
 
 
-def switch_role(ui, role: str, *, server: str = "", season: str = "",
-                tab: str = "已有角色", max_rounds: int = 4) -> SwitchResult:
+def switch_role(ui, role: str, *, tab: str = "已有角色", max_rounds: int = 4) -> SwitchResult:
     """在**当前账号内**切到指定角色。
 
-    走登录页「点击换区」→「选择服务器」面板 → 点目标角色 → 确定。
-    不需要密码。找不到角色就如实说明，不要瞎点。
+    走登录页「点击换区」→「选择服务器」面板 → 点目标角色 → 确定。不需要密码。
+
+    ★ **定位只认角色名**（见 `_find_role`）：
+      区服会随合服改名（今天的 X6014，合服后可能变成别的），拿它当判据迟早失效。
+      所以这里不再接受 server / season 参数 —— 它们连"参考加分"都不做。
+      找不到就如实说明，绝不瞎点。
     """
     want = (role or "").strip()
     res = SwitchResult(False, "role")
     if not want:
         res.reason = "没给目标角色名"
         return res
+
+    variants = _name_variants(want)
 
     for rnd in range(1, max_rounds + 1):
         items, _ = ui.ocr("swrole_%d" % rnd)
@@ -416,7 +651,7 @@ def switch_role(ui, role: str, *, server: str = "", season: str = "",
 
         # 必须先在登录页，不然「点击换区」这个入口不在
         if not _has(items, *KW_START_GAME) and not _has(items, *KW_AREA_ENTRY):
-            # 已经进游戏了：这种情况先不动，交给调用方决定要不要退回来
+            # 已经进游戏了：先不动，交给调用方决定要不要退回来
             res.reason = "当前不在登录页（看不到「点击换区」），无法切角色"
             res.steps.append("第%d轮：不在登录页" % rnd)
             return res
@@ -430,21 +665,33 @@ def switch_role(ui, role: str, *, server: str = "", season: str = "",
         if tab:
             _pick_tab(ui, tab)
 
-        hit = _find_role(ui, want, server=server, season=season)
+        hit, note = _find_role(ui, want)
+        if note:
+            res.reason = note
+            res.steps.append("第%d轮：%s" % (rnd, note))
+            _press_confirm(ui)
+            return res
+
         if hit is None:
             # 换个页签再找一遍（角色可能在「经典服」/「青春服」下）
             for t in ("已有角色", "最近登录", "经典服", "青春服"):
                 if t == tab:
                     continue
                 _pick_tab(ui, t)
-                hit = _find_role(ui, want, server=server, season=season)
+                hit, note = _find_role(ui, want)
+                if note:
+                    res.reason = note
+                    res.steps.append("第%d轮：%s" % (rnd, note))
+                    _press_confirm(ui)
+                    return res
                 if hit is not None:
                     res.steps.append("在「%s」页签下找到角色" % t)
                     break
 
         if hit is None:
             res.reason = ("「选择服务器」面板里找不到角色「%s」—— "
-                          "确认登记的角色名和游戏里显示的一致" % want)
+                          "确认登记的角色名和游戏里显示的一致（只按名字找，不看区服）"
+                          % want)
             _press_confirm(ui)
             return res
 
@@ -502,53 +749,86 @@ def _pick_tab(ui, tab: str) -> None:
         _safe_tap(ui, pt, "页签 %s（固定坐标）" % tab, delay=1.2)
 
 
-def _find_role(ui, role: str, *, server: str = "", season: str = "") -> Optional[TextItem]:
-    """在当前页签的角色列表里找目标角色。
+# 区服编号的**格式**（X6014 / s12345 / S6014 …）。
+# ⚠ 只用来「把前缀切掉」，**从不比较区服的具体值** ——
+#   合服后 X6014 可能变成完全不同的编号，比具体值就等于埋了个定时炸弹。
+_SRV_PREFIX_RE = re.compile(r"^[A-Za-z]{1,3}\d{3,5}")
 
-    匹配策略（从严到宽）：
-      1. 角色名精确/模糊匹配（match_score）
-      2. 命中「区服 + 赛季」组合
-    角色条目在面板里的坐标是 (651,416)/(665,539) 这类，文本可能被读成
-    「X6014龙兴之」这样连在一起，所以既整串比、也拆开比。
+
+def _name_variants(role: str) -> List[str]:
+    """角色名的等价写法。
+
+    面板上的角色条目常被 OCR 读成「X6014龙兴之」这种「区服编号 + 名字」连读框，
+    用户登记时也可能连区服一起填了。所以生成两种写法：原样、以及去掉开头
+    区服编号后的部分。这样「只填名字」和「连区服一起填」都能命中。
+    """
+    out = [role]
+    m = _SRV_PREFIX_RE.match(role)
+    if m and len(role) > m.end():
+        out.append(role[m.end():])
+    return [v.strip() for v in out if v and v.strip()]
+
+
+def _one_score(text: str, key: str) -> float:
+    """条目文本 vs 一个名字写法的匹配分。"""
+    t = fix_ocr(norm(text), drop=True)
+    k = fix_ocr(norm(key))
+    if not t or not k:
+        return 0.0
+    if t == k:
+        return 1.0
+    if k in t:
+        # 名字只是条目的一部分（面板把区服和名字挤在一个框里）。
+        # 单字名字的子串匹配太危险（几乎必然误命中），直接不算。
+        if len(k) < 2:
+            return 0.0
+        return 0.80 + 0.18 * (len(k) / len(t))
+    return match_score(text, key)
+
+
+def _find_role(ui, role: str) -> Tuple[Optional[TextItem], str]:
+    """在「选择服务器」面板里按**角色名**找角色。
+
+    返回 `(命中条目 或 None, 需要告知用户的说明)`。说明非空时表示「不敢确定」，
+    调用方应把它当失败原因报出来，而**不是**去猜一个点下去。
+
+    ★ 只认角色名：
+      区服会随合服改名（今天的 X6014，合服后可能变成别的编号），
+      拿区服 / 赛季当判据迟早会在某一天全线失效。名字才是稳定标识。
+
+    匹配从严到宽：
+      1. 归一化后完全相等
+      2. 条目文本包含角色名（面板常把「区服 + 名字」连读成一个框）
+      3. 模糊匹配（match_score ≥ 0.62，带长度约束）
+
+    同名歧义：出现 ≥2 个分数接近（差 < 0.15）的候选时**不猜**，返回说明。
+    点错角色 = 在别人的号上跑任务，比不跑糟糕得多。
     """
     items, _ = ui.ocr("findrole")
     guard_survey(ui, items)
 
-    keys = [k for k in (role, server, season) if k]
-    # 角色条目一般在下半屏的列表区
+    variants = _name_variants(role)
+    if not variants:
+        return None, "没给目标角色名"
+
+    # 角色条目一般在面板下半屏的列表区
     cands = [it for it in items if 300 < it.center[1] < 880 and it.center[0] > 120]
 
-    best, best_score = None, 0.0
+    scored: List[Tuple[float, TextItem]] = []
     for it in cands:
-        t = norm(it.text)
-        if not t:
-            continue
-        # 整串 vs 角色名
-        sc = match_score(it.text, role)
-        # 角色名 + 区服 + 赛季 都被包在这条里，给个加成
-        if server and norm(server) in t:
-            sc = max(sc, 0.72)
-        if season and norm(season) in t:
-            sc = max(sc, 0.72)
-        if server and season and norm(server) in t and norm(season) in t:
-            sc = max(sc, 0.86)
-        if sc > best_score:
-            best, best_score = it, sc
+        sc = max((_one_score(it.text, k) for k in variants), default=0.0)
+        if sc > 0:
+            scored.append((sc, it))
+    scored.sort(key=lambda x: (-x[0], x[1].center[1], x[1].center[0]))
 
-    if best is not None and best_score >= 0.6:
-        return best
-
-    # 兜底：拆词比。OCR 常把「X6014龙兴之」读成「X6014」+「龙兴之」两条。
-    if server or season:
-        for it in cands:
-            t = norm(it.text)
-            if server and norm(server) == t:
-                # 找它右边最近的那条当赛季
-                right = [o for o in cands if o.center[0] > it.center[0]
-                         and abs(o.center[1] - it.center[1]) < 40]
-                if right and (not season or match_score(right[0].text, season) >= 0.6):
-                    return it
-    return None
+    if not scored or scored[0][0] < 0.62:
+        return None, ""
+    best_sc, best = scored[0]
+    if len(scored) > 1 and scored[1][0] >= 0.62 and (best_sc - scored[1][0]) < 0.15:
+        return None, ("面板里有不止一个像「%s」的条目（「%s」和「%s」），"
+                      "不敢替你猜是哪一个 —— 请把角色名填得更精确一些"
+                      % (role, best.text[:18], scored[1][1].text[:18]))
+    return best, ""
 
 
 def _press_confirm(ui) -> None:
@@ -610,9 +890,9 @@ def ensure_target(ui, assignment: Dict[str, Any], *,
 
     # ---- 角色 ----
     if role:
+        # ★ 只传角色名：切换定位不看区服 / 赛季（合服会改名）。
+        #   assignment 里虽然还带着 server/season，但那是给人看的备注，不参与判断。
         r2 = switch_role(ui, role,
-                         server=str(assignment.get("server") or ""),
-                         season=str(assignment.get("season") or ""),
                          tab=str(assignment.get("tab") or "已有角色"))
         for s in r2.steps:
             say("      %s" % s)

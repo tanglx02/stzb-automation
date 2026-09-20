@@ -4,11 +4,36 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import sqlite3
 from contextlib import contextmanager
 from typing import Any, Dict, Iterable, List, Optional
 
-from . import settings
+from . import plan, settings
+
+# 区服编号的格式（X6014 / s12345 / S6014 …）。
+# ⚠ 只用来「剥掉前缀」，**从不比较区服的具体值** —— 合服后编号会变，
+#   比具体值等于埋了个定时炸弹。与采集端 stzb/account.py:_SRV_PREFIX_RE 一致。
+_SRV_PREFIX_RE = re.compile(r"^[A-Za-z]{1,3}\d{3,5}")
+
+
+def role_key(name: Any) -> str:
+    """角色名的归一化比较键 —— **全系统「角色是谁」的唯一判据**。
+
+    游戏里换区 / 合服都会改掉区服编号（X6014 → X6021），但角色名不变。
+    所以任何「这是不是同一个角色」的判断，都必须走这个函数，绝不看区服。
+
+    归一化三件事：
+      1. 去掉所有空白
+      2. 转小写（OCR 与手填的大小写差异不算区别）
+      3. 剥掉开头的区服编号前缀，让「X6014龙兴之」「X6021龙兴之」「龙兴之」
+         收敛到同一个键（注意：只按格式剥，从不读编号的值）
+    """
+    s = re.sub(r"\s+", "", str(name or ""))
+    m = _SRV_PREFIX_RE.match(s)
+    if m and len(s) > m.end():
+        s = s[m.end():]
+    return s.lower()
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -50,10 +75,11 @@ CREATE TABLE IF NOT EXISTS game_accounts (
 CREATE TABLE IF NOT EXISTS game_roles (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     account_id  INTEGER NOT NULL REFERENCES game_accounts(id) ON DELETE CASCADE,
-    name        TEXT NOT NULL,                 -- 角色名，OCR 读到的那个
-    server      TEXT,                          -- 区服，如「X6014」
-    season      TEXT,                          -- 赛季/剧本，如「龙兴之」
+    name        TEXT NOT NULL,                 -- ★ 角色名：切换角色时**唯一**的识别依据
+    server      TEXT,                          -- 区服（仅备注用，不参与识别，合服会变）
+    season      TEXT,                          -- 赛季/剧本（仅备注用，不参与识别）
     tab         TEXT,                          -- 属于哪个页签：已有角色 / 经典服 / 青春服
+    task_plan   TEXT,                          -- 该角色的「执行任务模式」JSON，见 plan.py
     note        TEXT,
     sort_order  INTEGER NOT NULL DEFAULT 0,
     enabled     INTEGER NOT NULL DEFAULT 1,
@@ -531,10 +557,10 @@ def events_recent(limit: int = 100) -> List[sqlite3.Row]:
 
 # ================================================================== 客户端
 #
-# 服务端在公网、客户端在内网 —— 服务端**不可能**主动连客户端。
+# 后端可能连不上采集端（不在同一网段 / NAT / 防火墙），甚至以后搬到公网。
 # 所以「是否在线」只能由客户端主动上报心跳（POST /api/agent/ping），
-# 服务端把 last_seen 记下来，界面按「距今多少秒」判在线/离线。
-# 这不是偷懒，是拓扑决定的唯一可行做法。
+# 后端把 last_seen 记下来，界面按「距今多少秒」判在线/离线。
+# 这不是偷懒，是拓扑决定的唯一稳妥做法（内网同机部署也用同一套，行为一致）。
 
 # 心跳间隔 30 秒；超过 3 个间隔没收到就认为掉线。
 HEARTBEAT_INTERVAL = 30
@@ -824,21 +850,23 @@ def role_get(rid: int) -> Optional[Dict[str, Any]]:
 
 
 def role_create(account_id: int, name: str, server: str = "", season: str = "",
-                tab: str = "", note: str = "") -> int:
+                tab: str = "", note: str = "", task_plan: str = "") -> int:
     ts = now()
     with tx() as c:
         nxt = c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM game_roles "
                         "WHERE account_id=?", (account_id,)).fetchone()["n"]
         cur = c.execute(
-            "INSERT INTO game_roles(account_id,name,server,season,tab,note,sort_order,"
-            "enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",
+            "INSERT INTO game_roles(account_id,name,server,season,tab,task_plan,note,"
+            "sort_order,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?,?)",
             (account_id, name.strip()[:60] or "未命名角色", server.strip()[:40],
-             season.strip()[:40], tab.strip()[:20], note.strip()[:400], int(nxt), ts, ts))
+             season.strip()[:40], tab.strip()[:20], (task_plan or "")[:4000],
+             note.strip()[:400], int(nxt), ts, ts))
         return int(cur.lastrowid)
 
 
 def role_update(rid: int, **fields: Any) -> None:
-    allowed = ("name", "server", "season", "tab", "note", "sort_order", "enabled")
+    allowed = ("name", "server", "season", "tab", "task_plan", "note",
+               "sort_order", "enabled")
     sets, vals = [], []
     for k, v in fields.items():
         if k not in allowed:
@@ -868,3 +896,205 @@ def assignment(cid: int) -> Dict[str, Any]:
     acc = account_get(int(cli["account_id"])) if cli.get("account_id") else None
     role = role_get(int(cli["role_id"])) if cli.get("role_id") else None
     return {"client": cli, "account": acc, "role": role}
+
+
+def role_find_by_name(name: str) -> Optional[Dict[str, Any]]:
+    """按**角色名**反查已登记的角色。
+
+    ★ 为什么按名字而不是区服：区服会随合服 / 转服变化（X6014 今天叫「X6014」，
+    合服后可能变成「X6021」），名字才是稳定的。所以全系统里
+    「角色」的唯一识别键就是 `name`，区服/赛季只当备注。
+
+    匹配用 `role_key()`（去空白 + 转小写 + 剥区服前缀），所以
+    「X6021龙兴之」也能命中登记为「X6014龙兴之」或「龙兴之」的角色。
+
+    有歧义时（两个不同角色归一化后同名）**不猜**，返回 None ——
+    宁可这一条记录归到「未登记」，也不要张冠李戴。
+
+    用途：运行记录上传时如果后端没指派过角色，就靠客户端自报的角色名
+    把这条记录归到正确的角色上，让「角色每日执行情况」不漏数据。
+    """
+    want = role_key(name)
+    if not want:
+        return None
+    hits: List[sqlite3.Row] = []
+    with tx() as c:
+        for r in c.execute("SELECT * FROM game_roles ORDER BY id").fetchall():
+            if role_key(r["name"]) == want:
+                hits.append(r)
+                if len(hits) > 1:
+                    break
+    if not hits:
+        return None
+    if len(hits) > 1:
+        # 多个角色只差区服前缀 → 无法确定是哪一个，拒绝猜测
+        return None
+    return dict(hits[0])
+
+
+def role_daily_overview(days: int = 7) -> Dict[str, Any]:
+    """按角色聚合最近几天的执行情况（「角色执行」页的数据源）。
+
+    返回::
+
+        {
+          "days": 7,
+          "dates": ["2026-09-20", ...],          # 今天在前
+          "roles": [ {id, name, account_label, plan, client,
+                      days:[{date, runs, ok, fail, skip,
+                             slots:[{slot, run_id, all_ok, started_at,
+                                     n_ok, n_fail, n_skip, tasks:[...]}]}],
+                      today: <其中一个>, last_run_at, registered} ],
+          "attention": [role_id, ...]            # 今天有未完成项的（导航角标用）
+        }
+
+    归属规则：优先按服务端指派（`runs.role_id`）；没有指派时按客户端自报的
+    角色名（`runs.role_label`）匹配登记的角色名 —— 就是上面那条「按名字识别」。
+    """
+    days = max(1, min(int(days or 7), 30))
+    today = dt.date.today()
+    dates = [(today - dt.timedelta(days=i)).isoformat() for i in range(days)]
+    since = dates[-1] + "T00:00:00"
+
+    roles = role_list()
+    accounts = {int(a["id"]): a for a in account_list(with_roles=False)}
+    clients = client_list()
+
+    by_name: Dict[str, Dict[str, Any]] = {}
+    by_id: Dict[int, Dict[str, Any]] = {}
+    _ambiguous: set = set()
+    for r in roles:
+        by_id[int(r["id"])] = r
+        k = role_key(r["name"])
+        if not k:
+            continue
+        if k in by_name and int(by_name[k]["id"]) != int(r["id"]):
+            _ambiguous.add(k)          # 两个角色归一化后同名 → 不给名字匹配
+        else:
+            by_name[k] = r
+    for k in _ambiguous:
+        by_name.pop(k, None)
+
+    with tx() as c:
+        runs = c.execute(
+            "SELECT id,started_at,slot,all_ok,n_ok,n_fail,n_skip,role_id,role_label,"
+            "account_id,account_label,client_id,duration_seconds,env_json "
+            "FROM runs WHERE started_at >= ? ORDER BY started_at ASC, id ASC",
+            (since,)).fetchall()
+        tasks_by_run: Dict[int, List[Dict[str, Any]]] = {}
+        if runs:
+            ids = [int(x["id"]) for x in runs]
+            qs = ",".join("?" * len(ids))
+            for t in c.execute(
+                    "SELECT run_id,key,name,status,seconds,reason FROM task_results "
+                    "WHERE run_id IN (%s) ORDER BY run_id, seq" % qs, ids).fetchall():
+                tasks_by_run.setdefault(int(t["run_id"]), []).append(dict(t))
+
+    # ---- 把每条运行记录归到某个角色 ----
+    # key: ("id", role_id) 或 ("name", 角色名) 或 ("anon", "")
+    bucket: Dict[Any, Dict[Any, Dict[str, Any]]] = {}
+    for r in runs:
+        date = str(r["started_at"] or "")[:10]
+        slot = str(r["slot"] or "auto")
+        rid = int(r["role_id"]) if r["role_id"] else None
+        label = (r["role_label"] or "").strip()
+        if rid is None and label:
+            hit = by_name.get(role_key(label))
+            if hit:
+                rid = int(hit["id"])
+        if rid is not None:
+            key: Any = ("id", rid)
+        elif label:
+            key = ("name", label)
+        else:
+            key = ("anon", "")
+        slot_map = bucket.setdefault(key, {})
+        cell_key = (date, slot)
+        cur = slot_map.get(cell_key)
+        entry = {
+            "date": date, "slot": slot, "run_id": int(r["id"]),
+            "all_ok": bool(r["all_ok"]), "started_at": r["started_at"],
+            "n_ok": int(r["n_ok"] or 0), "n_fail": int(r["n_fail"] or 0),
+            "n_skip": int(r["n_skip"] or 0),
+            "duration_seconds": float(r["duration_seconds"] or 0),
+            "client_id": r["client_id"],
+            "tasks": tasks_by_run.get(int(r["id"]), []),
+            "runs": 1,
+        }
+        if cur is None:
+            slot_map[cell_key] = entry
+        else:
+            # 同一档跑了多次（手动重跑）：以最后一次为准，但累计次数
+            entry["runs"] = int(cur.get("runs") or 1) + 1
+            slot_map[cell_key] = entry
+
+    # ---- 组装成角色视图 ----
+    out_roles: List[Dict[str, Any]] = []
+    attention: List[int] = []
+
+    def build(key: Any, role: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        slot_map = bucket.get(key, {})
+        day_list = []
+        for d in dates:
+            slots = [v for (dd, _s), v in sorted(slot_map.items()) if dd == d]
+            ok = sum(x["n_ok"] for x in slots)
+            fail = sum(x["n_fail"] for x in slots)
+            skip = sum(x["n_skip"] for x in slots)
+            day_list.append({
+                "date": d, "slots": slots,
+                "runs": sum(int(x.get("runs") or 1) for x in slots),
+                "ok": ok, "fail": fail, "skip": skip,
+                "empty": not slots,
+            })
+        last = ""
+        for d in day_list:
+            for s in d["slots"]:
+                if s["started_at"] and s["started_at"] > last:
+                    last = s["started_at"]
+        acc_id = int(role["account_id"]) if role and role.get("account_id") else None
+        acc = accounts.get(acc_id) if acc_id else None
+        cli = None
+        if role:
+            for c in clients:
+                if c.get("role_id") and int(c["role_id"]) == int(role["id"]):
+                    cli = {"id": c["id"], "name": c.get("name") or c.get("host"),
+                           "online": bool(c.get("online")), "enabled": bool(c.get("enabled"))}
+                    break
+        today_cell = day_list[0] if day_list else None
+        return {
+            "registered": role is not None,
+            "id": (role or {}).get("id"),
+            "name": (role or {}).get("name") or (key[1] if key[0] == "name" else "（未登记的角色）"),
+            "enabled": bool((role or {}).get("enabled", 1)),
+            "tab": (role or {}).get("tab") or "",
+            "server": (role or {}).get("server") or "",
+            "season": (role or {}).get("season") or "",
+            "account_id": acc_id,
+            "account_label": (acc or {}).get("label") or "",
+            "plan": plan.loads_plan((role or {}).get("task_plan")),
+            "plan_text": plan.summary_text((role or {}).get("task_plan")),
+            "client": cli,
+            "days": day_list,
+            "today": today_cell,
+            "last_run_at": last,
+        }
+
+    for r in roles:
+        cell = build(("id", int(r["id"])), r)
+        out_roles.append(cell)
+        t = cell.get("today") or {}
+        # 「需要关注」= 今天跑过、但有失败项（含整轮未完成）
+        if t and not t.get("empty") and (
+                t.get("fail") or any(not s["all_ok"] for s in t["slots"])):
+            attention.append(int(r["id"]))
+    # 有数据但没登记过的角色名也列出来，避免「跑了却看不到」
+    for key in bucket:
+        if key[0] == "id":
+            continue
+        out_roles.append(build(key, None))
+
+    out_roles.sort(key=lambda x: (
+        0 if x.get("registered") else 1,
+        0 if (x.get("today") and not x["today"].get("empty")) else 1,
+        str(x.get("name") or "")))
+    return {"days": days, "dates": dates, "roles": out_roles, "attention": attention}

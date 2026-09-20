@@ -4,24 +4,26 @@
 
 <h1>游戏账号与角色</h1>
 <div class="sub">
-  把你有多少个账号、每个账号下有哪些角色登记在这里，然后在「客户端」页把
-  <b>哪台机器负责哪个账号/角色</b> 指派下去。客户端跑任务前会自动切过去。
+  把你有多少个账号、每个账号下有哪些角色登记在这里，然后在
+  <a href="/clients">客户端</a> 页把 <b>哪台机器负责哪个账号/角色</b> 指派下去，
+  客户端跑任务前会自动切过去。<b>每个角色跑哪些任务</b>在
+  <a href="/roles">角色执行</a> 页单独配置。
 </div>
 
-{% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
-{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
-
 <div class="note">
-  <b>关于「切换」的能力边界（实测结论）：</b>
+  <b>关于「切换」的实测结论（决定了这里该怎么填）：</b>
   <ul>
-    <li><b>换角色 / 换区服 —— 免密</b>：登录页「点击换区」→「选择服务器」→ 选角色 → 确定。
-      所以下面登记的角色名要和游戏里显示的一致，客户端靠它来定位。</li>
+    <li><b>换角色 —— 免密，而且只认「角色名」。</b>
+      登录页「点击换区」→「选择服务器」→ 点角色 → 确定。
+      定位角色<b>只看名字</b>：区服会随着合服改名（今天的 X6014，合服后可能变成别的），
+      用它当判据迟早会失效。所以<b>角色名必须和游戏里显示的完全一致</b>，
+      区服/赛季那两栏只是给你自己看的备注。</li>
     <li><b>换账号 —— 免密但有限制</b>：走「用户中心 → 切换账号」会进网易统一登录页，
       能直接点的是<b>「常用」列表里已经登录过的账号</b>。
-      也就是说：<b>每个账号至少要在这台机器的模拟器里手动登录过一次</b>，
-      之后就能被自动切换。系统不保存任何密码。</li>
-    <li>因此「脱敏账号」这一栏建议填成游戏登录页显示的样子（如 <code>159****4508</code>），
-      客户端就是拿它跟当前登录页上的文字比对来判断「账号对不对」。</li>
+      所以约定是：<b>每个要自动切换的账号，至少在这台机器的模拟器里手动登录过一次</b>。
+      系统不保存任何密码。</li>
+    <li>「脱敏账号」这一栏按游戏登录页显示的样子填（如 <code>159****4508</code>），
+      客户端就是拿它跟当前登录页上的文字比对，判断「账号对不对」。</li>
   </ul>
 </div>
 
@@ -42,7 +44,7 @@
     <div class="grid2">
       <label class="f">
         <span class="name">完整账号（选填，仅用于你自己对账）</span>
-        <input type="text" name="login_name" placeholder="例如：15900004508">
+        <input type="text" name="login_name" placeholder="例如：手机号或邮箱（只你自己看）">
       </label>
       <label class="f">
         <span class="name">分组（选填）</span>
@@ -78,59 +80,47 @@
     <span class="hint">#{{ a.id }}</span>
   </div>
 
-  <!-- 角色表 -->
+  <!-- 角色列表 -->
   <table class="tight">
     <thead><tr>
-      <th>角色名</th><th>区服</th><th>赛季 / 剧本</th><th>页签</th><th>状态</th><th></th>
+      <th>角色名（切换时按它定位）</th><th>执行任务模式</th><th>状态</th><th style="width:190px">操作</th>
     </tr></thead>
     <tbody>
     {% for r in a.roles %}
       <tr>
         <td>
           <form method="post" action="/roles/{{ r.id }}/update" class="inline-form">
-            <input type="hidden" name="_has_enabled" value="1">
-            <input type="text" name="name" value="{{ r.name }}" class="mini" style="width:150px">
-            <input type="text" name="server" value="{{ r.server or '' }}" class="mini"
-                   style="width:80px" placeholder="区服">
-            <input type="text" name="season" value="{{ r.season or '' }}" class="mini"
-                   style="width:100px" placeholder="赛季">
-            <select name="tab" class="mini">
-              {% for t in ('已有角色', '经典服', '青春服', '最近登录', '') %}
-                <option value="{{ t }}" {% if (r.tab or '') == t %}selected{% endif %}>
-                  {{ t or '（未分类）' }}</option>
-              {% endfor %}
-            </select>
-            <label class="mini-cb">
-              <input type="checkbox" name="enabled" value="1" {% if r.enabled %}checked{% endif %}>
-              启用
-            </label>
+            <input type="text" name="name" value="{{ r.name }}" class="mini" style="width:160px">
             <button class="lnk" type="submit">保存</button>
           </form>
+          {% if r.server or r.season %}
+            <div class="hint">{{ r.server }}{% if r.season %} · {{ r.season }}{% endif %}（仅备注）</div>
+          {% endif %}
         </td>
-        <td class="muted">{{ r.server or '—' }}</td>
-        <td class="muted">{{ r.season or '—' }}</td>
-        <td class="muted">{{ r.tab or '—' }}</td>
+        <td><span class="plan-tag {% if r.plan.mode == 'paused' %}off{% endif %}">{{ r.plan_text }}</span></td>
         <td>{% if r.enabled %}<span class="pill ok">启用</span>
             {% else %}<span class="pill gray">停用</span>{% endif %}</td>
         <td>
-          <form method="post" action="/roles/{{ r.id }}/delete" class="inline"
-                onsubmit="return confirm('删除角色「{{ r.name }}」？\n用它的客户端会被改成「不限角色」。')">
-            <button class="lnk danger" type="submit">删除</button>
-          </form>
+          <a href="/roles?hl={{ r.id }}#r{{ r.id }}">任务模式 / 执行情况</a>
+          <details class="more" style="display:inline-block;margin:0 0 0 8px;
+                   border-top:none;padding-top:0;vertical-align:top">
+            <summary>删除</summary>
+            <form method="post" action="/roles/{{ r.id }}/delete">
+              <button class="lnk danger" type="submit">确认删除「{{ r.name }}」</button>
+            </form>
+          </details>
         </td>
       </tr>
     {% endfor %}
     {% if not a.roles %}
-      <tr><td colspan="6" class="muted">这个账号下还没有登记角色。</td></tr>
+      <tr><td colspan="4" class="muted">这个账号下还没有登记角色。</td></tr>
     {% endif %}
     </tbody>
   </table>
 
   <form method="post" action="/accounts/{{ a.id }}/roles" class="role-add">
     <span class="name">新增角色</span>
-    <input type="text" name="name" placeholder="角色名（游戏里显示的，如 X6014龙兴之）" style="width:230px" required>
-    <input type="text" name="server" placeholder="区服" style="width:90px">
-    <input type="text" name="season" placeholder="赛季" style="width:110px">
+    <input type="text" name="name" placeholder="角色名（和游戏里显示的一致）" style="width:230px" required>
     <select name="tab">
       <option value="已有角色">已有角色</option>
       <option value="最近登录">最近登录</option>
@@ -138,10 +128,12 @@
       <option value="青春服">青春服</option>
     </select>
     <button type="submit">添加</button>
+    <span class="hint">区服 / 赛季等细节，以及这个角色跑哪些任务，都在
+      <a href="/roles">角色执行</a> 页配置</span>
   </form>
 
   <details class="more">
-    <summary>编辑账号信息 / 删除账号</summary>
+    <summary>编辑账号信息</summary>
     <form method="post" action="/accounts/{{ a.id }}/update">
       <input type="hidden" name="_has_enabled" value="1">
       <div class="grid2">
@@ -164,10 +156,17 @@
       </label>
       <div class="actions"><button type="submit">保存账号</button></div>
     </form>
+  </details>
 
-    <form method="post" action="/accounts/{{ a.id }}/delete"
-          onsubmit="return confirm('删除账号「{{ a.label }}」及其全部 {{ a.roles|length }} 个角色？\n{% if users.get(a.id) %}注意：有 {{ users[a.id]|length }} 台客户端正在用它，删除后这些客户端会被改成「不指派」。{% endif %}')">
-      <div class="actions"><button class="danger" type="submit">删除账号</button></div>
+  <details class="more">
+    <summary class="lnk danger" style="color:var(--fail)">删除这个账号</summary>
+    <div class="banner warn" style="margin-top:10px">
+      删除后：账号和它下面的 {{ a.roles|length }} 个角色都会消失
+      {%- if users.get(a.id) %}；<b>有 {{ users[a.id]|length }} 台客户端正在用它</b>，
+      这些客户端会被改成「不指派」{% endif %}。此操作不可撤销。
+    </div>
+    <form method="post" action="/accounts/{{ a.id }}/delete">
+      <div class="actions"><button class="danger" type="submit">确认删除「{{ a.label }}」</button></div>
     </form>
   </details>
 </div>

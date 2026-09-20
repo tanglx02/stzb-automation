@@ -2,12 +2,17 @@
 """采集端（脚本）用的 API。整个路由组统一挂 agent 令牌校验，不可能漏。
 
 **拓扑前提（决定了这里所有接口的形状）：**
-服务端跑在公网，采集端跑在内网。服务端**永远连不上**采集端 —— 不是配置问题，
-是 NAT 决定的。所以：
-  · 「客户端是否在线」= 客户端主动上报心跳，服务端记 last_seen（见 /ping）
-  · 「探测客户端当前界面」= 服务端把指令挂在客户端那一行上，客户端下次心跳
+
+默认部署是「内网一台机器同时跑后端 + 采集脚本」，但也支持后端在别处、
+采集端在内网 —— 无论哪种，都可能出现**后端连不上采集端**的情况（NAT、
+防火墙、不在同一网段）。所以这里所有接口都是「采集端主动来问」的形状：
+
+  · 「客户端是否在线」= 客户端主动上报心跳，后端记 last_seen（见 /ping）
+  · 「探测客户端当前界面」= 后端把指令挂在客户端那一行上，客户端下次心跳
     带回去执行，再通过 /probe 回报（见 db.client_request_probe）
   · 「给某台客户端派任务」= 写进 run_requests.client_id，心跳时按 uid 过滤着领
+
+这样写还有一个好处：以后想把后端搬到公网，这套接口一个字都不用改。
 """
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ from typing import Any, Dict, Optional
 from fastapi import (APIRouter, Depends, File, Form, Header, HTTPException,
                      Request, UploadFile)
 
-from . import db, managed, security, settings
+from . import db, managed, plan, security, settings
 from .schemas import AckIn, HeartbeatIn, ProbeResultIn, RunIn
 
 _SAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -56,6 +61,16 @@ def _ident(request: Request) -> Dict[str, Any]:
         "host": (request.headers.get("x_agent_host") or "").strip(),
         "version": (request.headers.get("x_agent_version") or "").strip(),
     }
+
+
+def _role_key(name: Any) -> str:
+    """角色名的归一化比较键（薄封装，实现在 db.role_key）。
+
+    **角色只按名字识别，绝不比较区服** —— 游戏一合服，区服编号就变了
+    （X6014 → X6021），拿旧编号去比会把「其实已经是同一个角色」误判成
+    「需要切换」，客户端于是天天白切一遍。
+    """
+    return db.role_key(name)
 
 
 def _safe_name(name: str, fallback: str = "file.bin") -> str:
@@ -224,34 +239,49 @@ def _heartbeat(request: Request, body: Optional[HeartbeatIn],
             "masked": acc.get("masked") or "",
             "role_id": (role or {}).get("id"),
             "role": (role or {}).get("name") or "",
+            # ★ 区服/赛季只作备注下发：切换角色时**只认角色名**。
+            #   区服会随合服变化（X6014 合服后可能改名），拿它当识别依据迟早失效。
             "server": (role or {}).get("server") or "",
             "season": (role or {}).get("season") or "",
             "tab": (role or {}).get("tab") or "",
         }
+        # 该角色的「执行任务模式」：本轮跑哪些任务、在哪些档位跑
+        if role:
+            tp = plan.loads_plan(role.get("task_plan"))
+            target["task_plan"] = tp
+            if tp["mode"] == plan.MODE_PAUSED:
+                target["paused"] = True
 
     # ---- 需不需要切？----
-    # 判定规则很保守：只要客户端报上来的「脱敏账号」或「角色名」和目标对不上，
-    # 就让它切。客户端那边还会自己再比一次（它知道自己当前真实状态）。
+    # 判定很保守：客户端报上来的「脱敏账号」或「角色名」跟目标对不上就让它切。
+    # 客户端那边还会自己再比一次（它知道自己当前的真实状态）。
+    #
+    # ★ 角色一律**按名字**比 —— 区服会被游戏改掉（合服），角色名不会。
     switch_needed = False
     reason = ""
     if target:
-        cur = (status or {}).get("current") or {}
-        if cli.get("probe", {}).get("force_switch"):
-            switch_needed = True
-            reason = "管理端要求强制切换"
-        elif not cur.get("masked") and not cur.get("role"):
-            # 客户端还没进游戏、状态未知 —— 不算「不一致」，让它照常启动
+        if target.get("paused"):
+            # 角色被设为「暂停执行」：连切换都不必做，切过去也是白跑
             switch_needed = False
-            reason = "客户端尚未上报当前账号/角色"
+            reason = "角色当前被设为「暂停执行」，本轮不切换"
         else:
-            if target.get("masked") and cur.get("masked") \
-                    and str(target["masked"]) != str(cur["masked"]):
+            cur = (status or {}).get("current") or {}
+            if cli.get("probe", {}).get("force_switch"):
                 switch_needed = True
-                reason = "账号不一致（目标 %s，当前 %s）" % (target["masked"], cur["masked"])
-            elif target.get("role") and cur.get("role") \
-                    and str(target["role"]) != str(cur["role"]):
-                switch_needed = True
-                reason = "角色不一致（目标 %s，当前 %s）" % (target["role"], cur["role"])
+                reason = "管理端要求强制切换"
+            elif not cur.get("masked") and not cur.get("role"):
+                # 客户端还没进游戏、状态未知 —— 不算「不一致」，让它照常启动
+                switch_needed = False
+                reason = "客户端尚未上报当前账号/角色"
+            else:
+                if target.get("masked") and cur.get("masked") \
+                        and str(target["masked"]) != str(cur["masked"]):
+                    switch_needed = True
+                    reason = "账号不一致（目标 %s，当前 %s）" % (target["masked"], cur["masked"])
+                elif target.get("role") and cur.get("role") \
+                        and _role_key(target["role"]) != _role_key(cur["role"]):
+                    switch_needed = True
+                    reason = "角色不一致（目标 %s，当前 %s）" % (target["role"], cur["role"])
 
     # ---- 一次性指令 ----
     command = db.client_probe_take(int(cli["id"])) or None
@@ -404,6 +434,15 @@ def create_run(request: Request, body: RunIn,
     rid = int(cli["role_id"]) if cli and cli.get("role_id") else None
     acc = db.account_get(aid) if aid else None
     role = db.role_get(rid) if rid else None
+    # 服务端没指派过角色时，按**角色名**把这条记录归位 —— 这样即使没配置指派，
+    # 「角色执行」页也能看到这个角色每天跑得怎么样。
+    if role is None and (body.role_label or "").strip():
+        hit = db.role_find_by_name(body.role_label)
+        if hit:
+            role = hit
+            rid = int(hit["id"])
+            if acc is None and hit.get("account_id"):
+                acc = db.account_get(int(hit["account_id"]))
 
     rid_run = db.run_create({
         "client_run_id": body.client_run_id,

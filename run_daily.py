@@ -49,6 +49,7 @@ from stzb.heartbeat import Heartbeat, StatusBox   # noqa: E402
 from stzb.identity import Identity, read_assignment_cache, write_assignment_cache
 from stzb.remote_config import apply_remote, pick_job   # noqa: E402
 from stzb.report import RunReport                 # noqa: E402
+from stzb import task_plan as tplan               # noqa: E402
 from stzb.tasks import TASKS, run_all             # noqa: E402
 from stzb.ui import Ui                            # noqa: E402
 
@@ -747,6 +748,45 @@ def main():
                 if skipped:
                     log("  · 以下任务在远端配置里被关闭，本轮跳过：%s" % ",".join(skipped))
                     only = [k for k in only if enabled.get(k, True)] or None
+
+    # ------------------------------------------------ 角色「执行任务模式」
+    # 后端可以给**每个角色**单独指定「跑哪些任务 / 在哪些档位跑 / 是否暂停」。
+    # 优先级：控制台手动派的待执行任务（job）> 角色任务模式 > 全局配置与档位。
+    #
+    # 为什么 job 优先：那是「人在控制台点了执行，现在就要跑」，
+    # 角色的日常计划（比如「只在 00:00 档跑」）不该把它拦住。
+    if assignment and not job:
+        tp = assignment.get("task_plan")
+        if isinstance(tp, dict) and tp:
+            role_name = assignment.get("role") or "?"
+            if tplan.is_paused(tp):
+                log("· 角色「%s」的执行任务模式是「暂停执行」→ 本轮不跑任何任务"
+                    % role_name)
+                if hb_session:
+                    hb_session.box.set(state="idle", busy=False,
+                                       note="角色已设为暂停执行")
+                return 0
+            if not tplan.allows_slot(tp, slot):
+                log("· 角色「%s」只在 %s 档运行，当前是 %s 档 → 本轮跳过"
+                    % (role_name, "、".join(tplan.normalize(tp)["slots"]), slot))
+                if hb_session:
+                    hb_session.box.set(state="idle", busy=False,
+                                       note="不在该角色的运行档位")
+                return 0
+            picked = tplan.selected_tasks(tp, cfg.get("tasks"))
+            if picked is not None:
+                if not picked:
+                    log("  ! 角色「%s」的执行任务模式是「自定义」，但一个任务都没勾选"
+                        % role_name)
+                    log("    到后台「角色执行」页给它勾上要跑的任务（或改回「跟随后端全局配置」）。")
+                    if hb_session:
+                        hb_session.box.set(state="idle", busy=False,
+                                           note="角色任务模式未勾选任何任务")
+                    return 0
+                only = list(picked)
+                force = True        # 任务范围被收窄了，不再看「今天这一档跑过没」
+                log("· 按角色执行任务模式限定本轮任务：%s（%s）"
+                    % ("、".join(only), tplan.summary_text(tp)))
 
     st = load_state()
     if not force and not only:

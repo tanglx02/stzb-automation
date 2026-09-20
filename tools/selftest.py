@@ -2305,6 +2305,78 @@ def test_junqing_and_recruit():
           _price_in_btn_row([far_num], itc("招募1次", 700, 906)) is None)
 
 
+def test_current_role():
+    print("\n[32] 读「游戏内角色名」（按角色名识别的身份判据）")
+    # 2026-09-20 实测结论：游戏里**只有区服可选，角色名不出现在登录链路上**，
+    # 角色名只出现在进游戏后的主城左上角（「势力值」正上方那一行）。
+    # 所以「按角色名识别」= 切过去之后回读这一行做校验。
+    import stzb.account as _A
+
+    # 帧来自真实主城 OCR：角色名在「势力值」上方，右侧还有一堆资源计数
+    frame = [
+        itc("云魇丨奈子", 376, 19),          # ← 真角色名
+        itc("·19／35", 549, 19),
+        itc("酽一木+1675、、铁+2485", 849, 20),
+        itc("@400亞", 1464, 35),             # ← 曾经被误读成角色名的那个
+        itc("亞0148万", 1783, 35),
+        itc("．18：24：31", 559, 49),
+        itc("》忄势力值154", 297, 51),        # ← 锚点
+        itc("任务", 58, 109),
+    ]
+
+    class _U:
+        def __init__(self, items):
+            self._items = items
+
+        def ocr(self, tag="x"):
+            return self._items, ""
+
+    got = _A.current_role(_U(frame))
+    check("从主城读到角色名「云魇丨奈子」", got == "云魇丨奈子", repr(got))
+    check("★ 不会被右上角的资源计数抢走（曾经读成「400亞」）", got != "400亞", repr(got))
+
+    # 名字与「势力值」被 OCR 并成一条时，也要能抠出来
+    merged = [itc("云魇丨奈子势力值154", 380, 40)]
+    check("名字与「势力值」并成一条时能抠出来",
+          _A.current_role(_U(merged)) == "云魇丨奈子", repr(_A.current_role(_U(merged))))
+
+    # 登录页/面板上读不到 → 必须返回 None（绝不瞎猜）
+    login = [itc("网易游戏", 1019, 300), itc("常用", 1340, 432),
+             itc("159****4508", 807, 459), itc("登录", 959, 683),
+             itc("其他账号登录", 960, 813)]
+    check("登录页上读不到角色名 → 返回 None",
+          _A.current_role(_U(login)) is None, repr(_A.current_role(_U(login))))
+    check("空屏幕 → 返回 None", _A.current_role(_U([])) is None)
+
+    # 装饰噪声前缀要清掉（只剥非字母数字/非汉字的标点；
+    # 「忄」是 CJK 部首，属汉字区，按设计保留）
+    check("剥掉角色名前的标点装饰",
+          _A._clean_role_name("》忄势力值") == "忄势力值",
+          repr(_A._clean_role_name("》忄势力值")))
+    check("剥掉纯标点前缀/后缀",
+          _A._clean_role_name("·云魇丨奈子·") == "云魇丨奈子",
+          repr(_A._clean_role_name("·云魇丨奈子·")))
+    # 「像名度」：中文多才算名字，右栏计数（纯数字）必须被压下去
+    check("「云魇丨奈子」的像名度 > 「400亞」",
+          _A._name_likeness("云魇丨奈子") > _A._name_likeness("400亞"))
+    check("右栏计数「19／35」不像名字（像名度 <= 0）",
+          _A._name_likeness("19／35") <= 0, repr(_A._name_likeness("19／35")))
+
+    # ---- 登录链路的两屏必须分得开（这是「切不了账号」的根因所在）----
+    # 「点击换区」只在**游戏自己的登录页**上；网易统一登录页上没有它。
+    check("网易登录页不算「游戏登录页」（没有点击换区）",
+          not _A._has(login, *_A.KW_START_GAME)
+          and not _A._has(login, *_A.KW_AREA_ENTRY))
+    game_login = [itc("三国率土之滨", 640, 200), itc("X6014 龙兴之地", 500, 430),
+                  itc("点击换区", 400, 430), itc("开始游戏", 512, 490)]
+    check("游戏登录页能认出来（有开始游戏 + 点击换区）",
+          _A._has(game_login, *_A.KW_START_GAME)
+          and _A._has(game_login, *_A.KW_AREA_ENTRY))
+    # ⚠️ 主城上 (60,62) 是「任务」按钮，不是用户中心入口 —— 这条必须记住
+    check("角色名锚点用的是「势力值」，不是左上角那个位置",
+          _A.ROLE_NAME_ANCHOR == "势力值")
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -2344,6 +2416,7 @@ if __name__ == "__main__":
     test_cleanup()
     test_panel_ocr_fallback()
     test_junqing_and_recruit()
+    test_current_role()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)
