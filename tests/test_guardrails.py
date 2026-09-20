@@ -314,6 +314,75 @@ def inspect_source(fn):
         return ""
 
 
+def test_role_name_vertical_normalized():
+    """角色名的「竖线类字符」必须在前后端收敛到同一个形状。
+
+    为什么这条要进护栏（2026-09-20 实机发现）：
+      游戏角色名大量用中文竖线「丨」(U+4E28) 当中缀（「执剑丨青山」「云魇丨奈子」），
+      而**人在后台手打时几乎必然打成 ASCII 竖线 `|`** —— 两个码点长得几乎一样，
+      眼睛分不出来。若不做归一化，同一个角色在后端视角会变成两个人：
+        · 后端认为是两个不同角色 → 自动发现重复建角色；
+        · 指派比对 `role_key` 永远不等 → **天天白切一遍**（正是「只认角色名」
+          这套设计要防的问题）。
+    实测：不归一化时「执剑|青山」vs「执剑丨青山」只得 0.809 分，不是 1.0。
+    """
+    print("== 角色名竖线归一化（前后端一致）==")
+    ok = True
+
+    from stzb import account as A
+    from app import db as _db
+
+    # ① 两侧的「竖线字符表」必须一字不差
+    cli = getattr(A, "_VERT_CHARS", None)
+    srv = getattr(_db, "_VERT_CHARS", None)
+    if not cli or not srv:
+        print("   ✗ 有一侧没有 _VERT_CHARS：客户端=%r 服务端=%r" % (cli, srv))
+        return False
+    if set(cli) != set(srv):
+        print("   ✗ 两侧竖线字符表不一致")
+        print("      客户端：%s" % cli)
+        print("      服务端：%s" % srv)
+        ok = False
+    else:
+        print("   ✓ 两侧竖线字符表一致（%d 个字符）" % len(cli))
+
+    # ② 统一后的形状必须相同
+    if A._norm_vert("a|b丨c｜d") != _db.normalize_vert("a|b丨c｜d"):
+        print("   ✗ 两侧归一化结果不同：%r vs %r"
+              % (A._norm_vert("a|b丨c｜d"), _db.normalize_vert("a|b丨c｜d")))
+        ok = False
+    else:
+        print("   ✓ 两侧归一化结果一致：%r" % _db.normalize_vert("a|b丨c｜d"))
+
+    # ③ 手打 ASCII 竖线 与 OCR 读出的中文竖线，必须判为同一个角色
+    pairs = [("执剑丨青山", "执剑|青山"), ("云魇丨奈子", "云魇|奈子"),
+             ("执剑丨青山", "执剑｜青山")]
+    for a, b in pairs:
+        ka, kb = _db.role_key(a), _db.role_key(b)
+        sc = A._one_score(a, b)
+        if ka != kb or sc < 1.0:
+            print("   ✗ 「%s」与「%s」没收敛：role_key %r vs %r，score=%.3f"
+                  % (a, b, ka, kb, sc))
+            ok = False
+        else:
+            print("   ✓ 「%s」≡「%s」（score=1.0）" % (a, b))
+
+    # ④ ★ 反向：绝不能把真正的字母也归一化掉（I / l / 1 不在表里）
+    for a, b in [("Iron", "lron"), ("lulu", "1u1u")]:
+        if _db.role_key(a) == _db.role_key(b):
+            print("   ✗ 误伤：把「%s」和「%s」合并成了同一个角色" % (a, b))
+            ok = False
+    for bad in "Il1":
+        if bad in (cli or ""):
+            print("   ✗ 危险：竖线字符表里混进了字母/数字 %r，会误伤真名字" % bad)
+            ok = False
+    if ok:
+        print("   ✓ 未误伤字母名字（`I`/`l`/`1` 都不在表内）")
+
+    print("   %s" % ("✓ 通过了" if ok else "✗ 失败"))
+    return ok
+
+
 def main():
     results = []
     for fn in (test_whitelist_matches, test_account_section_is_local_only,
@@ -321,7 +390,8 @@ def main():
                test_offline_derived_from_last_seen,
                test_no_plaintext_passwords_anywhere,
                test_console_csp_allows_own_scripts,
-               test_realtime_contract):
+               test_realtime_contract,
+               test_role_name_vertical_normalized):
         try:
             results.append((fn.__name__, fn()))
         except Exception:

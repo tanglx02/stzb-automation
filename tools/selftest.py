@@ -2532,6 +2532,38 @@ def test_role_dialog():
           "%r %r" % (ok4, u4.tapped))
 
 
+def test_role_vert_norm():
+    """角色名里的「竖线类字符」必须先统一，再比较。
+
+    实测背景（2026-09-20 实机）：游戏角色名大量用中文竖线「丨」(U+4E28)
+    （「执剑丨青山」「云魇丨奈子」），连续三次 OCR 都稳定读出 U+4E28。
+    而**人在后台手打时几乎必然打成 ASCII 竖线 `|`** —— 两个码点长得几乎一样。
+    不统一的后果：同一个角色被判成两个人 → 自动发现重复建角色、
+    指派比对永远不等 → 天天白切一遍（正是「只认角色名」要防的事）。
+    """
+    print("\n[35] 角色名竖线归一化（手打 `|` ≡ OCR 读出的「丨」）")
+    import stzb.account as _A
+
+    # 各种竖线写法都要收敛
+    for a, b in [("执剑丨青山", "执剑|青山"), ("执剑丨青山", "执剑｜青山"),
+                 ("云魇丨奈子", "云魇|奈子"), ("云魇丨奈子", "云魇│奈子")]:
+        check("「%s」≡「%s」" % (a, b), _A._one_score(a, b) == 1.0,
+              "score=%.3f" % _A._one_score(a, b))
+
+    # 归一化后的形状统一成中文竖线
+    check("_clean_role_name 把 ASCII 竖线统一成「丨」",
+          _A._clean_role_name("执剑|青山") == "执剑丨青山",
+          repr(_A._clean_role_name("执剑|青山")))
+
+    # ★ 反向护栏：绝不能把真正的字母/数字也归一化掉
+    for bad in "Il1":
+        check("竖线字符表里不含字母/数字 %r（否则会误伤真名字）" % bad,
+              bad not in _A._VERT_CHARS)
+    check("「Iron」与「lron」仍是两个不同名字",
+          _A._one_score("Iron", "lron") < 0.99,
+          "score=%.3f" % _A._one_score("Iron", "lron"))
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -2573,6 +2605,7 @@ if __name__ == "__main__":
     test_junqing_and_recruit()
     test_current_role()
     test_role_dialog()
+    test_role_vert_norm()
     test_run_liveness()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))

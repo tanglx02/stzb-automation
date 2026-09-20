@@ -218,9 +218,15 @@ ROLE_NAME_TOP_Y = 60             # 角色名在屏幕最顶部这一带
 
 
 def _clean_role_name(s: str) -> str:
-    """清掉角色名前后沾上的图标/装饰噪声（如「》忄势力值154」这种前缀）。"""
+    """清掉角色名前后沾上的图标/装饰噪声（如「》忄势力值154」这种前缀）。
+
+    ★ 顺便把「竖线类」字符统一成中文竖线「丨」—— 这是为了让**读出来的名字**
+      与**后端登记的名字**处于同一形状。读名字只是为了上报/比对，
+      统一形状不会影响识别本身（见 `_VERT_CHARS`）。
+    """
     t = re.sub(r"^[^\w\u4e00-\u9fff]+", "", (s or "").strip())
     t = re.sub(r"[^\w\u4e00-\u9fff]+$", "", t)
+    t = _norm_vert(t)
     return t.strip()
 
 
@@ -754,6 +760,26 @@ def _pick_tab(ui, tab: str) -> None:
 #   合服后 X6014 可能变成完全不同的编号，比具体值就等于埋了个定时炸弹。
 _SRV_PREFIX_RE = re.compile(r"^[A-Za-z]{1,3}\d{3,5}")
 
+# 「竖线类」字符统一成一个形状 —— 这是角色名匹配里**必须**做的一步。
+#
+# 实测（2026-09-20）：游戏角色名大量用「丨」(U+4E28 CJK 汉字) 当中缀，
+# 连续三次 OCR 都稳定读出 U+4E28（不是渲染问题，是真的汉字）。
+# 而**用户在后台登记时几乎必然打成 ASCII 竖线 `|`** —— 两个码点长得几乎一样。
+# 不归一化的后果：客户端读「执剑丨青山」、后端登记「执剑|青山」，
+# 归一化后不相等（实测只得 0.809 分而非 1.0），会退到模糊匹配这条脆弱路径，
+# 甚至在串更长时直接匹配失败 → **天天白切一遍**，正是「只认角色名」要防的问题。
+# ⚠ 只归一化「确定是竖线形状」的字符，**绝不包含 `I` / `l` / `1`** ——
+#   那些可能是名字里真正的字母。与后端 server/app/db.py:_VERT_CHARS 保持一致
+#   （护栏测试盯着两边一致）。
+_VERT_CHARS = "|丨｜│┃∣❘ㅣǀ"
+_VERT_RE = re.compile("[%s]" % re.escape(_VERT_CHARS))
+_VERT_CANON = "丨"          # 统一的形状：中文竖线
+
+
+def _norm_vert(s: str) -> str:
+    """把所有「竖线类」字符统一成中文竖线「丨」。见 `_VERT_CHARS` 的说明。"""
+    return _VERT_RE.sub(_VERT_CANON, str(s or ""))
+
 
 def _name_variants(role: str) -> List[str]:
     """角色名的等价写法。
@@ -771,8 +797,13 @@ def _name_variants(role: str) -> List[str]:
 
 def _one_score(text: str, key: str) -> float:
     """条目文本 vs 一个名字写法的匹配分。"""
-    t = fix_ocr(norm(text), drop=True)
-    k = fix_ocr(norm(key))
+    # ★ 先统一竖线，再走常规归一化。
+    #   顺序不能反：core.norm() 会把 ASCII `|` 丢掉、却保留中文 `丨`，
+    #   不先统一的话「执剑|青山」会变成「执剑青山」、「执剑丨青山」保持原样，
+    #   两边永远不相等（实测只得 0.809）。先统一成 `丨` 后 norm 不会丢它，
+    #   于是「手打 | / OCR 读 丨」能拿到 1.0 的精确匹配。
+    t = fix_ocr(norm(_norm_vert(text)), drop=True)
+    k = fix_ocr(norm(_norm_vert(key)))
     if not t or not k:
         return 0.0
     if t == k:
@@ -783,7 +814,8 @@ def _one_score(text: str, key: str) -> float:
         if len(k) < 2:
             return 0.0
         return 0.80 + 0.18 * (len(k) / len(t))
-    return match_score(text, key)
+    # 模糊匹配也要喂**统一过竖线**的字符串，否则会退回原始的 `|` / `丨` 差异
+    return match_score(_norm_vert(text), _norm_vert(key))
 
 
 def _find_role(ui, role: str) -> Tuple[Optional[TextItem], str]:
