@@ -223,17 +223,20 @@ venv\Scripts\python.exe agent.py
 ## 部署后端控制台（可选）
 
 不部署也完全能用 —— 采集端照常跑任务，报告留在本机。
-部署后多的是：**在外面看结果、远程改配置、排下一次任务**。
+部署后多的是：**在手机上/别的电脑上看结果、远程改配置、排下一次任务**。
 
 | 部署方式 | 适合 | 说明 |
 |---|---|---|
-| **Docker Compose（Debian/Ubuntu）** | 公网服务器（推荐） | 应用 + Caddy 自动 HTTPS，一条命令起全套 |
-| **Windows 裸机** | 自己家里/办公室的机器 | `setup_server.bat` + `start_server.bat` |
-| **Linux 裸机** | 不想用 Docker | systemd + 反代 |
+| **Windows 裸机（内网）** | 自己家里/办公室，**默认走这条** | `setup_server.bat` + `start_server.bat`，绑 `0.0.0.0:8000`，手机开 `http://<内网IP>:8000` |
+| **Linux 裸机** | 有台常开的 Linux 机器 | systemd + 裸 uvicorn（内网）/ 加 Caddy（公网） |
+| **Docker Compose** | 想在外地（4G）也能看，属**可选进阶** | 应用 + Caddy 自动 HTTPS，需域名 + 服务器 |
+
+> **内网部署不需要域名、证书、反向代理** —— 局域网里跑 HTTP 就够了。
+> 只有确实要「在外地也能看」时才上公网那套。
 
 详细步骤见 **[server/README.md](server/README.md)**（三种方式都有）。
 
-绑定：采集端双击 `config_tool.bat` → 「后端托管」→ 填服务器地址与令牌 →
+绑定：采集端双击 `config_tool.bat` → 「后端托管」→ 填后端地址（内网填 `http://<内网IP>:8000`）与令牌 →
 它会**当场验证**，通过才写入。
 
 ---
