@@ -44,6 +44,9 @@ from stzb.cleanup import cleanup_by_days, parse_cfg as parse_cleanup_cfg, summar
 from stzb.cloud import upload_run, load_last_report, CloudClient, CloudError, hostname
 from stzb.config import load                      # noqa: E402
 from stzb.core import DEFAULT_ADB, GAME_PKG, Device   # noqa: E402
+from stzb.devices import (DeviceInfo, ensure_awake,  # noqa: E402
+                          ensure_frame_1920x1080, force_landscape,
+                          probe_device, restore_stay_on)
 from stzb.emulator import MuMu                    # noqa: E402
 from stzb.heartbeat import StatusBox             # noqa: E402
 from stzb.realtime import BUSY_PREFIX, Realtime   # noqa: E402
@@ -66,6 +69,65 @@ LOCK = run_lock_path(ROOT)
 LOG_DIR = os.path.join(ROOT, "logs")
 SHOT_DIR = os.path.join(ROOT, "logs", "shots")
 REPORT_DIR = os.path.join(ROOT, "logs", "reports")
+
+# ------------------------------------------------------------------ 目标设备
+#
+# ★ 为什么要有这个东西（2026-09-21 补）：
+#   多设备（模拟器 + USB 实体机）上线后，`run_daily` 原来**只能靠
+#   `config.device.serial_candidates` 去猜** —— 而实体机的 serial
+#   （形如 `340436524100AJ8`，**没有冒号**）根本不在那份候选表里，
+#   于是"在手机上跑一轮"这件事**没有办法表达**：它要么连不上，
+#   要么连到模拟器上去（在另一台设备上跑 = 在别的号上花资源，
+#   比直接失败严重得多）。
+#
+#   所以这里给一个显式的目标：`--serial <号>`（或环境变量
+#   `STZB_DEVICE_SERIAL`，供后台派活时透传）。
+#   指定之后：
+#     · 只连这一台，连不上就如实失败，**绝不退回其他设备**；
+#     · 目标不是模拟器形态时，**完全不碰 MuMu**（不去启动/关闭模拟器）。
+TARGET_SERIAL = ""
+
+
+def _emu_shape(serial: str) -> bool:
+    """这个 serial 是不是「模拟器形态」（host:port 或 emulator-N）。
+
+    判据与 `stzb/emulator._EMU_SHAPE_RE` 保持一致：**实体机没有冒号**
+    （`340436524100AJ8`），模拟器一定有（`127.0.0.1:7555` / `emulator-5554`）。
+    这条判断只有「要不要去动 MuMu」一个用途，不参与设备识别。
+    """
+    import re as _re
+    s = (serial or "").strip()
+    if not s:
+        return True                      # 没指定 = 按老规矩，当模拟器处理
+    return bool(_re.match(r"^(?:emulator-\d+|[A-Za-z0-9._-]+:\d+)$", s, _re.I))
+
+
+def _cand(cfg):
+    """该用哪份 serial 候选表。
+
+    指定了目标设备就**只给它一个** —— 不给任何退路。多设备场景下
+    「猜错了就换一台」是最危险的行为：那意味着你以为在 A 号上跑，
+    实际在 B 号上把资源花了。
+    """
+    if TARGET_SERIAL:
+        return [TARGET_SERIAL]
+    return cfg.get("device.serial_candidates")
+
+
+def _mk_device(cfg, shot_dir=None):
+    """按「目标设备」建一个 Device。所有创建点都走这里，别再各写一份。
+
+    目标为空时行为与老代码**逐字一致**（候选表 + 默认 serial），
+    这样没配多设备的老用户不会因为这次改动改变任何行为。
+    """
+    kw = {"adb": cfg.get("device.adb") or DEFAULT_ADB,
+          "serial_candidates": _cand(cfg)}
+    if TARGET_SERIAL:
+        kw["serial"] = TARGET_SERIAL
+    if shot_dir:
+        kw["shot_dir"] = shot_dir
+    return Device(**kw)
+
 
 class RunLock:
     """同一台模拟器同一时刻只允许一个实例操控。
@@ -200,9 +262,7 @@ def cmd_status(cfg):
     online = emu.adb_online()
     print("ADB 在线设备：%s" % (online or "无"))
     if online:
-        dev = Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
-                     serial_candidates=cfg.get("device.serial_candidates"),
-                     shot_dir=SHOT_DIR)
+        dev = _mk_device(cfg, SHOT_DIR)
         if dev.connect():
             fg = dev.foreground()
             print("前台窗口：%s" % (fg or "读不到"))
@@ -596,6 +656,11 @@ def main():
     ap.add_argument("--shutdown-after", action="store_true", help="跑完关掉模拟器")
     ap.add_argument("--keep-running", action="store_true", help="跑完保持模拟器开着")
     ap.add_argument("--no-emulator", action="store_true", help="不动模拟器（自己已开好）")
+    ap.add_argument("--serial", default="", metavar="ADB_SERIAL",
+                    help="指定目标设备的 ADB serial（如 340436524100AJ8 或 "
+                         "127.0.0.1:7555）。指定后只连这一台、连不上就失败，"
+                         "绝不退回其他设备；目标不是模拟器时完全不碰 MuMu。"
+                         "也可用环境变量 STZB_DEVICE_SERIAL。")
     ap.add_argument("--open-report", action="store_true", help="跑完自动打开报告")
     ap.add_argument("--no-upload", action="store_true", help="本轮不上传到后端")
     ap.add_argument("--no-cleanup", action="store_true",
@@ -613,6 +678,14 @@ def main():
     ap.add_argument("--whoami", action="store_true",
                     help="打印本机的客户端标识（后台靠它认机器）")
     args = ap.parse_args()
+
+    # ★ 目标设备：命令行优先，其次是环境变量（后台派活/多设备调度用环境变量透传，
+    #   这样不用去改 config.json —— 那会污染本机配置，别人跑的时候又忘了改回来）。
+    global TARGET_SERIAL
+    TARGET_SERIAL = (args.serial or os.environ.get("STZB_DEVICE_SERIAL") or "").strip()
+    if TARGET_SERIAL:
+        print("· 目标设备：%s（%s）" % (TARGET_SERIAL,
+                                     "模拟器" if _emu_shape(TARGET_SERIAL) else "实体机"))
 
     if args.list:
         for k, m in TASKS.items():
@@ -717,9 +790,7 @@ def main():
         # 起后台心跳线程：跑任务期间持续上报在线状态，并接收后台指令
         rt_session = RealtimeSession(client, identity, mode, log)
         rt_session.bind_ui_factory(lambda: Ui(
-            Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
-                   serial_candidates=cfg.get("device.serial_candidates"),
-                   shot_dir=shot_dir),
+            _mk_device(cfg, shot_dir),
             cfg, logger=log, dry_run=True))
         try:
             rt_session.start()
@@ -862,6 +933,14 @@ def main():
         report.env_info(客户端标识=identity.uid)
 
     emu_started_by_us = False
+    # 实体机「插电常亮」的原值（ensure_awake 改过才有值，收尾要还原）。
+    # ★ 必须在这里、也就是**任何 _bail 可能被调用之前**初始化：
+    #   _bail 里会读它做还原，而 _bail 最早在「检查模拟器」那一段就会被调到。
+    #   放到后面（靠近使用时）初始化 → 早期失败路径会 NameError。
+    stay_on_restore = None
+    # ADB 可执行文件路径：提前取好，供 _bail 里的「还原插电常亮」使用
+    # （_bail 可能在 2.4 段之前就被调到，所以不能等到那里才赋值）。
+    _adb = cfg.get("device.adb") or DEFAULT_ADB
     shutdown_after = (args.shutdown_after
                       or (emu_cfg.get("shutdown_after") == "always" and not args.keep_running))
     auto_shutdown_auto = (emu_cfg.get("shutdown_after", "auto") == "auto"
@@ -876,6 +955,13 @@ def main():
         """
         rlog("!! %s，退出。" % reason)
         report.env_info(结果=reason)
+        # 启动阶段失败也要把「插电常亮」还原回去 —— 否则用户的手机会一直
+        # 插着 USB 就常亮，而他根本不知道是谁改的（下次再跑也不会修回来）。
+        try:
+            if stay_on_restore is not None:
+                restore_stay_on(_adb, dev.serial, stay_on_restore, logger=rlog)
+        except Exception:                        # noqa: BLE001
+            pass
         p = report.write_all(REPORT_DIR, cfg.get("logging.keep_days", 14))
         rlog("· 报告：%s" % p["html"])
         _do_cleanup(cfg, rlog, skip=args.no_cleanup)
@@ -885,10 +971,21 @@ def main():
         return code
 
     # ---------------------------------------------------------------- 1. 模拟器
+    #
+    # ★ 「这一轮要不要管模拟器」只在这里算一次，启动段和收尾段**共用**它。
+    #   原来收尾段自己写了一遍 `if not args.no_emulator`，一旦这里再加条件
+    #   （比如「目标是实体机就别碰模拟器」），两处就会分叉 —— 后果是
+    #   在手机上跑完一轮，收尾却把用户的模拟器关掉了。
+    manage_emu = not args.no_emulator and not (
+        TARGET_SERIAL and not _emu_shape(TARGET_SERIAL))
     if rt_session:
         rt_session.box.set(state="starting", busy=True, note="正在准备模拟器")
     if args.no_emulator:
         rlog("· 按 --no-emulator 跳过模拟器管理，直接连 ADB")
+    elif not manage_emu:
+        # 目标是一台**实体机**（serial 没有冒号）→ 一眼都不要看 MuMu。
+        # 否则轻则白等一次启动，重则把正在跑的模拟器关掉。
+        rlog("· 目标设备 %s 是实体机 → 不碰模拟器，直接连 ADB" % TARGET_SERIAL)
     else:
         rlog("· 检查模拟器…")
         if args.cold or emu_cfg.get("cold_restart"):
@@ -907,16 +1004,81 @@ def main():
             report.env_info(模拟器启动耗时="%.0f 秒" % (time.time() - t0))
 
     # ---------------------------------------------------------------- 2. ADB
-    dev = Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
-                 serial_candidates=cfg.get("device.serial_candidates"),
-                 shot_dir=shot_dir)
+    dev = _mk_device(cfg, shot_dir)
     if not dev.connect(retries=6, wait=2.0):
         return _bail(3, "ADB 连接失败")
     rlog("· ADB 已连接：%s" % dev.serial)
     report.env_info(ADB设备=dev.serial)
     if rt_session:
         rt_session.box.set(state="starting", note="ADB 已连接，准备打开游戏")
-        rt_session.box.patch_device(emulator_running=True, adb_serial=dev.serial)
+        # emulator_running 要如实报：跑实体机时它就不是模拟器，
+        # 硬写 True 会让后台的设备卡片显示成「模拟器运行中」而误导排查。
+        rt_session.box.patch_device(emulator_running=_emu_shape(dev.serial),
+                                    adb_serial=dev.serial)
+
+    # ------------------------------------------- 2.4 亮屏 / 防息屏（仅实体机）
+    #
+    # ★ 模拟器不需要这一条（它的屏幕永远不会睡），但**实体手机会**。
+    #   手机在任务中途息屏 → screencap 拿到锁屏/黑屏 → OCR 一行都读不到 →
+    #   表现成「界面认不出来」，最后报一个跟真实原因毫不相干的错。
+    #   所以只对实体机做，且锁屏时**如实停下**（不猜锁屏密码）。
+    if not _emu_shape(dev.serial):
+        aw = ensure_awake(_adb, dev.serial, logger=rlog)
+        report.env_info(屏幕=aw.get("state"),
+                        锁屏=("是" if aw.get("locked") else
+                              ("未知" if aw.get("locked") is None else "否")))
+        if not aw.get("ok"):
+            return _bail(3, aw.get("message") or "设备屏幕不可用（未做任何点击）")
+        if aw.get("changed"):
+            stay_on_restore = aw.get("stay_on_before")
+
+    # ------------------------- 2.5 画面尺寸/方向对齐（实体机的硬前提）
+    #
+    # ★ 为什么必须卡在「跑之前」，而不是等出问题再说：
+    #   项目所有坐标写死 1920×1080。实体机原生 1080×2400 竖屏，
+    #   不对齐就直接跑 = 每一次点击都落在错误的像素上，而且**不会报错** ——
+    #   表现为「点到别的按钮上」，最坏是点到花钱的键（税收「20/强征」、
+    #   市井玉符购买）。所以这里宁可跑不起来，也绝不在未对齐的屏幕上点第一下。
+    #
+    # ★★ 判据必须是**实测画面**，不能是 `wm size` 的 override 字符串
+    #   （2026-09-21 真机抓到，是真 bug）：
+    #     `wm size 1080x1920` 的 override 字符串**不随物理方向变化** ——
+    #     手机竖着时截图 1080×1920、横着时 1920×1080，而 `wm size` 两次
+    #     都回显 `Override size: 1080x1920`。只比字符串的检查**在竖屏时也会通过**，
+    #     游戏于是按竖屏排版，写死的坐标全部错位。
+    #     实测踩到：跑批卡在「认不出的界面」空转 4 分钟、连点 14 次 ✕ 全打偏，
+    #     而日志里没有任何一行提到方向 —— 极难查。
+    #   所以实体机走 `ensure_frame_1920x1080()`：它把两个候选 override 都试一遍，
+    #   每试一个就截一帧验尺寸，留那个真能出 1920×1080 的（旋转是哪个不用猜）。
+    if not _emu_shape(dev.serial):
+        _fk = ensure_frame_1920x1080(_adb, dev.serial, logger=rlog)
+        report.env_info(实际画面=("%dx%d" % (_fk["w"], _fk["h"])) if _fk.get("w")
+                       else "读不到",
+                        分辨率覆盖=_fk.get("override") or "无需覆盖")
+        if not _fk.get("ok"):
+            return _bail(3, "%s（未做任何点击）" % _fk.get("message"))
+        rlog("· 画面已确认：%dx%d（横屏，坐标与模拟器一致）" % (_fk["w"], _fk["h"]))
+    else:
+        # 模拟器：天然就是 1920×1080，保持原有逻辑（已连跑两轮验证过）。
+        _di = DeviceInfo(dev.serial)
+        _probed = True
+        try:
+            probe_device(_adb, _di, deep=False)
+        except Exception as e:                    # noqa: BLE001
+            _probed = False
+            rlog("  ! 读设备分辨率失败：%r" % (e,))
+        if _probed and _di.needs_landscape:
+            rlog("· 分辨率未对齐（原生 %dx%d，需要 %s）→ 自动覆盖横屏"
+                 % (_di.native_w, _di.native_h, DeviceInfo.TARGET))
+            fr = force_landscape(_adb, dev.serial, logger=rlog)
+            try:
+                probe_device(_adb, _di, deep=False)
+            except Exception:                     # noqa: BLE001
+                pass
+            if not fr.get("ok"):
+                return _bail(3, "分辨率对齐失败：%s（未做任何点击）" % fr.get("message"))
+        report.env_info(分辨率=(("已覆盖 %s" % _di.override) if _di.override
+                              else ("原生 1920×1080" if _probed else "未读到")))
 
     # ---------------------------------------------------------------- 3. 游戏
     if dev.game_running(pkg):
@@ -1033,7 +1195,7 @@ def main():
         log("  ! 清理异常（已忽略，不影响本轮结果）：%r" % e)
 
     # ---------------------------------------------------------------- 6. 收尾
-    if not args.no_emulator:
+    if manage_emu:
         if shutdown_after or (auto_shutdown_auto and emu_started_by_us):
             why = "--shutdown-after / 配置 shutdown_after=always" if shutdown_after \
                 else "本次是脚本自己启动的（shutdown_after=auto）"
@@ -1046,6 +1208,16 @@ def main():
             emu.stop()
         else:
             log("· 收尾：保持模拟器运行（下次跑会复用）")
+
+    # 实体机：把「插电常亮」还原成跑之前的值。
+    #   放这里而不是放在末尾后面，是因为它属于「设备状态还原」，
+    #   要和上面的关模拟器归一类；且上传很慢，没理由让用户设置多挂那么久。
+    #   还原失败也绝不抛 —— 它只是把用户设置放回去，不该影响上传与收尾。
+    if stay_on_restore is not None:
+        try:
+            restore_stay_on(_adb, dev.serial, stay_on_restore, logger=log)
+        except Exception as e:                    # noqa: BLE001
+            log("  ! 还原插电常亮设置失败：%r（不影响本次结果）" % (e,))
 
     # ---------------------------------------------------------------- 7. 上传后端
     # 放在关模拟器之后：先把占内存的虚拟机放掉，再慢慢传。

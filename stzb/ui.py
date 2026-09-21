@@ -26,7 +26,28 @@ from .core import (GAME_PKG, Device, Point, Templates, TextItem, find_all_text,
 HOME_TASK = (60, 105)          # 左上「任务」
 HOME_ACTIVITY = (296, 175)     # 顶部「活动」
 HOME_RECRUIT = (1807, 1036)    # 右下「招募」
-HOME_TAB_NEIZHENG = (412, 942)  # 左下「内政」页签
+HOME_TAB_NEIZHENG = (412, 942)  # 左下「内政」页签（模拟器实测；已改为「先几何定位」）
+# 主城底部那排页签：从左到右固定是 武将 / 库藏 / 内政 / 势力 / 同盟。
+# ★ 为什么必须几何定位，不能只用一个固定坐标（2026-09-21 真机抓到，是真 bug）：
+#   这五个字是**竖排书法体，OCR 基本读不出来**（放大 3 倍也读不出，实测），
+#   所以老代码只能盲点固定坐标 (412,942)。而它们的 x 会随设备/缩放**整体平移**：
+#     模拟器上「内政」在 x≈412 → 一直好用；
+#     手机上（vivo V2055A）五个块实测中心是 153/254/358/458/561 ——
+#     「内政」在 **358**，而 (412,942) 正好落在**「势力」按钮的左边缘(413)**上，
+#     于是「打开内政」实际打开了**势力面板** → 内政下的 4 个任务全部失败
+#     （日志只写「打不开内政面板」，完全看不出是点错了按钮）。
+#   所以改成：先在底部找到那 5 个白块、按 x 排序、取第 3 个（内政）。
+#   白块的尺寸指纹很干净（实测 宽≈85 高≈183 面积≈6700，等距 ~102px）。
+HOME_TAB_ORDER = ("武将", "库藏", "内政", "势力", "同盟")
+HOME_TAB_NEIZHENG_INDEX = 2                 # 0-based
+# 页签白块的形状指纹：宽高与**填充率**。
+# ★ 为什么卡填充率而不是绝对面积：面积会随缩放/渲染（半透明底、圆角、内嵌竖图）
+#   变化很大 —— 实测某台机上是 bbox 85×183 而白像素只有 6700（填充率 0.43）。
+#   用绝对面积当阈值就得为每台设备重调；用填充率只描述"这是个细高的浅色块"，
+#   与缩放无关，合成图与真机图都能过。
+HOME_TAB_BOX = {"min_w": 55, "max_w": 130, "min_h": 120, "max_h": 260,
+                "min_fill": 0.22, "max_fill": 1.01, "y_min": 820,
+                "max_aspect": 4.0}
 
 # 内政面板里的入口（会漂移，仅作兜底）
 # 有的入口实测必须点「图标」而不是文字（点文字没反应），这里给文字→图标的偏移
@@ -994,13 +1015,70 @@ class Ui:
                 return False
         return True
 
+    def home_tab_centers(self, img) -> List[Tuple[int, int]]:
+        """主城底部那排页签的中心点，按 x 从左到右排序（几何定位，不靠 OCR）。
+
+        为什么不用 OCR：那五个字是**竖排书法体，OCR 读不出来**（放大 3 倍也不行，
+        实测）。老代码只能盲点固定坐标 `HOME_TAB_NEIZHENG`，而它们的 x 会随
+        设备/缩放整体平移 —— 手机上 (412,942) 正好落在「势力」上，
+        于是「打开内政」把势力面板打开了（见 HOME_TAB_ORDER 上方的说明）。
+
+        这五个白块的形状指纹很干净、且与分辨率无关：
+          实测 宽≈85、高≈183、面积≈6700，等距 ~102px，y 从 ~882 起。
+        返回 [] 表示没找到（调用方回退到固定坐标）。
+        """
+        if img is None:
+            return []
+        try:
+            import cv2
+            import numpy as np
+        except Exception:                        # noqa: BLE001
+            return []
+        h, w = img.shape[:2]
+        if not h or not w:
+            return []
+        y0 = min(HOME_TAB_BOX["y_min"], h - 1)
+        strip = img[y0:h, :]
+        try:
+            hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+            # 白/浅灰底（页签是半透明白块）
+            mask = cv2.inRange(hsv, np.array((0, 0, 180)), np.array((180, 60, 255)))
+            n, _lab, stats, cent = cv2.connectedComponentsWithStats(mask)
+        except Exception:                        # noqa: BLE001
+            return []
+        out: List[Tuple[int, int]] = []
+        for i in range(1, n):
+            x, y, bw, bh, area = stats[i]
+            if not (HOME_TAB_BOX["min_w"] <= bw <= HOME_TAB_BOX["max_w"]):
+                continue
+            if not (HOME_TAB_BOX["min_h"] <= bh <= HOME_TAB_BOX["max_h"]):
+                continue
+            fill = float(area) / float(max(1, bw * bh))
+            if not (HOME_TAB_BOX["min_fill"] <= fill <= HOME_TAB_BOX["max_fill"]):
+                continue
+            out.append((int(cent[i][0]), int(cent[i][1]) + y0))
+        out.sort()
+        return out
+
+    def _home_tab_point(self, name: str, img) -> Optional[Tuple[int, int]]:
+        """按名字取底部页签的中心点；定位不到返回 None。"""
+        idx = HOME_TAB_ORDER.index(name) if name in HOME_TAB_ORDER else -1
+        if idx < 0:
+            return None
+        boxes = self.home_tab_centers(img)
+        # 必须**恰好** 5 个才敢按序号取 —— 少一个/多一个都说明这批不是那排页签，
+        # 按序号取会点错按钮（点错页签虽然无害，但会让 open_neizheng 白跑一轮）。
+        if len(boxes) != len(HOME_TAB_ORDER):
+            return None
+        return boxes[idx]
+
     def open_neizheng(self) -> bool:
         self.log("  · 打开「内政」面板")
         for attempt in range(1, 5):
             # 带放大兜底：内政界面也是深色底 + 美术字，偶发整屏漏读。
             # 漏读会让 is_home/is_neizheng 同时判 False → 白白 to_home() 重来一轮。
-            items, _ = self.ocr_multi("nz_pre_%d" % attempt, n=1,
-                                      scaled_fallback=True)
+            items, path = self.ocr_multi("nz_pre_%d" % attempt, n=1,
+                                          scaled_fallback=True)
             if self.is_neizheng(items):
                 return True
             if not self.is_home(items):
@@ -1008,7 +1086,7 @@ class Ui:
                 continue
             # 底部页签的「内政」是竖排书法体，OCR 基本读不出来（放大 3 倍也读不出）；
             # 而主城别处随时可能出现「内政」二字（资源说明浮层里就有），
-            # 所以只在底部页签区域内认它，认不到就用固定坐标。
+            # 所以只在底部页签区域内认它。
             hit = None
             for it in items:
                 if it.center[1] > 900 and it.center[0] < 800 \
@@ -1023,7 +1101,32 @@ class Ui:
             if hit is not None:
                 self.tap(*hit.center)
             else:
-                self.tap(*HOME_TAB_NEIZHENG)
+                # ★ 几何定位优先，固定坐标只当最后的兜底。
+                #   固定坐标 (412,942) 是**模拟器**上量的，而它其实只是
+                #   **勉强**落在内政页签的右边缘（模拟器实测页签 167/275/388/495/608，
+                #   内政块 x≈388±43）；换设备/缩放后整排会平移 —— 手机上变成
+                #   153/254/358/458/561，412 正好越过内政的右边界、压到「势力」上
+                #   （2026-09-21 实测：点「内政」开出了势力面板，
+                #   内政下 4 个任务全废，日志却只写「打不开内政面板」）。
+                pt = None
+                try:
+                    pt = self._home_tab_point("内政", read_png(path))
+                except Exception as e:           # noqa: BLE001
+                    self.log("    ! 底部页签几何定位失败：%r" % (e,))
+                if pt is not None:
+                    self.log("    · 按几何定位点「内政」@%s（底部第 %d 个页签）"
+                             % (pt, HOME_TAB_NEIZHENG_INDEX + 1))
+                    self.tap(*pt)
+                elif attempt < 4:
+                    # 定位不到通常是这一帧页签被挡住/没露全（实测有这种帧）。
+                    # **换一帧重试**，而不是拿一个已知会点错设备的坐标去赌。
+                    self.log("    · 这一帧底部页签没露出来 → 换一帧重试，不盲点")
+                    time.sleep(1.0)
+                    continue
+                else:
+                    self.log("    · 页签几何定位一直不可用 → 回退固定坐标 %s"
+                             % (HOME_TAB_NEIZHENG,))
+                    self.tap(*HOME_TAB_NEIZHENG)
             # 内政面板入场有动画，等它稳一下再确认
             time.sleep(3.5)
             items, _ = self.ocr_multi("nz_post_%d" % attempt, n=1,

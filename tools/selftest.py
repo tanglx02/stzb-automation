@@ -936,6 +936,35 @@ def test_report():
         check("序号过 100 也按数值排（099 在 100 之前，不是字母序）",
               order == ["cc_panel_01.png", "cc_ok_02.png", "cc_y_099.png", "cc_x_100.png"],
               str(order))
+        # ★ 跨轮重名（2026-09-21 实测踩到）：
+        #   截图文件名里的序号是 `Device` 的**进程内自增**计数器，每跑一轮都从 0 开始，
+        #   所以**跨轮会重名**——同一个 tag 在同一位置拍出的名字两轮一模一样。
+        #   而归属用的是「目录差集」；只比**文件名集合**的话，第二轮那张会被判成
+        #   「本来就有」→ 该任务计 **0 张**。
+        #   实测：手机第 5 轮「贡品」报「截图0张」，目录里却躺着 4 张新图 ——
+        #   报告是排查的主要依据，把张数报成 0 等于把线索藏起来。
+        rr = os.path.join(tmp, "rr")
+        os.makedirs(rr, exist_ok=True)
+        stale = os.path.join(rr, "gp_page_009.png")
+        write_png(stale, np.full((20, 30, 3), 10, dtype=np.uint8))
+        os.utime(stale, (1_600_000_000, 1_600_000_000))   # 上一轮留下的同名旧图
+        rep4 = RunReport(tmp, rr, slot="12:00", logger=lambda m: None)
+        rec4 = rep4.begin("gongpin", "贡品礼包")
+        write_png(stale, np.full((20, 30, 3), 200, dtype=np.uint8))   # 同名、新内容
+        write_png(os.path.join(rr, "gp_after_010.png"),
+                  np.full((20, 30, 3), 200, dtype=np.uint8))
+        rep4.finish(rec4, True, seconds=1.0)
+        names4 = [os.path.basename(p) for p in rec4.entry.shots]
+        check("跨轮同名的图仍算新增（不能因重名漏计）",
+              names4 == ["gp_page_009.png", "gp_after_010.png"], str(names4))
+        old_one = os.path.join(rr, "gp_old_001.png")
+        write_png(old_one, np.full((20, 30, 3), 10, dtype=np.uint8))
+        os.utime(old_one, (1_600_000_000, 1_600_000_000))
+        rec5 = rep4.begin("x", "X")
+        rep4.finish(rec5, True, seconds=1.0)
+        check("没被重写的老图不算新增（不能把历史图全算进来）",
+              rec5.entry.shots == [], str(rec5.entry.shots))
+
         # 制造 mtime 完全相同的情况，序号排序仍必须正确
         same = os.path.join(tmp, "same")
         os.makedirs(same, exist_ok=True)
@@ -2627,6 +2656,414 @@ def test_role_vert_norm():
           "score=%.3f" % _A._one_score("Iron", "lron"))
 
 
+def test_device_target():
+    """指定目标设备（--serial / STZB_DEVICE_SERIAL）—— 「在手机上跑一轮」的能力。
+
+    ★ 为什么进自检（2026-09-21）：
+      多设备上线后，`run_daily` 原来只能靠 `config.device.serial_candidates` 猜。
+      而实体机 serial（`340436524100AJ8`，**没有冒号**）天生不在那份候选表里，
+      于是"指定在手机上跑"这件事**根本没法表达** —— 后果不是报错，
+      而是**悄悄连到模拟器上跑**（在别的设备上跑 = 在别的号上花资源）。
+      这类「跑到别的设备上」是本项目最不能接受的一类错误，所以把判据钉死。
+    """
+    print("\n[36] 指定目标设备：只连这一台，绝不退回别的设备")
+    import subprocess
+
+    # ① 形态判据：实体机没有冒号，模拟器一定有
+    from stzb import devices as _D
+    from run_daily import _cand, _emu_shape   # noqa: PLC0415
+
+    check("实体机 serial 判为「非模拟器」", _emu_shape("340436524100AJ8") is False)
+    check("host:port 判为模拟器", _emu_shape("127.0.0.1:7555") is True)
+    check("emulator-N 判为模拟器", _emu_shape("emulator-5554") is True)
+    check("空 serial 按老规矩当模拟器（不改变老行为）", _emu_shape("") is True)
+    # 与 stzb.devices 里的判据必须同一套口径，不能各写一份
+    check("与 stzb.devices 的模拟器形态判据一致",
+          bool(_D._EMU_SERIAL_RE.match("127.0.0.1:7555"))
+          and not _D._EMU_SERIAL_RE.match("340436524100AJ8"))
+
+    # ② 候选表：指定目标后**只给一台**（不给退路）
+    class _Cfg(dict):
+        def get(self, k, d=None):
+            if k == "device.serial_candidates":
+                return ["127.0.0.1:7555", "127.0.0.1:16384"]
+            return d
+
+    import run_daily as _rd
+    old = _rd.TARGET_SERIAL
+    try:
+        _rd.TARGET_SERIAL = ""
+        check("未指定目标 → 用配置里的候选表",
+              _cand(_Cfg()) == ["127.0.0.1:7555", "127.0.0.1:16384"])
+        _rd.TARGET_SERIAL = "340436524100AJ8"
+        c = _cand(_Cfg())
+        check("指定目标 → 候选表只剩它一个（没有退路）",
+              c == ["340436524100AJ8"], str(c))
+    finally:
+        _rd.TARGET_SERIAL = old
+
+    # ③ 真实命令行：--serial 必须真的接上（项目教训：只测函数测不到「参数有没有接上」）
+    p = subprocess.run([sys.executable, os.path.join(ROOT, "run_daily.py"),
+                        "--list", "--serial", "340436524100AJ8"],
+                       capture_output=True, text=True, timeout=60,
+                       cwd=ROOT, errors="ignore")
+    out = (p.stdout or "") + (p.stderr or "")
+    check("--serial 走真实命令行被识别为实体机",
+          "340436524100AJ8" in out and "实体机" in out,
+          out.strip().splitlines()[:1])
+
+    # ④ 启动段与收尾段必须共用同一个「要不要管模拟器」——
+    #    两处各写一遍的话，在手机上跑完会把用户的模拟器关掉。
+    with open(os.path.join(ROOT, "run_daily.py"), encoding="utf-8") as f:
+        src = f.read()
+    check("启动/收尾共用 manage_emu（收尾不再自己写一遍条件）",
+          "manage_emu = not args.no_emulator" in src
+          and "if manage_emu:" in src
+          and "if not args.no_emulator:\n        if shutdown_after" not in src)
+    # ⑤ 画面/分辨率不对齐时**必须拒绝点击**（坐标写死 1920×1080，错分辨率=乱点）。
+    #    实体机走 `ensure_frame_1920x1080`（见第 38 组），模拟器仍用 force_landscape。
+    check("画面不对齐时拒绝跑（安全前置）",
+          'ensure_frame_1920x1080(' in src and "未做任何点击" in src)
+    check("模拟器路径保留 force_landscape（实体机走自适应那条）",
+          "force_landscape" in src and "_di.needs_landscape" in src)
+
+
+def test_awake_guard():
+    """实体机「亮屏 / 防息屏 / 锁屏拒绝」的判据（2026-09-21 新增）。
+
+    ★ 为什么必须有这一组：
+      模拟器的屏幕永远不会睡，所以这条路径在模拟器时代从来没被需要过 ——
+      它是**只有真机才会暴露**的一类问题：手机在任务中途息屏（顺带还会锁屏），
+      `screencap` 拿到黑屏，OCR 一行都读不出来，脚本于是在**锁屏界面上**
+      点满一整轮，最后报一个跟真实原因毫不相干的「进不去某界面」。
+      实测（vivo V2055A）确认：息屏后 `screen_locked` 立刻变 True。
+
+    这里用**替换 `_adb_run` 返回假 dumpsys 文本**的方式测解析层 ——
+    解析正是最容易写错的地方（`mCurrentFocus` 在 dumpsys 里出现两次，
+    只取第一行会永远读到 null，把「锁着」判成「没锁」）。
+    """
+    print("\n[37] 实体机亮屏/防息屏/锁屏判据")
+    import stzb.devices as _D
+
+    # ① 位值：USB = 2。写错成 1（AC）就会去改错的那一位，等于没防住息屏。
+    check("STAY_ON_USB 位值 = 2（USB）", _D.STAY_ON_USB == 2, str(_D.STAY_ON_USB))
+
+    orig = _D._adb_run
+    try:
+        def _mk(power="", policy="", window=""):
+            def fake(adb, args, timeout=20.0):
+                a = " ".join(args)
+                if "dumpsys power" in a:
+                    return power
+                if "dumpsys window policy" in a:
+                    return policy
+                if "dumpsys window" in a:
+                    return window
+                return ""
+            return fake
+
+        # ② 亮/暗
+        _D._adb_run = _mk(power="  mWakefulness=Awake\n")
+        check("mWakefulness=Awake → awake", _D.screen_state("adb", "s") == "awake")
+        _D._adb_run = _mk(power="  mWakefulness=Asleep\n")
+        check("mWakefulness=Asleep → asleep", _D.screen_state("adb", "s") == "asleep")
+        _D._adb_run = _mk(power="  mWakefulness=Dozing\n")
+        check("mWakefulness=Dozing → asleep", _D.screen_state("adb", "s") == "asleep")
+        _D._adb_run = _mk(power="完全读不到\n")
+        check("读不到 mWakefulness → unknown（绝不猜）",
+              _D.screen_state("adb", "s") == "unknown")
+
+        # ③ 锁屏：首选 KeyguardStateMonitor 段下的 mIsShowing
+        _D._adb_run = _mk(policy="  KeyguardStateMonitor\n    mIsShowing=true\n")
+        check("KeyguardStateMonitor.mIsShowing=true → 锁着",
+              _D.screen_locked("adb", "s") is True)
+        _D._adb_run = _mk(policy="  KeyguardStateMonitor\n    mIsShowing=false\n")
+        check("KeyguardStateMonitor.mIsShowing=false → 没锁",
+              _D.screen_locked("adb", "s") is False)
+
+        # ④ ★ 回归：mCurrentFocus 在 dumpsys window 里出现**两次**，
+        #    第 151 行是 null、第 253 行才是真窗口。只取第一行 → 永远判「没锁」
+        #    → 在锁屏上瞎点。必须取**最后一行**。
+        two_focus_locked = (
+            "  mCurrentFocus=null\n"
+            "  其它内容\n"
+            "  mCurrentFocus=Window{abc u0 NotificationShade/Keyguard}\n")
+        _D._adb_run = _mk(window=two_focus_locked)
+        check("两行 mCurrentFocus（先 null 后 Keyguard）→ 判锁着（取最后一行）",
+              _D.screen_locked("adb", "s") is True)
+
+        two_focus_free = (
+            "  mCurrentFocus=null\n"
+            "  mCurrentFocus=Window{abc u0 com.netease.stzb.netease/Client}\n")
+        _D._adb_run = _mk(window=two_focus_free)
+        check("两行 mCurrentFocus（先 null 后游戏）→ 判没锁",
+              _D.screen_locked("adb", "s") is False)
+
+        # ⑤ 两条路都读不到 → None（未知），绝不能默认成「没锁」
+        _D._adb_run = _mk()
+        check("完全读不到锁屏状态 → None（未知，不猜 False）",
+              _D.screen_locked("adb", "s") is None)
+
+        # ⑥ ensure_awake：息屏+锁屏 → 先唤醒、再如实拒绝。
+        #    ★ 假 adb 必须**有状态**：发过 KEYCODE_WAKEUP 之后要变成 Awake，
+        #      否则测的是「唤不醒」那条分支，而不是「唤醒了但仍锁着」。
+        st = {"awake": False, "woke": False}
+
+        def fake_locked(adb, args, timeout=20.0):
+            a = " ".join(args)
+            if "dumpsys power" in a:
+                return "  mWakefulness=%s\n" % ("Awake" if st["awake"] else "Asleep")
+            if "KEYCODE_WAKEUP" in a:
+                st["woke"] = True
+                st["awake"] = True                # 模拟真机被唤醒
+                return ""
+            if "dumpsys window policy" in a:
+                return "  KeyguardStateMonitor\n    mIsShowing=true\n"
+            return ""
+        _D._adb_run = fake_locked
+        r = _D.ensure_awake("adb", "s", logger=lambda m: None)
+        check("ensure_awake 认出了「原本息屏」", r.get("state") == "awake", str(r))
+        check("确实发了 KEYCODE_WAKEUP", st["woke"] is True)
+        check("息屏+锁屏 → ok=False 且提示去解锁",
+              r["ok"] is False and "解锁" in (r.get("message") or ""), str(r.get("message")))
+
+        # ⑦ ensure_awake：亮屏 + 已设常亮 → ok=True 且**不改任何设置**
+        _D._adb_run = _mk(power="  mWakefulness=Awake\n",
+                          policy="  KeyguardStateMonitor\n    mIsShowing=false\n")
+        # settings get 返回 7（已含 USB 位）
+        _orig2 = _D._adb_run
+        calls = []
+
+        def fake2(adb, args, timeout=20.0):
+            a = " ".join(args)
+            calls.append(a)
+            if "stay_on_while_plugged_in" in a and "get" in a:
+                return "7\n"
+            return _orig2(adb, args, timeout)
+        _D._adb_run = fake2
+        r2 = _D.ensure_awake("adb", "s", logger=lambda m: None)
+        check("状态正常时 ok=True", r2["ok"] is True, str(r2.get("message")))
+        check("已含 USB 位 → changed=False（不动用户设置）", r2["changed"] is False)
+        check("没有发出任何 settings put（不改用户设置）",
+              not any("settings put" in c for c in calls), str(calls))
+
+        # ⑧ 缺 USB 位 → 补上，并把**原值**带回去供还原
+        calls2 = []
+
+        def fake3(adb, args, timeout=20.0):
+            a = " ".join(args)
+            calls2.append(a)
+            if "stay_on_while_plugged_in" in a and "get" in a:
+                return "1\n"                      # 只有 AC 位，缺 USB
+            return _orig2(adb, args, timeout)
+        _D._adb_run = fake3
+        r3 = _D.ensure_awake("adb", "s", logger=lambda m: None)
+        check("缺 USB 位 → changed=True 且带回原值 1",
+              r3["changed"] is True and r3["stay_on_before"] == 1, str(r3))
+        check("补的值 = 原值 | 2（只补 USB 位，不动别的位）",
+              r3["stay_on_after"] == 3, str(r3.get("stay_on_after")))
+        check("确实发出了 settings put",
+              any("settings put" in c for c in calls2), str(calls2))
+    finally:
+        _D._adb_run = orig
+
+        # ⑨ 接线检查：run_daily 必须在**跑之前**做这两件事，且失败要拒绝点击
+    with open(os.path.join(ROOT, "run_daily.py"), encoding="utf-8") as f:
+        src = f.read()
+    check("run_daily 对实体机做 ensure_awake", "ensure_awake(" in src)
+    check("锁屏/屏幕不可用 → _bail（不点击）",
+          'aw.get("ok")' in src and "未做任何点击" in src)
+    check("跑完还原插电常亮设置（restore_stay_on）", "restore_stay_on(" in src)
+    check("还原在 _bail 里也有（早期失败不能留下被改过的设置）",
+          src.count("restore_stay_on(") >= 2, "出现 %d 次" % src.count("restore_stay_on("))
+    check("_adb 在任何 _bail 之前初始化（否则早期失败路径 NameError）",
+          src.index("_adb = cfg.get") < src.index("manage_emu = not args.no_emulator"))
+
+
+def test_frame_fit():
+    """横屏画面判据：**实测画面**才是唯一可信的判据（2026-09-21 真机抓到的 bug）。
+
+    ★ 事故回顾（第 3 轮跑批）：手机被放成竖的，`wm size` 仍回显
+      `Override size: 1080x1920`（那个字符串不随旋转变），于是「只比 override」
+      的检查通过了 → 游戏按 1080×1920 竖屏排版 → 写死的坐标全部错位 →
+      脚本卡在「认不出的界面」连点 14 次 ✕、整轮 **成功 1 / 失败 5、
+      白跑 842 秒、留下 250+ 张废截图**，而日志里一个字都没提方向。
+
+    修法两条，都要钉住：
+      ① 判据改成**截一帧读 PNG 头**（`frame_size`），不是读 `wm size` 的回显；
+      ② 覆盖值不再写死 —— 两个候选都试，留那个真能出 1920×1080 的
+         （因为「该传哪个」取决于当前旋转，而旋转读不准：vivo/OriginOS
+         忽略 ADB 设的旋转锁，实测连桌面都不跟着转）。
+    """
+    print("\n[38] 横屏画面：实测画面为判据 + 覆盖值自适应")
+    import io
+    import struct as _struct
+    import stzb.devices as _D
+
+    # ① 常量：画面尺寸与候选值
+    check("目标画面 1920x1080", (_D.FRAME_W, _D.FRAME_H) == (1920, 1080))
+    check("候选里同时有 1080x1920 与 1920x1080（两个方向都要试）",
+          set(_D.OVERRIDE_CANDIDATES) == {"1080x1920", "1920x1080"},
+          str(_D.OVERRIDE_CANDIDATES))
+
+    # ② frame_size 必须真的**解析截图字节**，而不是去读 wm size。
+    #    用一个手搓的最小 PNG 头验证解析（含"必须按大端读"这条）。
+    def _png(w, h):
+        return (b"\x89PNG\r\n\x1a\n" + _struct.pack(">I", 13) + b"IHDR"
+                + _struct.pack(">II", w, h) + b"\x08\x02\x00\x00\x00" + b"\x00" * 8)
+
+    orig_run = _D.subprocess.run
+    orig_adb = _D._adb_run
+
+    class _P:
+        def __init__(self, out):
+            self.stdout = out
+
+    try:
+        _D.subprocess.run = lambda *a, **k: _P(_png(1920, 1080))
+        check("frame_size 从 PNG 头读出 1920x1080（大端）",
+              _D.frame_size("adb", "s") == (1920, 1080))
+        _D.subprocess.run = lambda *a, **k: _P(_png(1080, 1920))
+        check("竖屏截图读成 1080x1920（不会被当横屏）",
+              _D.frame_size("adb", "s") == (1080, 1920))
+        _D.subprocess.run = lambda *a, **k: _P(b"not a png at all")
+        check("不是 PNG → None（不猜）", _D.frame_size("adb", "s") is None)
+        _D.subprocess.run = lambda *a, **k: _P(b"")
+        check("空输出 → None（不猜）", _D.frame_size("adb", "s") is None)
+
+        # ③ 覆盖值自适应：模拟「物理竖屏的手机」——
+        #    只要 override 不是 1920x1080，画面就是竖的 1080×1920；
+        #    一旦覆盖成 1920x1080，画面才变横屏。必须挑出后者，
+        #    且**先试的那个（1080x1920）失败不算错**。
+        st = {"override": ""}
+        applied = []
+
+        def fake_adb(adb, args, timeout=20.0):
+            a = " ".join(args)
+            if "wm size" in a:
+                if "get" in a:
+                    return "Physical size: 1080x2400\n"
+                st["override"] = a.split()[-1]
+                applied.append(st["override"])
+            return ""
+
+        def fake_shot(*a, **k):
+            # 竖屏手机：只有覆盖成 1920x1080 才出横屏画面
+            return _P(_png(1920, 1080) if st["override"] == "1920x1080"
+                      else _png(1080, 1920))
+
+        _D._adb_run = fake_adb
+        _D.subprocess.run = fake_shot
+        r = _D.ensure_frame_1920x1080("adb", "s", logger=lambda m: None)
+        check("竖屏手机上自动挑出能出横屏的那个覆盖值",
+              r["ok"] is True and r["override"] == "1920x1080", str(r))
+        check("确实试过两个候选（不是只试一个就放弃）",
+              applied[:2] == ["1080x1920", "1920x1080"], str(applied))
+
+        # ④ 两个都试不出横屏 → ok=False（交给调用方拒绝跑），且提示可操作
+        applied2 = []
+        _D._adb_run = fake_adb
+        _D.subprocess.run = lambda *a, **k: _P(_png(1080, 1920))
+        r2 = _D.ensure_frame_1920x1080("adb", "s", logger=lambda m: None)
+        check("两个候选都拿不到横屏 → ok=False", r2["ok"] is False, str(r2))
+        check("拒绝时给出可操作提示（把手机横过来 / 自动旋转）",
+              "横过来" in (r2.get("message") or ""), str(r2.get("message")))
+
+        # ⑤ 已经是横屏 → 一个字节都不改（不改用户设备状态）
+        applied3 = []
+
+        def fake_adb3(adb, args, timeout=20.0):
+            a = " ".join(args)
+            if "wm size" in a:
+                if "get" in a:
+                    return "Physical size: 1080x2400\n"
+                applied3.append(a)
+            return ""
+
+        _D._adb_run = fake_adb3
+        _D.subprocess.run = lambda *a, **k: _P(_png(1920, 1080))
+        r3 = _D.ensure_frame_1920x1080("adb", "s", logger=lambda m: None)
+        check("画面已经对 → ok=True 且不写任何 wm size",
+              r3["ok"] is True and not applied3, str(applied3))
+    finally:
+        _D.subprocess.run = orig_run
+        _D._adb_run = orig_adb
+
+    # ⑥ 接线：实体机走这条自适应路径，且失败要拒绝跑
+    with io.open(os.path.join(ROOT, "run_daily.py"), encoding="utf-8") as f:
+        src = f.read()
+    check("run_daily 对实体机调 ensure_frame_1920x1080", "ensure_frame_1920x1080(" in src)
+    check("画面不对 → _bail（不点击）",
+          '_fk.get("ok")' in src and "未做任何点击" in src)
+
+
+def test_home_tabs():
+    """主城底部页签：几何定位（不靠 OCR、不靠固定坐标）。
+
+    ★ 事故回顾（2026-09-21 真机）：底部那排 武将/库藏/内政/势力/同盟 是
+      **竖排书法体，OCR 读不出来**，所以老代码盲点固定坐标 `(412,942)`。
+      而那个坐标只在模拟器上成立 —— 它其实**只是勉强落在内政页签的右边缘**：
+        模拟器实测页签中心 167/275/**388**/495/608（内政块 x≈345~431，412 在边内）
+        手机实测页签中心   153/254/**358**/458/561（内政块 x≈315~401，412 已在块外）
+      于是手机上「打开内政」把**势力**面板打开了 → 内政下 4 个任务全废，
+      而日志只写「打不开内政面板」，完全指不到真正的原因。
+
+    修法：在底部找到那 5 个白块（形状指纹干净、与分辨率无关），
+    按 x 排序取第 3 个。这里用**合成图**验证，不依赖 logs/ 里的历史截图。
+    """
+    print("\n[39] 主城底部页签：几何定位（替代设备相关的固定坐标）")
+    import numpy as _np
+    from stzb.ui import (HOME_TAB_NEIZHENG, HOME_TAB_NEIZHENG_INDEX,
+                         HOME_TAB_ORDER, Ui)
+
+    check("页签顺序固定为 武将/库藏/内政/势力/同盟",
+          HOME_TAB_ORDER == ("武将", "库藏", "内政", "势力", "同盟"),
+          str(HOME_TAB_ORDER))
+    check("「内政」是第 3 个（index=2）",
+          HOME_TAB_ORDER[HOME_TAB_NEIZHENG_INDEX] == "内政")
+    check("老固定坐标仍保留作最后兜底（模拟器时代的行为不删）",
+          isinstance(HOME_TAB_NEIZHENG, tuple) and len(HOME_TAB_NEIZHENG) == 2)
+
+    ui = Ui.__new__(Ui)                       # 只要方法，不跑 __init__
+
+    def _mk_img(centers):
+        """在 1920x1080 黑底上按实测尺寸画 5 个白块（宽85 高183）。"""
+        img = _np.zeros((1080, 1920, 3), dtype=_np.uint8)
+        for cx, cy in centers:
+            x0, y0 = int(cx - 42), int(cy - 91)
+            img[y0:y0 + 183, x0:x0 + 85] = (255, 255, 255)
+        return img
+
+    # ① 手机实测位置 → 必须定位到 358，而不是 412（那正是点错的坐标）
+    phone = [(153, 957), (254, 955), (358, 964), (458, 954), (561, 957)]
+    b = ui.home_tab_centers(_mk_img(phone))
+    check("认出 5 个页签", len(b) == 5, str(b))
+    check("按 x 从左到右排序", b == sorted(b), str(b))
+    pt = ui._home_tab_point("内政", _mk_img(phone))
+    check("手机上「内政」定位到 x=358（不是老的 412）", pt == (358, 964), str(pt))
+    check("老常量 412 确实不在「内政」块内（这正是 bug 的原因）",
+          not (358 - 42 <= HOME_TAB_NEIZHENG[0] <= 358 + 42),
+          "老 x=%d，内政块 316~400" % HOME_TAB_NEIZHENG[0])
+
+    # ② 模拟器实测位置（整排右移）→ 定位到 388，说明是**自适应**而不是写死
+    emu = [(167, 947), (275, 945), (388, 956), (495, 962), (608, 947)]
+    check("模拟器位置上「内政」定位到 x=388",
+          ui._home_tab_point("内政", _mk_img(emu)) == (388, 956))
+
+    # ③ 页签没露出来 / 数量不对 → 返回 None（交给调用方换一帧重试，绝不猜序号）
+    check("全黑帧 → 定位不到（None）", ui._home_tab_point("内政", _mk_img([])) is None)
+    only_three = [(153, 957), (254, 955), (358, 964)]
+    check("只找到 3 个块 → 不按序号猜（None）",
+          ui._home_tab_point("内政", _mk_img(only_three)) is None)
+
+    # ④ 接线：open_neizheng 必须**先用几何、后回退**，且回退前先换帧重试
+    with open(os.path.join(ROOT, "stzb", "ui.py"), encoding="utf-8") as f:
+        src = f.read()
+    check("open_neizheng 调了 _home_tab_point", "_home_tab_point(\"内政\"" in src)
+    check("定位不到时先换一帧重试，不直接盲点固定坐标",
+          "换一帧重试，不盲点" in src)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -2670,6 +3107,10 @@ if __name__ == "__main__":
     test_role_dialog()
     test_role_vert_norm()
     test_run_liveness()
+    test_device_target()
+    test_awake_guard()
+    test_frame_fit()
+    test_home_tabs()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)

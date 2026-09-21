@@ -162,7 +162,7 @@ class RunReport:
         # 上传时一起带上，服务端拿它核对「切换到底生效了没」。
         self.account_label: str = ""
         self.role_label: str = ""
-        self._before: set = set()
+        self._before: Dict[str, float] = {}
 
     # ------------------------------------------------------------ 运行级信息
 
@@ -176,11 +176,33 @@ class RunReport:
 
     # ------------------------------------------------------------ 任务
 
-    def _shot_files(self) -> set:
+    def _shot_files(self) -> Dict[str, float]:
+        """截图目录的 {文件名: mtime}。
+
+        ★ 为什么必须带上 mtime，不能只比**文件名集合**（2026-09-21 实测踩到）：
+          截图文件名里的序号是 `Device` 的**进程内自增计数器**，每跑一轮都从 0 开始，
+          所以**跨轮会重名** —— 同一个 tag 在同一位置拍出的名字，两轮一模一样
+          （如 `gp_page_009.png`）。
+          只比名字的话，第二轮的这张会被判成「本来就存在」→ 该任务计 **0 张**。
+          实测：手机第 5 轮「贡品」报「截图0张」，而目录里确实躺着 4 张新图
+          —— 报告是排查问题的主要依据，它把截图数报成 0，等于把线索藏起来了。
+
+          带 mtime 只需多花一次 stat：**同名的文件被重写 → mtime 变了 → 仍算新增**。
+          注意这与「排序」不同：排序不能按 mtime（Windows 粒度约 15ms，
+          同一批里两张图 mtime 可能完全相同），排序仍走文件名里的序号。
+        """
         try:
-            return {f for f in os.listdir(self.shot_dir) if f.endswith(".png")}
+            out: Dict[str, float] = {}
+            for f in os.listdir(self.shot_dir):
+                if not f.endswith(".png"):
+                    continue
+                try:
+                    out[f] = os.path.getmtime(os.path.join(self.shot_dir, f))
+                except OSError:
+                    continue
+            return out
         except Exception:
-            return set()
+            return {}
 
     def skip(self, key: str, name: str, reason: str):
         e = TaskEntry(key=key, name=name, status=STATUS_SKIP, reason=reason)
@@ -199,7 +221,8 @@ class RunReport:
         e.status = status or (STATUS_OK if ok else STATUS_FAIL)
         e.reason = reason
         e.seconds = seconds
-        new = self._shot_files() - self._before
+        new = {f for f, mt in self._shot_files().items()
+               if self._before.get(f) != mt}
         # OCR 放大重试产生的中间图（xxx.png.x2.png）不进报告，太吵
         new = {f for f in new if ".x2." not in f}
         e.shots = self._by_seq(new)
