@@ -495,6 +495,35 @@ FRAME_W, FRAME_H = 1920, 1080
 OVERRIDE_CANDIDATES = ("1080x1920", "1920x1080")
 
 
+def _current_override(adb: str, serial: str) -> str:
+    """当前 `wm size` 的 override 值（没设过就返回空串）。
+
+    用来在**尝试失败时把它还原回去** —— 见 ensure_frame_1920x1080 里的说明。
+    """
+    out = _adb_run(adb, ["-s", serial, "shell", "wm", "size"], timeout=15.0) or ""
+    for line in out.splitlines():
+        s = line.strip()
+        if s.lower().startswith("override size:"):
+            return s.split(":", 1)[1].strip()
+    return ""
+
+
+def _auto_rotate_on(adb: str, serial: str) -> Optional[bool]:
+    """系统的「自动旋转」开着吗？读不到返回 None。
+
+    为什么值得单独读：手机横过来却仍然竖屏排版的常见原因就一个 ——
+    **自动旋转被关掉了**（游戏 activity 是 UNSPECIFIED，跟着系统走）。
+    这时用户「已经把手机横过来了」但画面还是竖的，光看画面判据会一直失败，
+    提示里必须点破这一条，否则用户不知道下一步该动哪里。
+    """
+    out = _adb_run(adb, ["-s", serial, "shell", "settings", "get",
+                         "system", "accelerometer_rotation"], timeout=10.0)
+    s = (out or "").strip()
+    if s in ("0", "1"):
+        return s == "1"
+    return None
+
+
 def ensure_frame_1920x1080(adb: str, serial: str,
                            logger: Optional[Callable[[str], None]] = None) -> Dict:
     """确保**实际画面**就是 1920×1080（项目坐标的前提）。
@@ -522,6 +551,9 @@ def ensure_frame_1920x1080(adb: str, serial: str,
         return {"ok": True, "w": FRAME_W, "h": FRAME_H, "override": "",
                 "message": "画面已经是 1920×1080，无需调整"}
 
+    # 记下进来时的 override，失败要还原（下面每个候选都真的写过一次 wm size）
+    before = _current_override(adb, serial)
+
     probed = []
     for target in OVERRIDE_CANDIDATES:
         sz = _try(target)
@@ -531,14 +563,35 @@ def ensure_frame_1920x1080(adb: str, serial: str,
             return {"ok": True, "w": FRAME_W, "h": FRAME_H, "override": target,
                     "message": "已覆盖为 %s（画面 1920×1080）" % target}
 
+    # ★ 都试不通 → 还原 override，**不把用户的手机留在「尺寸被改过」的状态**。
+    #   这段的每一步都真的写过 `wm size`，不还原就会停在最后一个候选上；
+    #   手机拔下来自己用时界面尺寸会变得莫名其妙，而用户不知道是谁改的。
+    #   （方向本来就不对这件事另说 —— 那是调不好的，见下面的提示。）
+    try:
+        _adb_run(adb, ["-s", serial, "shell", "wm", "size",
+                       before or "reset"], timeout=20.0)
+    except Exception:                            # noqa: BLE001
+        pass
+
+    # 提示要能落地：自动旋转关着是「手机横过来也没用」的唯一原因，必须点破
+    ar = _auto_rotate_on(adb, serial)
+    if ar is False:
+        hint = ("★ 手机的**「自动旋转」是关闭的**：先去设置里把它打开，"
+                "再把手机横过来放平（自动旋转关着时，横过来也不会变）")
+    elif ar is True:
+        hint = ("把手机**横过来放平**再重跑 —— 注意别平放在桌面上，"
+                "要有明确的横持姿态，重力感应才判得出来")
+    else:
+        hint = "把手机横过来放平，并确认系统「自动旋转」是开着的"
+
     detail = "；".join("%s→%s" % (t, ("%dx%d" % s) if s else "读不到")
                       for t, s in probed)
     return {"ok": False, "w": (cur or (0, 0))[0], "h": (cur or (0, 0))[1],
             "override": "",
-            "message": ("试过所有横屏覆盖都拿不到 1920×1080 的画面（%s）。"
-                        "请把手机横过来放平、确认系统「自动旋转」开着，再重跑。"
-                        "（项目坐标写死 1920×1080，画面不对时所有点击都会错位）"
-                        % detail)}
+            "message": ("试过所有横屏覆盖都拿不到 1920×1080 的画面（%s）。%s。"
+                        "（vivo 等 ROM 会忽略 ADB 设的旋转锁，所以脚本没法替你转屏；"
+                        "项目坐标写死 1920×1080，画面不对时所有点击都会错位）"
+                        % (detail, hint))}
 
 
 def ensure_landscape_frame(adb: str, serial: str,

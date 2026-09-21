@@ -609,7 +609,7 @@ def _do_cleanup(cfg, log, *, skip: bool = False, force: bool = False) -> dict:
 
 
 def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason="",
-               identity=None):
+               identity=None, run_ok=True):
     """上传结果 + 给待执行任务回执。**任何失败都不抛异常**，也不影响本机报告。
 
     这是刻意的：上报告是尽力而为。网络断了、服务器挂了，已经跑完的任务不能白跑 ——
@@ -617,6 +617,12 @@ def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason="",
 
     `disabled`（没绑后端 / 显式 --no-upload）或 `client is None`（托管但初始化失败）时
     这里直接返回，**一个字节都不往外发**。
+
+    `run_ok` = 这一轮**任务本身**跑成功了吗（与"上报成功"是两件事）。
+    ★ 2026-09-21 修：回执以前只看 `res["ok"]`（那是**上传**成不成功），
+      于是「启动就失败、一个任务都没跑」的轮次也会回执成「完成」——
+      用户在后端看到「已完成」，游戏里却什么都没发生，还以为是自己没点对。
+      现在两者都要成立才算完成。
     """
     if disabled or client is None:
         if disabled:
@@ -635,10 +641,16 @@ def _do_upload(cfg, report, paths, client, job, log, disabled=False, reason="",
 
     if job:
         try:
-            client.ack_job(int(job["id"]), "done" if res.get("ok") else "failed",
+            done = bool(res.get("ok")) and bool(run_ok)
+            client.ack_job(int(job["id"]), "done" if done else "failed",
                            res.get("run_id"))
-            log("  · 待执行任务 #%s 已回执：%s"
-                % (job["id"], "完成" if res.get("ok") else "失败"))
+            if not res.get("ok"):
+                why = "报告上传失败"
+            elif not run_ok:
+                why = "本轮没跑成功（详见报告）"
+            else:
+                why = "完成"
+            log("  · 待执行任务 #%s 已回执：%s" % (job["id"], why))
         except Exception as e:
             log("  ! 回执失败：%r" % (e,))
     return res
@@ -824,7 +836,7 @@ def main():
             log("· 按 --no-remote-config 跳过远端配置")
 
         if cfg["cloud"].get("pull_jobs", True):
-            job = pick_job(client, logger=log)
+            job = pick_job(client, logger=log, serial=TARGET_SERIAL)
         if args.job_only and not job:
             # ★ 常驻代理收到「后台派了任务」的推送时会用 --job-only 起一轮。
             #   队列空（任务被别的客户端抢走 / 已被取消）就**必须立刻退出** ——
@@ -833,6 +845,25 @@ def main():
             log("· 按 --job-only：后台待执行队列里没有属于本机的任务，直接退出")
             return 0
         if job:
+            # ★ 任务自己带了目标设备，而本进程还没定（定时任务起的、或人工直接
+            #   跑的本脚本）→ 以任务为准。必须在下面**连设备之前**定下来，
+            #   否则 step 1 的「要不要碰模拟器」会按错的目标判断。
+            jserial = str(job.get("serial") or "").strip()
+            if jserial and not TARGET_SERIAL:
+                TARGET_SERIAL = jserial
+                log("· 本轮任务指定了设备：%s（%s）→ 只连这一台"
+                    % (TARGET_SERIAL,
+                       "模拟器" if _emu_shape(TARGET_SERIAL) else "实体机"))
+            elif jserial and jserial != TARGET_SERIAL:
+                # 理论上不该发生（pick_job 已经按 serial 过滤过了）。
+                # 真发生说明后端和本机的认知不一致 → **宁可退出也不跑错设备**。
+                # 注意这里**不能调 _bail**：它依赖 _adb / stay_on_restore，
+                # 那些要到下面才初始化（早了会 NameError）。直接退出即可 ——
+                # 这一步还没碰任何设备，没有任何要还原的东西。
+                log("!! 任务 #%s 指定设备 %s，与本机目标 %s 不一致 → 退出，"
+                    "不冒跑错设备的风险（未做任何点击）"
+                    % (job.get("id"), jserial, TARGET_SERIAL))
+                return 4
             if job.get("slot") and job["slot"] != "auto":
                 slot = job["slot"]
             jonly = (job.get("only") or "").strip()
@@ -967,7 +998,7 @@ def main():
         _do_cleanup(cfg, rlog, skip=args.no_cleanup)
         _do_upload(cfg, report, p, client, job, rlog,
                    disabled=(args.no_upload or not managed), reason=upload_skip_reason,
-                   identity=identity)
+                   identity=identity, run_ok=False)   # ← 启动阶段就失败了，明确不是「完成」
         return code
 
     # ---------------------------------------------------------------- 1. 模拟器
@@ -1223,7 +1254,10 @@ def main():
     # 放在关模拟器之后：先把占内存的虚拟机放掉，再慢慢传。
     _do_upload(cfg, report, paths, client, job, log,
                disabled=(args.no_upload or not managed), reason=upload_skip_reason,
-               identity=identity)
+               identity=identity,
+               # 与本函数末尾的返回码同一个判据 —— 两边分叉的话，
+               # 就会出现「退出码 1 但任务回执成完成」这种自相矛盾的状态。
+               run_ok=bool(res) and all(res.values()))
 
     if not only:
         if st.get("date") != today:

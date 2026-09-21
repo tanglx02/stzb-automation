@@ -181,9 +181,20 @@ def apply_remote(cfg: Dict[str, Any], client, state_path: str,
     return res
 
 
-def pick_job(client, logger: Callable[[str], None] = print
-             ) -> Optional[Dict[str, Any]]:
-    """领一条待执行请求。没有就返回 None；出错也不抛。"""
+def pick_job(client, logger: Callable[[str], None] = print,
+             serial: str = "") -> Optional[Dict[str, Any]]:
+    """领一条待执行请求。没有就返回 None；出错也不抛。
+
+    `serial` = 本进程已经定下来的目标设备（来自 --serial / STZB_DEVICE_SERIAL）。
+    ★ 为什么要按它过滤：任务可以**指定在哪台设备上跑**（后端加的）。
+      如果本进程已经锁定用手机跑，却领了一条「指定模拟器」的任务，
+      就会在手机上执行模拟器的任务 —— **在错误的设备上点游戏**，
+      后果可能是花掉另一台设备上那个号的资源。所以：
+        · 任务没指定设备 → 谁都能领（通用任务，按本机配置选设备）
+        · 任务指定的设备 == 本进程的目标 → 能领
+        · 任务指定了别的设备 → **跳过**，留给挂着那台设备的客户端
+      这样即使后端漏了定向（老库里已有、或人工改库），也不会跑错设备。
+    """
     try:
         ok, data = client.list_jobs()
     except Exception as e:
@@ -195,14 +206,25 @@ def pick_job(client, logger: Callable[[str], None] = print
     jobs = data.get("jobs") or []
     if not jobs:
         return None
-    job = jobs[0]
+    mine = (serial or "").strip()
+    job = None
+    for j in jobs:
+        want = str(j.get("serial") or "").strip()
+        if not want or not mine or want == mine:
+            job = j
+            break
+        logger("  · 跳过任务 #%s：它指定在 %s 上跑，本机锁的是 %s"
+               % (j.get("id"), want, mine))
+    if job is None:
+        return None
     if not client.take_job(int(job["id"])):
         logger("  ! 任务 #%s 领取失败（可能已被领走）" % job.get("id"))
         return None
-    logger("  · 领到待执行任务 #%s（档位=%s 范围=%s%s）"
+    logger("  · 领到待执行任务 #%s（档位=%s 范围=%s%s%s）"
            % (job.get("id"), job.get("slot"),
               job.get("only") or "按档位全部",
-              "，预演" if job.get("dry_run") else ""))
+              "，预演" if job.get("dry_run") else "",
+              ("，设备=%s" % job["serial"]) if job.get("serial") else ""))
     if job.get("note"):
         logger("      备注：%s" % job["note"])
     return job

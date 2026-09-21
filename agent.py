@@ -443,6 +443,30 @@ def main() -> int:
     rt_holder: dict = {"rt": None}
     run_state: dict = {"proc": None}
 
+    def _peek_job_serial() -> str:
+        """看一眼队列**第一条**任务要求在哪台设备上跑（没指定就返回空串）。
+
+        为什么要先看：任务可以指定设备（后端「设备管理」页/待执行任务页选的）。
+        run_daily 自己也会领任务并读出设备，但那要等它启动、连上后端之后才发生；
+        这里先看一眼，能把目标设备当成 `--serial` 直接传下去 —— run_daily 一启动
+        就知道自己该不该碰模拟器（`manage_emu` 判据依赖它），少一次来回。
+
+        ★ 只认「本机有权领的那条」（list_jobs 已经按客户端过滤过了）。
+          第一条**没指定设备**时返回空串 —— 那表示「按本机配置自己选」，
+          不能顺手拿后面某条的设备去当目标，那会让通用任务被顶到别的设备上跑。
+        """
+        # 环境变量已经把本机钉在某一台设备上时，不覆盖用户的意图
+        if str(os.environ.get("STZB_DEVICE_SERIAL") or "").strip():
+            return ""
+        try:
+            ok, data = client.list_jobs()
+        except Exception:
+            return ""
+        jobs = ((data or {}).get("jobs") or []) if ok else []
+        if not jobs:
+            return ""
+        return str(jobs[0].get("serial") or "").strip()
+
     def _spawn_run(why: str) -> bool:
         proc = run_state.get("proc")
         if proc is not None and proc.poll() is None:
@@ -452,22 +476,27 @@ def main() -> int:
             # 可能是定时任务起的，也可能是别人手动跑的 —— 反正现在不能抢
             log("  · 本机已有一轮任务在跑，%s（任务留在队列里）" % why)
             return False
+        cmd = [sys.executable, os.path.join(ROOT, "run_daily.py"), "--job-only"]
+        dev_serial = _peek_job_serial()
+        if dev_serial:
+            cmd += ["--serial", dev_serial]
         log_file = os.path.join(LOG_DIR, "agent_run.log")
         try:
             fh = io.open(log_file, "a", encoding="utf-8")
             fh.write("\n===== %s 常驻代理起一轮：%s =====\n"
                      % (dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), why))
+            fh.write("     目标设备：%s\n" % (dev_serial or "（未指定，按本机配置）"))
             fh.flush()
             proc = subprocess.Popen(
-                [sys.executable, os.path.join(ROOT, "run_daily.py"), "--job-only"],
-                cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT)
+                cmd, cwd=ROOT, stdout=fh, stderr=subprocess.STDOUT)
         except Exception as e:
             log("  ! 起 run_daily 失败：%r" % (e,))
             return False
         run_state["proc"] = proc
         box.set(state="starting", busy=True, note="正在按后台任务跑一轮")
-        log("  ✓ 已起一轮 run_daily（pid=%s，%s），输出见 logs/agent_run.log"
-            % (proc.pid, why))
+        log("  ✓ 已起一轮 run_daily（pid=%s，%s%s），输出见 logs/agent_run.log"
+            % (proc.pid, why,
+               ("，设备=" + dev_serial) if dev_serial else ""))
         threading.Thread(target=_wait_run, args=(proc,), name="stzb-run-wait",
                          daemon=True).start()
         return True

@@ -69,6 +69,21 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else ""
 
 
+def _row_get(row, key: str, default=None):
+    """从 sqlite3.Row / dict 里安全取一列。
+
+    ★ Row **没有 `.get()`** —— 直接 `row.get("x")` 会抛
+      `AttributeError: 'sqlite3.Row' object has no attribute 'get'`，
+      而这类错经常被上层 catch 成一句含糊的「失败」，很难查
+      （2026-09-21 在 role_sync_discovered 上真被坑过一次）。
+    """
+    try:
+        v = row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+    return default if v is None else v
+
+
 def _ident(request: Request) -> Dict[str, Any]:
     """从请求头里取客户端身份（老客户端只发头、不发 body 也能用）。"""
     return {
@@ -540,7 +555,13 @@ def jobs(request: Request, limit: int = 10,
         {"id": r["id"], "slot": r["slot"], "only": r["only_tasks"] or "",
          "dry_run": bool(r["dry_run"]), "created_at": r["created_at"],
          "created_by": r["created_by"], "note": r["note"] or "",
-         "client_id": r["client_id"]}
+         "client_id": r["client_id"],
+         # ★ 目标设备（2026-09-21 加）。客户端拿到 serial 后**直接把它当目标设备**，
+         #   不再用 config.device.serial_candidates 去猜 —— 猜错的后果不是报错，
+         #   而是**在别的设备上跑**（= 在别的号上花资源），比失败严重得多。
+         #   老库的行这两列是 NULL，所以用 get 兜住。
+         "device_id": _row_get(r, "device_id"),
+         "serial": (_row_get(r, "serial") or "").strip()}
         for r in rows], "client_id": cid, "registered": cli is not None}
 
 

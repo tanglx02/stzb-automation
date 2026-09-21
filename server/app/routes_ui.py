@@ -590,6 +590,10 @@ def jobs_page(request: Request, created: int = 0, canceled: int = 0, err: str = 
         jobs=db.request_list(limit=60, owner_id=sc["owner_id"], own_only=sc["own_only"]),
         allow=settings.ALLOW_RUN_REQUESTS,
         clients=db.client_list(),
+        # ★ 可派任务的设备清单（2026-09-21）。之前这里只有「客户端」下拉，
+        #   于是「用手机跑还是用模拟器跑」在页面上根本选不出来 —— 见 db 里
+        #   run_requests.serial 的注释。
+        devices=db.device_list(),
         my_accounts=db.account_list(with_roles=False, **sc),
         created=created, canceled=canceled, err=err,
         is_admin=bool(u.get("is_admin"))))
@@ -610,13 +614,46 @@ async def job_create(request: Request):
     cid = int(raw_cid) if raw_cid.isdigit() else None
     if cid is not None and not db.client_get(cid):
         return RedirectResponse("/jobs?err=%s" % _q("指定的客户端不存在"), status_code=303)
+
+    # ★ 目标设备（2026-09-21 加）。指定了设备就**同时锁定它所属的那台客户端** ——
+    #   设备是挂在一台电脑上的，派给别的电脑等于让它去连一台它没有的设备。
+    #   这一步不能省：只写 device_id 不写 client_id 的话，别的客户端会把任务领走、
+    #   然后连不上任何设备，报一个和真实原因无关的错。
+    did = None
+    dev_serial = None
+    raw_did = str(form.get("device_id") or "").strip()
+    if raw_did.isdigit():
+        dev = db.device_get(int(raw_did))
+        if not dev:
+            return RedirectResponse("/jobs?err=%s" % _q("指定的设备不存在或已被删除"),
+                                    status_code=303)
+        if not dev.get("enabled"):
+            return RedirectResponse(
+                "/jobs?err=%s" % _q("设备「%s」已被停用，先启用再派任务"
+                                    % (dev.get("name") or dev.get("serial"))),
+                status_code=303)
+        s = str(dev.get("serial") or "").strip()
+        if not s:
+            return RedirectResponse("/jobs?err=%s" % _q("这台设备没有 serial，无法派任务"),
+                                    status_code=303)
+        did, dev_serial = int(dev["id"]), s
+        owner_cid = dev.get("client_id")
+        if owner_cid:
+            cid = int(owner_cid)          # 设备在哪台电脑上，就派给哪台
+        elif cid is None:
+            return RedirectResponse(
+                "/jobs?err=%s" % _q("设备「%s」还没挂到任何客户端上"
+                                    "（先在这台机器上跑 agent.py）"
+                                    % (dev.get("name") or s)), status_code=303)
+
     if slot not in ("auto", "00:00", "12:00"):
         slot = "auto"
     # 归属：普通用户排的队挂在自己名下（他能在列表里看到并取消）；
     # 管理员排的是公共的（owner_id=None），普通用户也能看到 —— 见 db.request_list。
     owner = None if u.get("is_admin") else int(u["id"])
     rid = db.request_create(slot, only, dry, u["username"], note,
-                            client_id=cid, owner_id=owner)
+                            client_id=cid, owner_id=owner,
+                            device_id=did, serial=dev_serial)
     # ★ 立刻推给采集端，别让它等到下一拍心跳（最多 30 秒）才知道有活干。
     #   推送只是「提醒」：任务本身已经落库，推不到也会被心跳兜住。
     #   定向任务只推给点名的那台；公共任务谁都能领，所以推给全部在线客户端。
@@ -625,8 +662,9 @@ async def job_create(request: Request):
     else:
         realtime.notify_all("jobs", job=rid)
     target = (db.client_get(cid) or {}).get("name") if cid else "任意客户端"
-    db.event("info", "console", "新建待执行任务 #%d（%s 档，范围=%s，执行者=%s，排队人=%s）"
-             % (rid, slot, only or "按档位", target, u["username"]))
+    on_dev = "，设备=%s" % dev_serial if dev_serial else ""
+    db.event("info", "console", "新建待执行任务 #%d（%s 档，范围=%s，执行者=%s%s，排队人=%s）"
+             % (rid, slot, only or "按档位", target, on_dev, u["username"]))
     return RedirectResponse("/jobs?created=%d" % rid, status_code=303)
 
 

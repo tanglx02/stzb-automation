@@ -102,6 +102,26 @@
     </span>
   </div>
 
+  {# ---- 在这台设备上跑一轮任务 ----
+     直接复用 /jobs 的入队逻辑（hidden 里把设备与范围带上），不另开一条路由 ——
+     任务怎么排队、怎么被客户端领走，只有一条路径，不会分叉出第二套语义。 #}
+  <form method="post" action="/jobs">
+    <input type="hidden" name="device_id" value="{{ d.id }}">
+    <input type="hidden" name="slot" value="auto">
+    <input type="hidden" name="only" value="all">
+    <input type="hidden" name="note" value="设备页发起（{{ d.name or d.serial }}）">
+    <div class="actions" style="margin-top:0">
+      <button class="primary" type="submit"
+              {% if not d.enabled or not d.online %}disabled
+                title="{% if not d.enabled %}设备已停用{% else %}设备离线：先点上面的「扫描 ADB 设备」，或在客户端启停模拟器{% endif %}"{% endif %}>
+        在这台设备上跑一轮全部任务</button>
+      <span class="hint" style="align-self:center">
+        排入队列后由挂着这台设备的客户端执行；{% if running %}现在有任务在跑，会等它跑完再接上。{% else %}通常几秒内就会开始。{% endif %}
+        要选档位 / 指定某几个任务 / 预演，请到<a href="/jobs">待执行任务</a>页。
+      </span>
+    </div>
+  </form>
+
   <details class="more">
     <summary>编辑 / 删除</summary>
     <form method="post" action="/devices/{{ d.id }}/update">

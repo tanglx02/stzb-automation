@@ -2935,16 +2935,24 @@ def test_frame_fit():
         #    只要 override 不是 1920x1080，画面就是竖的 1080×1920；
         #    一旦覆盖成 1920x1080，画面才变横屏。必须挑出后者，
         #    且**先试的那个（1080x1920）失败不算错**。
-        st = {"override": ""}
+        st = {"override": "", "ar": "1"}
         applied = []
 
         def fake_adb(adb, args, timeout=20.0):
             a = " ".join(args)
+            # 系统「自动旋转」开关（失败诊断会读它）
+            if "accelerometer_rotation" in a:
+                return st["ar"] + "\n"
             if "wm size" in a:
-                if "get" in a:
-                    return "Physical size: 1080x2400\n"
-                st["override"] = a.split()[-1]
-                applied.append(st["override"])
+                parts = a.split()
+                if parts[-1] == "size":          # 读：回显 Physical + Override
+                    s = "Physical size: 1080x2400\n"
+                    if st["override"]:
+                        s += "Override size: %s\n" % st["override"]
+                    return s
+                # 写：wm size <值> / wm size reset
+                st["override"] = "" if parts[-1] == "reset" else parts[-1]
+                applied.append(parts[-1])
             return ""
 
         def fake_shot(*a, **k):
@@ -2961,6 +2969,7 @@ def test_frame_fit():
               applied[:2] == ["1080x1920", "1920x1080"], str(applied))
 
         # ④ 两个都试不出横屏 → ok=False（交给调用方拒绝跑），且提示可操作
+        st.update(override="1080x1920", ar="1")
         applied2 = []
         _D._adb_run = fake_adb
         _D.subprocess.run = lambda *a, **k: _P(_png(1080, 1920))
@@ -2968,6 +2977,22 @@ def test_frame_fit():
         check("两个候选都拿不到横屏 → ok=False", r2["ok"] is False, str(r2))
         check("拒绝时给出可操作提示（把手机横过来 / 自动旋转）",
               "横过来" in (r2.get("message") or ""), str(r2.get("message")))
+        # ★ 失败必须把 override 还原成**进来时的样子**：
+        #   上面每个候选都真的写过一次 `wm size`，不还原就停在最后一个候选上，
+        #   用户拔下手机自己用会发现界面尺寸莫名变了，还不知道是谁改的。
+        check("失败时把 override 还原成进入时的值",
+              st["override"] == "1080x1920", "还原后=%r" % st["override"])
+
+        # ④b 自动旋转关着 → 提示必须点破这一点
+        #     （这是「手机横过来了但画面还是竖的」的唯一常见原因，
+        #       不说破用户不知道下一步该动哪里）
+        st.update(override="1080x1920", ar="0")
+        _D._adb_run = fake_adb
+        _D.subprocess.run = lambda *a, **k: _P(_png(1080, 1920))
+        r2b = _D.ensure_frame_1920x1080("adb", "s", logger=lambda m: None)
+        check("自动旋转关闭时，提示明确说「自动旋转是关闭的」",
+              "自动旋转" in (r2b.get("message") or "")
+              and "关闭" in (r2b.get("message") or ""), str(r2b.get("message")))
 
         # ⑤ 已经是横屏 → 一个字节都不改（不改用户设备状态）
         applied3 = []
@@ -2975,7 +3000,8 @@ def test_frame_fit():
         def fake_adb3(adb, args, timeout=20.0):
             a = " ".join(args)
             if "wm size" in a:
-                if "get" in a:
+                parts = a.split()
+                if parts[-1] == "size":
                     return "Physical size: 1080x2400\n"
                 applied3.append(a)
             return ""
@@ -3138,6 +3164,110 @@ def test_back_arrow():
           "画面已变化" in src)
 
 
+def test_device_job():
+    """后端派任务指定设备：serial 必须贯穿「排任务 → 派发 → 执行 → 回执」。
+
+    ★ 事故回顾（2026-09-21）：`/jobs` 页面上只有「执行客户端」下拉，**没有设备**；
+      `run_requests` 表也只有 client_id；接口只回 id/slot/only/client_id；
+      agent 起 run_daily 只传 `--job-only`。于是「用手机跑还是用模拟器跑」
+      在**整条链路上都表达不出来** —— 客户端只能靠 config.device.serial_candidates
+      猜设备，而实体机 serial（`340436524100AJ8`，**没有冒号**）天生不在候选表里。
+      表现就是「从后端发不起手机任务」：派了也没人跑得起来，或者悄悄跑到了模拟器上。
+
+    这一组钉住四件事：
+      ① 数据层有 device_id / serial（含老库迁移）；
+      ② pick_job 会**按设备过滤**（不领别的设备的活 —— 在错误设备上跑 = 花错号的资源）；
+      ③ 接口/agent/run_daily 三处都把这东西透传下去；
+      ④ 回执不把「启动就失败」说成「完成」。
+    """
+    print("\n[41] 设备任务：后端指定设备跑（serial 全链路）")
+    import io
+    import stzb.remote_config as _RC
+
+    with io.open(os.path.join(ROOT, "server", "app", "db.py"), encoding="utf-8") as f:
+        dbs = f.read()
+    check("run_requests 表有 device_id 与 serial 两列",
+          "device_id   INTEGER" in dbs and "serial      TEXT" in dbs)
+    check("迁移表里也有这两列（老库能自动补上，不用重建）",
+          '"device_id": "INTEGER"' in dbs and '"serial": "TEXT"' in dbs)
+    check("request_create 接受 device_id / serial",
+          "device_id: Optional[int] = None" in dbs
+          and "serial: Optional[str] = None" in dbs)
+    check("request_list 带出设备名（页面能回显排给哪台）",
+          "d.name AS device_name" in dbs)
+
+    # ---------------- pick_job 的行为（这是最容易写错、也最危险的一处）
+    class _C:
+        def __init__(self, jobs):
+            self.jobs = jobs
+            self.taken = []
+
+        def list_jobs(self):
+            return True, {"jobs": self.jobs}
+
+        def take_job(self, jid):
+            self.taken.append(jid)
+            return True
+
+    def _j(i, serial=""):
+        return {"id": i, "slot": "auto", "only": "", "dry_run": False,
+                "note": "", "serial": serial}
+
+    c = _C([_j(1, "127.0.0.1:7555"), _j(2, "340436524100AJ8")])
+    got = _RC.pick_job(c, logger=lambda m: None, serial="340436524100AJ8")
+    check("锁了手机时跳过模拟器那条、领到手机那条",
+          bool(got) and got["id"] == 2 and c.taken == [2],
+          "%s / taken=%s" % (got, c.taken))
+
+    c2 = _C([_j(1, "127.0.0.1:7555")])
+    got2 = _RC.pick_job(c2, logger=lambda m: None, serial="340436524100AJ8")
+    check("队列里只有别的设备的活 → 一条都不领（留给那台设备）",
+          got2 is None and c2.taken == [], "%s / taken=%s" % (got2, c2.taken))
+
+    c3 = _C([_j(1, "")])
+    got3 = _RC.pick_job(c3, logger=lambda m: None, serial="340436524100AJ8")
+    check("没指定设备的通用任务 → 锁了哪台都能领（按本机配置跑）",
+          bool(got3) and got3["id"] == 1, str(got3))
+
+    c4 = _C([_j(1, "127.0.0.1:7555")])
+    got4 = _RC.pick_job(c4, logger=lambda m: None, serial="")
+    check("本机自己没锁设备（老路径）→ 任何任务都能领，行为不变",
+          bool(got4) and got4["id"] == 1, str(got4))
+
+    c5 = _C([])
+    check("队列空 → None（不抛）",
+          _RC.pick_job(c5, logger=lambda m: None, serial="x") is None)
+
+    # ---------------- 接线：三处都要透传
+    with io.open(os.path.join(ROOT, "server", "app", "routes_agent.py"),
+                 encoding="utf-8") as f:
+        ags = f.read()
+    check("接口把 serial / device_id 下发给客户端",
+          '"serial":' in ags and '"device_id":' in ags)
+
+    with io.open(os.path.join(ROOT, "agent.py"), encoding="utf-8") as f:
+        agents = f.read()
+    check("agent 会看队列第一条要哪台设备并传 --serial",
+          "_peek_job_serial" in agents and '"--serial"' in agents)
+
+    with io.open(os.path.join(ROOT, "run_daily.py"), encoding="utf-8") as f:
+        rds = f.read()
+    check("run_daily 领任务时带上自己的目标设备（不领错设备的活）",
+          "pick_job(client, logger=log, serial=TARGET_SERIAL)" in rds)
+    check("任务自带设备而本机没定 → 以任务为准（定时任务路径也能跑对）",
+          "jserial" in rds)
+    check("任务设备与本机目标冲突 → 直接退出，不冒险跑错设备",
+          "不冒跑错设备的风险" in rds)
+
+    # ---------------- 回执：别把「一步没跑」说成「完成」
+    check("回执同时看「上传成功」和「本轮跑成功」",
+          "run_ok" in rds and "run_ok=False" in rds)
+    check("_bail（启动就失败）明确回执为非完成",
+          "run_ok=False)   # ← 启动阶段就失败了" in rds)
+    check("主流程回执的判据与返回码同源（不会自相矛盾）",
+          "run_ok=bool(res) and all(res.values())" in rds)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -3184,6 +3314,7 @@ if __name__ == "__main__":
     test_device_target()
     test_awake_guard()
     test_frame_fit()
+    test_device_job()
     test_home_tabs()
     test_back_arrow()
     print("\n" + "=" * 62)

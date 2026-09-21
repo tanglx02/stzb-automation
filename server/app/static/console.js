@@ -67,6 +67,40 @@
     }
   }
 
+  /* ---------------------------------------------- 任务页：客户端 → 设备 联动
+   * 用法：<select name="client_id" data-device-filter="jobdev">，
+   *       设备下拉的 id 为 jobdev，每个 option 带 data-cli="所属客户端id"。
+   *
+   * 为什么要有：设备是挂在一台电脑上的。选了一台客户端却能看到另一台的设备，
+   * 很容易排出一个「让 A 去连 B 的设备」的任务 —— 那必然连不上，而且报的错
+   * 跟真正的原因（选错了）没关系。所以按客户端收敛一下。
+   *
+   * ★ 这只是**界面便利**，不是安全边界：服务端 job_create 里照样会拿设备的
+   *   client_id 覆盖表单传来的值（见 routes_ui.py），前端被绕过也不会出错。
+   */
+  function filterDevices(sel) {
+    var box = document.getElementById(sel.getAttribute('data-device-filter'));
+    if (!box) return;
+    var cli = sel.value;
+    var opts = box.querySelectorAll('option[data-cli]');
+    for (var i = 0; i < opts.length; i++) {
+      var o = opts[i];
+      var keep = (cli === '' || o.getAttribute('data-cli') === cli);
+      o.hidden = !keep;
+      if (!keep && o.selected) { box.value = ''; }
+    }
+  }
+
+  function wireDeviceFilter() {
+    var sels = document.querySelectorAll('select[data-device-filter]');
+    for (var i = 0; i < sels.length; i++) {
+      (function (sel) {
+        sel.addEventListener('change', function () { filterDevices(sel); });
+        filterDevices(sel);
+      })(sels[i]);
+    }
+  }
+
   /* ------------------------------------------------------------ 下拉即提交
    * 用法：<select data-auto-submit>（角色执行页的「最近 N 天」）
    */
@@ -135,6 +169,7 @@
   function boot() {
     wireConfirm();
     wireRoleFilter();
+    wireDeviceFilter();
     wireAutoSubmit();
     wireAutoRefresh();
   }

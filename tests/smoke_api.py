@@ -227,6 +227,31 @@ with TestClient(app) as c:
             bad_pages.append((p, code))
     print("  页面全部 200:" if not bad_pages else "  !! 非 200 页面：%s" % bad_pages)
 
+    print("\n== 任务页必须能指定设备 ==")
+    # ★ 2026-09-21：后端曾经**整条链路都没有「设备」这个维度**，于是
+    #   「在手机上跑还是在模拟器上跑」根本选不出来，用户看到的现象是
+    #   「从后端发不起设备任务」。这里**硬断言**钉住入口别再被删掉 ——
+    #   少了下拉就等于这个功能又没了，不能只在屏幕上写一行提示。
+    jobs_html = c.get("/jobs").text
+    devs_html = c.get("/devices").text
+    # 设备行是**有登记设备时**才渲染的，而冒烟测试用的是空临时库 →
+    # 按钮不会出现在 HTML 里。所以这条查**模板文件**（跟护栏测试一个路子）。
+    _tpl = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "server", "app", "templates")
+    with open(os.path.join(_tpl, "_device_rows.html"), encoding="utf-8") as f:
+        dev_rows_tpl = f.read()
+    must_have = [
+        ('/jobs 的设备下拉', 'name="device_id"' in jobs_html),
+        ('/jobs 的「执行设备」表单标签', '执行设备（模拟器 / 实体手机）' in jobs_html),
+        ('/jobs 列表的「执行设备」表头', "<th>执行设备</th>" in jobs_html),
+        ('设备行模板的「跑一轮」按钮', "在这台设备上跑一轮" in dev_rows_tpl),
+    ]
+    for name, ok in must_have:
+        print("  %-34s %s" % (name, "✓" if ok else "✗ 缺失"))
+    missing = [n for n, ok in must_have if not ok]
+    if missing:
+        raise SystemExit("!! 设备任务入口缺失：%s" % missing)
+
     print("\n== 新增：设备管理接口与账号密码 ==")
     dev = c.get("/api/devices")
     print("  GET /api/devices ->", dev.status_code,

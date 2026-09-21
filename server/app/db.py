@@ -257,6 +257,14 @@ CREATE TABLE IF NOT EXISTS run_requests (
     --   普通用户只能看到/取消自己排的，管理员看全部。
     owner_id    INTEGER,
     client_id   INTEGER,                           -- 指定哪台客户端执行；NULL = 任意一台
+    -- ★ 指定**设备**（2026-09-21 加）。之前只有 client_id，于是「用手机跑还是
+    --   用模拟器跑」在整条链路上都表达不出来 —— 客户端只能靠
+    --   config.device.serial_candidates 猜设备，而实体机 serial 没有冒号、
+    --   天生不在那份候选表里，结果就是**从后端永远发不起手机任务**。
+    --   device_id 用于页面回显（任务排给哪台设备）；serial 才是客户端真正
+    --   要用的东西 —— 设备后来被删了，这条历史的队列仍然可执行、可排查。
+    device_id   INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    serial      TEXT,
     slot        TEXT,
     only_tasks  TEXT,
     dry_run     INTEGER NOT NULL DEFAULT 0,
@@ -336,6 +344,10 @@ _MIGRATIONS = {
     "run_requests": {
         "client_id": "INTEGER",
         "owner_id": "INTEGER",                 # 多用户：谁排的队
+        # 定向到具体设备（模拟器 / 实体机）。老库没有这两列，
+        # 补上之后「用哪台设备跑」才表达得出来 —— 见 SCHEMA 里的长注释。
+        "device_id": "INTEGER",
+        "serial": "TEXT",
     },
     "game_accounts": {
         "owner_id": "INTEGER",                 # 多用户：账号归谁
@@ -883,12 +895,24 @@ def prune_runs(keep: int) -> List[int]:
 
 def request_create(slot: str, only_tasks: str, dry_run: bool, by: str, note: str = "",
                    client_id: Optional[int] = None,
-                   owner_id: Optional[int] = None) -> int:
+                   owner_id: Optional[int] = None,
+                   device_id: Optional[int] = None,
+                   serial: Optional[str] = None) -> int:
+    """排一条待执行任务。
+
+    device_id / serial 是「用哪台设备跑」（2026-09-21 加）。两者一起写：
+    device_id 给页面回显，serial 给客户端连设备 —— 客户端拿到 serial 会
+    直接把它当目标设备用，**不再靠 config 里的候选表猜**（猜错的后果是
+    在别的设备上跑，等于在别的号上花资源）。
+    """
     with tx() as c:
         cur = c.execute(
-            "INSERT INTO run_requests(created_at,created_by,owner_id,client_id,slot,"
-            "only_tasks,dry_run,status,note) VALUES(?,?,?,?,?,?,?,'pending',?)",
-            (now(), by, owner_id, client_id, slot or "auto", only_tasks or "",
+            "INSERT INTO run_requests(created_at,created_by,owner_id,client_id,"
+            "device_id,serial,slot,only_tasks,dry_run,status,note) "
+            "VALUES(?,?,?,?,?,?,?,?,?,'pending',?)",
+            (now(), by, owner_id, client_id,
+             device_id, (serial or "").strip() or None,
+             slot or "auto", only_tasks or "",
              1 if dry_run else 0, note))
         return int(cur.lastrowid)
 
@@ -906,9 +930,11 @@ def request_list(limit: int = 50, status: Optional[str] = None,
         where.append("(r.owner_id IS ? OR r.owner_id IS NULL)")
         params.append(owner_id)
     sql = ("SELECT r.*, c.name AS client_name, c.host AS client_host, "
-           "u.username AS owner_name FROM run_requests r "
+           "u.username AS owner_name, d.name AS device_name, d.kind AS device_kind "
+           "FROM run_requests r "
            "LEFT JOIN clients c ON c.id=r.client_id "
-           "LEFT JOIN users u ON u.id=r.owner_id ")
+           "LEFT JOIN users u ON u.id=r.owner_id "
+           "LEFT JOIN devices d ON d.id=r.device_id ")
     if where:
         sql += "WHERE " + " AND ".join(where) + " "
     sql += "ORDER BY r.id DESC LIMIT ?"
