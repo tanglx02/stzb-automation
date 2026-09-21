@@ -78,6 +78,28 @@ NZ_ENTRY_FALLBACK = {
 SUB_CLOSE = [(1832, 53), (1771, 144), (1792, 158), (1766, 57)]
 NZ_BACK = [(1835, 57), (1872, 57), (1810, 57)]                 # 内政/主界面右上返回箭头（实测在 1835,57）
 
+# 面板右上角那个「返回箭头」（奶油色弯曲箭头 + 深色圆底）的**几何指纹**。
+#
+# ★★ 为什么必须几何定位，不能只靠上面那串固定候选（2026-09-21 真机实测）：
+#   这个箭头的位置**因设备而异**，而且差得不是一点点：
+#       模拟器实测中心 **(1832, 53)**  ← 老候选 (1832,53) 正好命中
+#       手机实测中心   **(1759, 132)**  ← 老候选**全部落空**
+#                                        （(1771,144) 只擦到块的右下角）
+#   根因：实体机的应用可用区不是满屏 —— 实测 `mAppBounds=Rect(0,36-1920,954)`，
+#   只有 1920×918（顶部被刘海内边距 81px + 状态栏挤掉），游戏于是把整个 UI
+#   **重新排版**（底部页签 x 缩放 0.925、返回箭头挪到 (1759,132)），
+#   和模拟器的 1920×1080 满屏布局**不是同一个坐标系**。
+#   后果：手机上关不掉内政面板 → `to_home()` 连试 14 轮全失败、
+#   卡住 ~5 分钟（任务最后靠内部重试兜回来，但白耗时间且随时可能真失败）。
+#
+#   而**颜色+形状指纹在两种布局下完全一致**（实测均值 BGR≈(140,189,205)，
+#   块约 53~58 × 39~44，右上角 32%×22% 区域内**有且只有一个**这种色块），
+#   所以这条判据是跨设备稳的。
+BACK_ARROW_BOX = {"x_frac": 0.78, "y_frac": 0.32,
+                  "min_w": 30, "max_w": 90, "min_h": 24, "max_h": 70,
+                  "min_ratio": 1.05, "max_ratio": 1.9, "max_area": 4000,
+                  "min_area": 120}
+
 # 弹窗
 BTN_CANCEL = (756, 743)        # 「确定退出率土之滨？」→「取消」
 BTN_START_GAME = (960, 876)    # 登录页「开始游戏」
@@ -924,9 +946,80 @@ class Ui:
             return ("月卡礼包", "超值贡品", "每日领取")
         return ()
 
+    def back_arrow_point(self, img) -> Optional[Point]:
+        """几何定位面板右上角的「返回箭头」，定位不到返回 None。
+
+        判据（2026-09-21 两台设备实测一致）：
+          · 位置：画面右上角（x > 78% 宽、y < 32% 高）
+          · 颜色：**奶油色** —— R>170 且 G>160 且 R-B>35 且 G-B>25
+            （实测两台的均值都是 BGR≈(140,189,205)，几乎一模一样）
+          · 形状：宽 30~90、高 24~70、**宽高比 1.05~1.9**（箭头是横的，不是方块）
+
+        为什么值得单独做这一条：见 `BACK_ARROW_BOX` 上方那段说明 ——
+        箭头位置在模拟器 (1832,53) / 手机 (1759,132)，**固定坐标兜不住**，
+        而颜色+形状指纹两边一致。实测该区域内**有且只有一个**这种色块，
+        所以判据很干净（不会误伤旁边的金色「特性」图标 —— 它不在这个色域内）。
+
+        保守起见：**只认「唯一一个」合格块**；找到 0 个或多个都返回 None，
+        让调用方回退到原有候选点（宁可慢一点，也不要瞎点）。
+        """
+        if img is None:
+            return None
+        try:
+            import cv2
+            import numpy as np
+        except Exception:                        # noqa: BLE001
+            return None
+        h, w = img.shape[:2]
+        if not h or not w:
+            return None
+        cfg = BACK_ARROW_BOX
+        x0 = int(w * cfg["x_frac"])
+        y1 = int(h * cfg["y_frac"])
+        reg = img[0:y1, x0:]
+        if reg.size == 0:
+            return None
+        try:
+            b = reg[:, :, 0].astype(int)
+            g = reg[:, :, 1].astype(int)
+            r = reg[:, :, 2].astype(int)
+            mask = (((r > 170) & (g > 160) & ((r - b) > 35) & ((g - b) > 25))
+                    .astype(np.uint8) * 255)
+            n, _lab, stats, cent = cv2.connectedComponentsWithStats(mask)
+        except Exception:                        # noqa: BLE001
+            return None
+        hits: List[Point] = []
+        for i in range(1, n):
+            _x, _y, bw, bh, area = stats[i]
+            if not (cfg["min_area"] <= area <= cfg["max_area"]):
+                continue
+            if not (cfg["min_w"] <= bw <= cfg["max_w"]):
+                continue
+            if not (cfg["min_h"] <= bh <= cfg["max_h"]):
+                continue
+            ratio = float(bw) / float(max(1, bh))
+            if not (cfg["min_ratio"] <= ratio <= cfg["max_ratio"]):
+                continue
+            hits.append((int(cent[i][0]) + x0, int(cent[i][1])))
+        if len(hits) != 1:
+            return None                          # 0 个或多个都不猜
+        return hits[0]
+
     def _try_closes(self, anchors: Sequence[str], cands: Sequence[Point],
-                    per_try: float = 1.8) -> bool:
-        """在候选坐标里挨个点，直到特征词消失（说明面板关了）。"""
+                    per_try: float = 1.6) -> bool:
+        """在候选坐标里挨个点，直到特征词消失（说明面板关了）。
+
+        ★ 为什么点完要「再确认一次」（2026-09-21 真机踩到）：
+          面板关闭**有动画**，而 OCR 本身也要一秒左右。老代码只等 1.8s 就下结论，
+          面板还没关干净 → 判成「这个候选没用」→ 继续点后面的候选。
+          而后面那些候选**落在主城上**，在主城上瞎点可能又开出别的面板 ——
+          于是「关掉 → 又打开」来回振荡，实测手机上 `to_home()` 连试 14 轮全失败、
+          白耗约 5 分钟（日志里只有一长串「尝试关闭当前面板 政策」，
+          完全看不出真正原因）。
+          所以这里第一次判定「还在」时，**多给一个确认窗口**再复查一次
+          （总等待 ≈ per_try + confirm 秒），把「正在关」和「真的没点中」分开。
+        """
+        confirm = 2.4
         for c in cands:
             self.tap(*c, delay=0.0)
             time.sleep(per_try)
@@ -938,6 +1031,11 @@ class Ui:
             if self.is_home(items):
                 return True                      # 已经回到主城就别再点了
             if not self.has(items, *anchors):
+                return True
+            # 还看得见锚点 —— 可能只是关得慢，再等一会儿复查一次
+            time.sleep(confirm)
+            items2, _ = self.ocr("closechk2")
+            if self.is_home(items2) or not self.has(items2, *anchors):
                 return True
         return False
 
@@ -971,16 +1069,36 @@ class Ui:
                     continue
                 anchors = self._screen_anchors(items)
                 neizheng = self.is_neizheng(items)
-                cands = NZ_BACK + SUB_CLOSE if neizheng else SUB_CLOSE
+                cands = list(NZ_BACK + SUB_CLOSE if neizheng else SUB_CLOSE)
+                # ★ 几何定位到的返回箭头**排在最前**（跨设备稳）：
+                #   它比那串在模拟器上量的固定坐标可靠 —— 手机上固定候选全部落空。
+                #   定位不到就原样用固定候选（老行为不变）。
+                arrow = None
+                try:
+                    arrow = self.back_arrow_point(read_png(path))
+                except Exception as e:           # noqa: BLE001
+                    self.log("    ! 返回箭头几何定位失败：%r" % (e,))
+                if arrow is not None:
+                    cands.insert(0, arrow)
                 if anchors:
-                    self.log("    · 尝试关闭当前面板 %s" % (anchors[0],))
+                    self.log("    · 尝试关闭当前面板 %s%s"
+                             % (anchors[0], "（返回箭头几何定位 @%s）" % (arrow,)
+                                if arrow else ""))
                     self._try_closes(anchors, cands)
                 else:
                     # 认不出的界面：原来只点 cands[0] 就拉倒，于是死等启动超时。
                     # 实测踩到「政务」面板 —— 它的 ✕ 在 (1778,155) 附近，
                     # 正好不是 cands[0]=(1832,53)，300 秒全耗在「等待中…」。
                     # 改成把右上角整串候选都试一遍，每点一次回头确认有没有回主城。
+                    #
+                    # ★ 但**画面一旦明显变了就要立刻停手**（2026-09-21 真机踩到）：
+                    #   原来只在「锚点出现」时才 break。可如果那一下**正好把面板关掉**，
+                    #   锚点是不会出现的（变成主城了，而主城未必能立刻认出）→
+                    #   循环继续拿后面的候选**往主城上点**，又开出别的面板 →
+                    #   「关掉→又打开」来回振荡，14 轮全废。
+                    #   所以加一条「这一帧和点之前明显不是同一屏了 → 停手，交回外层重判」。
                     self.log("    · 认不出的界面 → 依次试右上角 ✕")
+                    before = {it.text.strip() for it in items if it.text.strip()}
                     for c in cands:
                         self.tap(*c, delay=0.0)
                         time.sleep(1.5)
@@ -990,6 +1108,14 @@ class Ui:
                             return True
                         if self._screen_anchors(items2):
                             break               # 已经切到认得出的面板，交给外层循环
+                        after = {it.text.strip() for it in items2 if it.text.strip()}
+                        if before and after:
+                            same = len(before & after) / float(len(before | after))
+                            if same < 0.5:
+                                # 换屏了（多半就是关成功了）→ 别再往新画面上点
+                                self.log("    · 画面已变化（相似度 %.2f）→ 停止试点，重新判断"
+                                         % same)
+                                break
         self.log("  !! 回主城失败（已尝试 %d 次）" % max_rounds)
         return False
 

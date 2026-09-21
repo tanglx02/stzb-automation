@@ -3064,6 +3064,80 @@ def test_home_tabs():
           "换一帧重试，不盲点" in src)
 
 
+def test_back_arrow():
+    """面板右上角「返回箭头」：几何定位（跨设备）。
+
+    ★ 事故回顾（2026-09-21 真机）：关面板用的那串固定候选点是**在模拟器上量的**
+      （`SUB_CLOSE`/`NZ_BACK` 都在 (1832,53)/(1835,57) 一带）。而实体机的应用可用区
+      不是满屏（实测 `mAppBounds=Rect(0,36-1920,954)`，只有 1920×918，
+      被刘海内边距 + 状态栏挤掉一截），游戏把整个 UI **重新排版**：
+        模拟器箭头中心 **(1832, 53)**  ← 老候选正好命中
+        手机箭头中心   **(1759, 132)**  ← 老候选全部落空
+      后果：手机上关不掉内政面板，`to_home()` 连试 14 轮全失败、卡 ~5 分钟，
+      日志里只有一长串「尝试关闭当前面板 政策」，完全看不出真正原因。
+
+    修法：按**颜色+形状**几何定位（实测两台均值 BGR 都是 (140,189,205)、
+    块 53~58×39~44，且右上角该区域内**有且只有一个**这种色块）。
+    """
+    print("\n[40] 返回箭头：几何定位（替代设备相关的固定坐标）")
+    import numpy as _np
+    from stzb.ui import BACK_ARROW_BOX, Ui
+
+    ui = Ui.__new__(Ui)
+
+    def _mk(blobs):
+        """暗底 1920x1080 上画奶油色块（BGR 与实测一致）。"""
+        img = _np.zeros((1080, 1920, 3), dtype=_np.uint8)
+        img[:, :] = (60, 60, 70)
+        for cx, cy, w, h in blobs:
+            x0, y0 = int(cx - w / 2), int(cy - h / 2)
+            img[y0:y0 + h, x0:x0 + w] = (140, 189, 205)     # BGR 奶油色
+        return img
+
+    def _near(got, want, tol=2):
+        """质心会有 1~2px 的舍入差（合成图是整数矩形），点按钮完全够用。"""
+        return got is not None and abs(got[0] - want[0]) <= tol \
+            and abs(got[1] - want[1]) <= tol
+
+    # ① 两台设备各自的真实位置都要认出来（这才是「跨设备」的意义）
+    check("模拟器位置 (1832,53) 认出箭头",
+          _near(ui.back_arrow_point(_mk([(1832, 53, 58, 44)])), (1832, 53)),
+          str(ui.back_arrow_point(_mk([(1832, 53, 58, 44)]))))
+    check("手机位置 (1759,132) 认出箭头",
+          _near(ui.back_arrow_point(_mk([(1759, 132, 53, 39)])), (1759, 132)),
+          str(ui.back_arrow_point(_mk([(1759, 132, 53, 39)]))))
+    check("老固定候选 (1832,53) 在手机位置上确实落空（这就是那个 bug）",
+          abs(1759 - 1832) > 40 and abs(132 - 53) > 40)
+
+    # ② 保守性：0 个 / 多个 / 形状不对，一律 None（宁可慢，不要瞎点）
+    check("没有色块 → None", ui.back_arrow_point(_mk([])) is None)
+    check("有两个色块（歧义）→ None",
+          ui.back_arrow_point(_mk([(1832, 53, 58, 44), (1759, 132, 53, 39)])) is None)
+    check("方块（宽高比 1.0，不像箭头）→ None",
+          ui.back_arrow_point(_mk([(1832, 53, 44, 44)])) is None)
+    check("太小的噪点 → None", ui.back_arrow_point(_mk([(1832, 53, 12, 9)])) is None)
+    check("位置偏左（不在右上角区域）→ None",
+          ui.back_arrow_point(_mk([(700, 53, 58, 44)])) is None)
+    check("位置偏下（不在顶部区域）→ None",
+          ui.back_arrow_point(_mk([(1832, 700, 58, 44)])) is None)
+    check("画面为 None → None", ui.back_arrow_point(None) is None)
+
+    # ③ 判据常量自洽
+    check("宽高比区间能容下实测的 58/44=1.32 与 53/39=1.36",
+          BACK_ARROW_BOX["min_ratio"] <= 1.32 <= BACK_ARROW_BOX["max_ratio"]
+          and BACK_ARROW_BOX["min_ratio"] <= 1.36 <= BACK_ARROW_BOX["max_ratio"])
+
+    # ④ 接线：to_home 必须把几何点**排在最前**，且定位不到时回退老候选
+    with open(os.path.join(ROOT, "stzb", "ui.py"), encoding="utf-8") as f:
+        src = f.read()
+    check("to_home 里调了 back_arrow_point", "back_arrow_point(read_png(path))" in src)
+    check("几何点插到候选最前（cands.insert(0, arrow)）", "cands.insert(0, arrow)" in src)
+    check("_try_closes 加了「关得慢」的二次确认（避免误判没点中）",
+          "closechk2" in src)
+    check("认不出的界面：画面明显变化就停手（避免关掉后又往新画面点）",
+          "画面已变化" in src)
+
+
 if __name__ == "__main__":
     print("=" * 62)
     print("  率土之滨自动化 —— 离线自检")
@@ -3111,6 +3185,7 @@ if __name__ == "__main__":
     test_awake_guard()
     test_frame_fit()
     test_home_tabs()
+    test_back_arrow()
     print("\n" + "=" * 62)
     print("  通过 %d 项，失败 %d 项" % (PASS, FAIL))
     print("=" * 62)
