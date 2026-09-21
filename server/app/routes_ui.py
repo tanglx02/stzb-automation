@@ -132,6 +132,14 @@ def _ctx(request: Request, **kw) -> Dict[str, Any]:
         "plan_task_keys": plan.TASK_KEYS,
         "plan_slots": plan.SLOTS,
         "task_name": {t["key"]: t["name"] for t in managed.TASK_META},
+        # 指令类型的中文名（设备页/账号页显示「这条指令是干什么的」）
+        "probe_kinds": db.PROBE_KINDS,
+        "device_kinds": db.DEVICE_KINDS,
+        # 两个页面共用 _probe_box.html / _device_rows.html 时要有默认值：
+        # 账号页不会传 running / devices，缺了默认值模板里 `running` 就是 Undefined，
+        # `{% if running %}` 在 Jinja 里对 Undefined 判 False（刚好是对的），
+        # 但 `running.why` 会抛错 —— 所以显式兜一个 None。
+        "running": None,
     }
     base.update(kw)
     return base
@@ -826,18 +834,31 @@ def accounts_page(request: Request, ok: str = "", err: str = "", hl: int = 0):
         for r in a["roles"]:
             r["plan"] = plan.loads_plan(r.get("task_plan"))
             r["plan_text"] = plan.summary_text(r.get("task_plan"))
-    # 每个账号下挂了几台客户端（用于提示「删了会影响谁」）
+            # ★ 角色自动发现的痕迹：在游戏里找不到的角色要显眼地标出来，
+            #   让用户判断是改名了还是真没了（系统只标不删，见 db.role_sync_discovered）
+            r["_stale"] = bool(r.get("missing_at")) and \
+                str(r.get("missing_at") or "") > str(r.get("seen_at") or "")
+    # 每个账号下挂了几台客户端 / 几台设备（用于提示「删了会影响谁」）
     users: Dict[int, List[Any]] = {}
     for c in db.client_list():
         if c.get("account_id"):
             users.setdefault(int(c["account_id"]), []).append(c)
+    holders: Dict[int, List[Any]] = {}
+    for d in db.device_list():
+        if d.get("account_id"):
+            holders.setdefault(int(d["account_id"]), []).append(d)
+    for a in accounts:
+        a["_holders"] = holders.get(int(a["id"]), [])
     return templates.TemplateResponse(request, "accounts.html", _ctx(
         request, nav="accounts", accounts=accounts, ok=ok, err=err, hl=hl,
         users=users, clients=db.client_list(),
         # 管理员才能在「新增/编辑账号」里改归属；普通用户建号恒归自己，不需要这个下拉
         all_users=db.user_list() if is_admin(request) else [],
         # 模板里「客户端指派一览」要按 role_id 反查角色名，这里必须传（原来漏了）
-        role_list=db.role_list(**sc)))
+        role_list=db.role_list(**sc),
+        # 角色发现要选一台客户端来执行；结果也会落到设备页，普通用户看不到那边
+        devices_all=db.device_list() if is_admin(request) else [],
+        running=_anyone_running() if is_admin(request) else None))
 
 
 def _plan_from_form(form) -> str:
@@ -877,10 +898,29 @@ async def account_create(request: Request):
                             masked=str(form.get("masked") or ""),
                             tag=str(form.get("tag") or ""),
                             note=str(form.get("note") or ""),
-                            owner_id=owner)
-    db.event("info", "console", "新增游戏账号「%s」（#%d，归属=%s）"
-             % (label, aid, u["username"] if owner else "管理员/公共"))
-    return RedirectResponse("/accounts?hl=%d&ok=%s" % (aid, _q("账号已添加")), status_code=303)
+                            owner_id=owner,
+                            password=str(form.get("password") or ""),
+                            pwd_hint=str(form.get("pwd_hint") or ""))
+    db.event("info", "console", "新增游戏账号「%s」（#%d，归属=%s%s）"
+             % (label, aid, u["username"] if owner else "管理员/公共",
+                "，已设密码" if str(form.get("password") or "").strip() else ""))
+    # ★ 用户需求：「添加完之后后台会自动查看目前有没有在跑任务，如果没有跑会提示
+    #   可以添加然后启动模拟器或者实体手机配合用户完成添加」。
+    #   这里不自动下发任何指令（自动启模拟器会打断别人正在跑的任务），
+    #   只把「现在空闲/在忙」如实带回去，让用户在页面上自己决定下一步。
+    busy = _anyone_running()
+    if busy:
+        return RedirectResponse(
+            "/accounts?hl=%d&ok=%s" % (aid, _q(
+                "账号「%s」已添加。注意：%s —— 要连设备登录请等它跑完，"
+                "否则会打断正在跑的任务" % (label, busy["why"]))),
+            status_code=303)
+    return RedirectResponse(
+        "/accounts?hl=%d&ok=%s#a%d" % (aid, _q(
+            "账号「%s」已添加。现在没有任务在跑 —— 可以到「设备管理」"
+            "启动模拟器 / 添加实体手机，再点「发现角色」把游戏里的角色读回来"
+            % label), aid),
+        status_code=303)
 
 
 @router.post("/accounts/{aid}/update")
@@ -905,6 +945,47 @@ async def account_update(request: Request, aid: int):
     db.account_update(aid, **fields)
     db.event("info", "console", "更新游戏账号 #%d" % aid)
     return RedirectResponse("/accounts?hl=%d&ok=%s" % (aid, _q("已保存")), status_code=303)
+
+
+@router.post("/accounts/{aid}/password")
+async def account_set_password(request: Request, aid: int):
+    """给游戏账号设 / 改 / 清密码（用户需求：「后台新增账号要带密码」）。
+
+    ★ 存的是 scrypt 哈希（`db.account_set_password` → `security.hash_secret`），
+      **不是明文**，且哈希永远不出数据层（`_scrub_account` 把它换成 has_password）。
+      所以这里的语义是「凭据台账」：账号掉了要人工重登时能核对密码对不对，
+      **不能**用它自动登录网易 —— 登录走的是游戏的「常用账号列表」（免密）。
+      这一点在 accounts.html 的说明块里也写了，免得用户以为填了密码就能自动登录。
+
+    `pwd_hint` 是**明文提示**（用户自己写的，比如「尾号4508那个」），
+    和密码本身无关，可以放心显示在界面上。
+    """
+    require_user(request)
+    sc = scope_of(request)
+    if not db.account_owned_by(aid, sc["owner_id"]):
+        return RedirectResponse("/accounts?err=%s" % _q("没有这个账号"), status_code=303)
+    if not db.account_get(aid):
+        return RedirectResponse("/accounts?err=%s" % _q("账号不存在"), status_code=303)
+    form = await request.form()
+    pwd = str(form.get("password") or "").strip()
+    hint = str(form.get("pwd_hint") or "").strip()
+    if form.get("clear"):
+        db.account_set_password(aid, "", hint)
+        db.event("warn", "console", "清空游戏账号 #%d 的密码" % aid)
+        return RedirectResponse("/accounts?hl=%d&ok=%s" % (aid, _q("已清空该账号的密码")),
+                                status_code=303)
+    if not pwd:
+        return RedirectResponse("/accounts?hl=%d&err=%s" % (aid, _q("密码不能为空（要清空请点「清空密码」）")),
+                                status_code=303)
+    if len(pwd) < 6:
+        # 游戏账号密码是网易那边的规则，这里只做个下限提醒 —— 不替对方定规则，
+        # 但太短的「凭据」记了也没意义（真要核对时自己都不确定打对了没）。
+        return RedirectResponse("/accounts?hl=%d&err=%s" % (aid, _q("密码至少 6 位")),
+                                status_code=303)
+    db.account_set_password(aid, pwd, hint)
+    db.event("info", "console", "设置游戏账号 #%d 的密码（哈希入库）" % aid)
+    return RedirectResponse("/accounts?hl=%d&ok=%s" % (aid, _q("密码已保存（只存哈希，无法回读）")),
+                            status_code=303)
 
 
 @router.post("/accounts/{aid}/delete")
@@ -1058,6 +1139,413 @@ def roles_page(request: Request, days: int = 7, hl: int = 0,
     return templates.TemplateResponse(request, "roles.html", _ctx(
         request, nav="roles", ov=ov, days=days, hl=hl,
         ok=ok, err=err, warn=warn, clients=db.client_list()))
+
+
+# ================================================================== 设备管理
+#
+# ★ 2026-09-21 用户需求：「后台增加客户端设备，也能管理客户端设备，比如管理员
+#   直接能从后台启动安卓模拟器（这是其中一种设备），然后还能在后台添加安卓手机
+#   实体机客户端」。
+#
+# 模型（见 db.py devices 表那段注释）：
+#   clients = 一台跑 agent.py 的电脑（心跳/在线状态）
+#   devices = 那台电脑上挂着的具体设备（模拟器 / USB 实体机），设备级才有账号指派
+#
+# 后端**永远不直接碰 ADB** —— 它在内网另一头。所有设备操作都是
+# 「往客户端下一次指令 → 客户端执行 → 回报结果」，所以每个按钮的反馈都是
+# 「已下发，等客户端回报」，结果回到这一页的设备块里。
+
+def _anyone_running() -> Optional[Dict[str, Any]]:
+    """本机（所有客户端）此刻有没有在跑任务。
+
+    ★ 用途是用户需求里那句「添加完之后后台会自动查看目前有没有在跑任务，
+      如果没有跑会提示可以添加然后启动模拟器或者实体手机」。
+
+    判据看两处，缺一不可：
+      · 客户端心跳里报的 busy/state=running（正在跑）
+      · 客户端有**未取走**的一轮任务在队列里（即将跑）
+    只查队列会漏掉「正在跑但队列已清空」；只查状态会漏掉「刚派下去还没起」。
+    """
+    for c in db.client_list():
+        st = c.get("status") or {}
+        if st.get("busy") or st.get("state") == "running":
+            return {"client": c, "why": "客户端「%s」正在跑任务"
+                    % (c.get("name") or c.get("host") or c.get("uid"))}
+    pend = db.request_pending(limit=1)
+    if pend:
+        return {"client": None,
+                "why": "队列里还有 %d 条待执行任务" % len(db.request_pending(limit=99))}
+    return None
+
+
+def _device_post(request: Request, cid: int, kind: str, extra: Optional[Dict[str, Any]] = None,
+                 note: str = "", back: str = "") -> RedirectResponse:
+    """给某台客户端的设备下发一条指令（设备页的按钮都走这里，避免各写一遍）。
+
+    实时通道连着就是秒到；没连上则等下一次心跳（≤ HEARTBEAT_INTERVAL 秒）取走。
+    """
+    cli = db.client_get(cid)
+    if not cli:
+        return RedirectResponse("/devices?err=%s" % _q("客户端不存在"), status_code=303)
+    p = db.client_request_probe(cid, kind=kind,
+                                by=current_user(request) or "?", note=note,
+                                extra=extra or {})
+    pushed = realtime.notify_client(cid, "command", probe=p.get("id"))
+    db.event("info", "console", "给客户端 #%d 下发设备指令「%s」%s"
+             % (cid, db.PROBE_KINDS.get(kind, kind), "（实时推送）" if pushed else ""))
+    tip = "已下发「%s」%s" % (db.PROBE_KINDS.get(kind, kind),
+                              "（实时通道已送达）" if pushed
+                              else "，等它下次心跳（最多 %d 秒）" % settings.HEARTBEAT_INTERVAL)
+    return RedirectResponse((back or "/devices?hl=%d" % cid) + "&ok=%s" % _q(tip),
+                            status_code=303)
+
+
+@router.get("/devices", response_class=HTMLResponse)
+def devices_page(request: Request, hl: int = 0, ok: str = "", err: str = "",
+                 cid: int = 0):
+    """设备页：扫描 ADB 设备、添加实体机/模拟器、远程启停模拟器、横屏覆盖、发现角色。
+
+    管理员专属 —— 这一页全都是对共用主机的操作（启停模拟器谁都能点的话，
+    等于谁都能把别人正在跑的任务打断）。
+    """
+    require_admin(request)
+    sc = scope_of(request)
+    clients = db.client_list()
+    devs = db.device_list()
+    # 设备按「属于哪台电脑」分组渲染；没归属的（电脑记录被删过）单独一堆
+    by_client: Dict[int, List[Dict[str, Any]]] = {}
+    for d in devs:
+        by_client.setdefault(int(d.get("client_id") or 0), []).append(d)
+        d["_account"] = db.account_get(int(d["account_id"])) if d.get("account_id") else None
+    for c in clients:
+        c["_devices"] = by_client.get(int(c["id"]), [])
+        c["_roles"] = [r for r in (db.role_list(int(c["account_id"]))
+                                   if c.get("account_id") else []) if r.get("enabled")]
+        c["realtime"] = realtime.is_connected(c.get("uid") or "")
+        # 这台电脑上一次 adb_scan 的结果里，有哪些设备**还没登记**
+        pr = c.get("probe") or {}
+        c["_scan_new"] = []
+        if pr.get("kind") == "adb_scan" and pr.get("status") == "done":
+            res = pr.get("result") or {}
+            known = {str(d["serial"]) for d in c["_devices"]}
+            for d in (res.get("devices") or []):
+                s = str(d.get("serial") or "")
+                if s and s not in known:
+                    c["_scan_new"].append(d)
+            c["_emu"] = res.get("emulator") or {}
+    return templates.TemplateResponse(request, "devices.html", _ctx(
+        request, nav="devices", clients=clients, devices=devs, hl=hl,
+        orphan=by_client.get(0, []), accounts=db.account_list(**sc),
+        role_list=db.role_list(**sc), running=_anyone_running(),
+        ok=ok, err=err))
+
+
+@router.post("/devices/scan")
+async def devices_scan(request: Request):
+    """让某台客户端扫一遍它本机的 ADB 设备（含未授权的，那样才能提示去点允许调试）。
+
+    ★ 扫描结果**不会**自动变成设备记录 —— 只有用户点「添加」才入库。
+      理由见 routes_agent._sync_scanned_devices 的说明（自动建会塞进一堆脏行）。
+    """
+    require_admin(request)
+    form = await request.form()
+    cid = int(str(form.get("client_id") or "0") or 0)
+    if not cid:
+        return RedirectResponse("/devices?err=%s" % _q("没指定哪台客户端"), status_code=303)
+    return _device_post(request, cid, "adb_scan",
+                        note="后台要求扫描 ADB 设备",
+                        back="/devices?hl=%d" % cid)
+
+
+@router.post("/devices/add")
+async def device_add(request: Request):
+    """登记一台设备（模拟器或 USB 实体机）。
+
+    两种入口共用这一个路由：
+      · 扫描结果里的「添加」按钮 → 表单带着扫到的 serial / kind / 屏幕信息
+      · 手动填写 → 用户自己敲 serial（比如手机没插着、想先建好记录）
+    幂等：同一台电脑下同一个 serial 重复提交只会得到同一条记录（device_create）。
+    """
+    require_admin(request)
+    form = await request.form()
+    cid = int(str(form.get("client_id") or "0") or 0)
+    serial = str(form.get("serial") or "").strip()
+    kind = str(form.get("kind") or "phone")
+    name = str(form.get("name") or "").strip()
+    note = str(form.get("note") or "").strip()
+    if not cid:
+        return RedirectResponse("/devices?err=%s" % _q("请先选这台设备挂在哪台客户端下"),
+                                status_code=303)
+    if not serial:
+        return RedirectResponse("/devices?hl=%d&err=%s" % (cid, _q("serial 不能为空")),
+                                status_code=303)
+    did = db.device_create(serial, kind, client_id=cid, name=name, note=note,
+                           vmindex=int(str(form.get("vmindex") or "0") or 0))
+    # 顺手把扫到的屏幕信息补进去（有就填，没有就算了）
+    for k in ("screen_w", "screen_h", "native_w", "native_h"):
+        v = str(form.get(k) or "").strip()
+        if v.isdigit():
+            db.device_update(did, **{k: int(v)})
+    if str(form.get("override") or "") == "1080x1920":
+        db.device_update(did, force_size=1)
+    row = db.device_get(did)
+    db.event("info", "console", "登记设备 %s（%s）到客户端 #%d"
+             % (serial, db.DEVICE_KINDS.get(kind, kind), cid))
+    return RedirectResponse("/devices?hl=%d&ok=%s"
+                            % (cid, _q("已添加设备：%s" % ((row or {}).get("name") or serial))),
+                            status_code=303)
+
+
+@router.post("/devices/{did}/update")
+async def device_update(request: Request, did: int):
+    """改设备的名字 / 类型 / 备注 / 是否启用 / 模拟器实例号。
+
+    只覆盖**表单里真的出现了**的字段（`_has_*` 隐藏标记那一套，和账号编辑一致）：
+    设备页上有好几种小表单（有的只改名字），缺了标记就会把没提交的字段清空。
+    """
+    require_admin(request)
+    form = await request.form()
+    d = db.device_get(did)
+    if not d:
+        return RedirectResponse("/devices?err=%s" % _q("设备不存在"), status_code=303)
+    fields: Dict[str, Any] = {}
+    if "name" in form:
+        fields["name"] = str(form.get("name") or "").strip()[:60]
+    if "note" in form:
+        fields["note"] = str(form.get("note") or "").strip()[:200]
+    if form.get("kind") in ("emulator", "phone"):
+        fields["kind"] = str(form.get("kind"))
+    if "vmindex" in form:
+        try:
+            fields["vmindex"] = int(str(form.get("vmindex") or "0"))
+        except Exception:
+            pass
+    if form.get("_has_enabled"):
+        fields["enabled"] = form.get("enabled") is not None
+    db.device_update(did, **fields)
+    db.event("info", "console", "设备 #%d 信息已更新（%s）"
+             % (did, "、".join(fields.keys()) or "无变化"))
+    return RedirectResponse("/devices?hl=%d&ok=%s"
+                            % (int(d.get("client_id") or 0), _q("已保存设备信息")),
+                            status_code=303)
+
+
+@router.post("/devices/{did}/assign")
+async def device_assign(request: Request, did: int):
+    """给设备指派账号 / 角色。角色必须属于该账号（db 层会再校验一次并清空不合法的）。"""
+    require_admin(request)
+    form = await request.form()
+    d = db.device_get(did)
+    if not d:
+        return RedirectResponse("/devices?err=%s" % _q("设备不存在"), status_code=303)
+    raw_a = str(form.get("account_id") or "").strip()
+    raw_r = str(form.get("role_id") or "").strip()
+    aid = int(raw_a) if raw_a.isdigit() else None
+    rid = int(raw_r) if raw_r.isdigit() else None
+    if aid is not None and not db.account_get(aid):
+        return RedirectResponse("/devices?hl=%d&err=%s"
+                                % (int(d.get("client_id") or 0), _q("账号不存在")),
+                                status_code=303)
+    if aid is not None and rid is not None:
+        role = db.role_get(rid)
+        if not role or int(role["account_id"]) != aid:
+            return RedirectResponse("/devices?hl=%d&err=%s"
+                                    % (int(d.get("client_id") or 0),
+                                       _q("角色不属于该账号，已忽略角色")),
+                                    status_code=303)
+    db.device_set_account(did, aid, rid)
+    # 设备改了指派 → 对应客户端跑任务时要用新账号，推一份新状态过去
+    if d.get("client_id"):
+        realtime.push_state_to_client(int(d["client_id"]))
+    acc = db.account_get(aid) if aid else None
+    label = acc["label"] if acc else "不指派"
+    if rid:
+        label += " / %s" % (db.role_get(rid) or {}).get("name", "")
+    db.event("info", "console", "设备 #%d 指派为 %s" % (did, label))
+    return RedirectResponse("/devices?hl=%d&ok=%s"
+                            % (int(d.get("client_id") or 0), _q("已指派：%s" % label)),
+                            status_code=303)
+
+
+@router.post("/devices/{did}/delete")
+def device_delete(request: Request, did: int):
+    require_admin(request)
+    d = db.device_get(did)
+    cid = int((d or {}).get("client_id") or 0)
+    if db.device_delete(did):
+        db.event("warn", "console", "删除设备 #%d" % did)
+    return RedirectResponse("/devices?hl=%d&ok=%s" % (cid, _q("已删除该设备记录")),
+                            status_code=303)
+
+
+# ---- 远程启停模拟器 ----
+
+@router.post("/devices/emulator/start")
+async def emulator_start(request: Request):
+    """★ 用户需求的核心动作之一：管理员直接从后台启动安卓模拟器。
+
+    「有没有在跑任务」先查一遍：正在跑就拒绝启动 —— 中途启模拟器会把
+    正在跑的任务的界面抢掉（任务那边以为还在主城，实际已经被顶掉了）。
+    这不是客套话，是实打实的会把一轮任务跑废。
+    """
+    require_admin(request)
+    form = await request.form()
+    cid = int(str(form.get("client_id") or "0") or 0)
+    busy = _anyone_running()
+    if busy:
+        return RedirectResponse("/devices?hl=%d&err=%s"
+                                % (cid, _q("现在不能启动模拟器：%s，先等它跑完"
+                                           % busy["why"])), status_code=303)
+    return _device_post(request, cid, "start_emulator",
+                        note="后台启动模拟器", back="/devices?hl=%d" % cid)
+
+
+@router.post("/devices/emulator/stop")
+async def emulator_stop(request: Request):
+    require_admin(request)
+    form = await request.form()
+    cid = int(str(form.get("client_id") or "0") or 0)
+    busy = _anyone_running()
+    if busy:
+        return RedirectResponse("/devices?hl=%d&err=%s"
+                                % (cid, _q("现在不能关模拟器：%s" % busy["why"])),
+                                status_code=303)
+    return _device_post(request, cid, "stop_emulator",
+                        note="后台关闭模拟器", back="/devices?hl=%d" % cid)
+
+
+@router.post("/devices/{did}/force-size")
+def device_force_size(request: Request, did: int):
+    """把实体机屏幕覆盖成 1920×1080（实体机不覆盖就不能跑：坐标全偏）。
+
+    模拟器不用点这个 —— 它天生就是 1920×1080。
+    """
+    require_admin(request)
+    d = db.device_get(did)
+    if not d:
+        return RedirectResponse("/devices?err=%s" % _q("设备不存在"), status_code=303)
+    cid = int(d.get("client_id") or 0)
+    if not cid:
+        return RedirectResponse("/devices?err=%s" % _q("这台设备没挂在任何客户端下"),
+                                status_code=303)
+    return _device_post(request, cid, "force_size", extra={"serial": d["serial"]},
+                        note="后台要求把 %s 覆盖成横屏" % d["serial"],
+                        back="/devices?hl=%d" % cid)
+
+
+@router.post("/devices/{did}/restore-size")
+def device_restore_size(request: Request, did: int):
+    """恢复实体机原生分辨率（拔线前该点一下，否则手机桌面会变形）。"""
+    require_admin(request)
+    d = db.device_get(did)
+    if not d:
+        return RedirectResponse("/devices?err=%s" % _q("设备不存在"), status_code=303)
+    cid = int(d.get("client_id") or 0)
+    return _device_post(request, cid, "restore_size", extra={"serial": d["serial"]},
+                        note="后台要求恢复 %s 的原生分辨率" % d["serial"],
+                        back="/devices?hl=%d" % cid)
+
+
+# ---- 角色自动发现 ----
+
+@router.post("/devices/{did}/discover")
+async def device_discover(request: Request, did: int):
+    """★ 用户需求：「第一次登录游戏后角色自动保存到后端；
+    以后登录时游戏里找不到对应角色了，就重新发现并添加到后端」。
+
+    这个按钮让客户端去游戏里读角色名，回报后由
+    routes_agent._sync_discovered_roles 写进 game_roles。
+
+    allow_tap：文本里勾了「允许点一次『点击换区』」才传 true ——
+    默认只读，这样第一次接入陌生设备时不会做任何点击。
+    """
+    require_admin(request)
+    form = await request.form()
+    d = db.device_get(did)
+    if not d:
+        return RedirectResponse("/devices?err=%s" % _q("设备不存在"), status_code=303)
+    cid = int(d.get("client_id") or 0)
+    if not cid:
+        return RedirectResponse("/devices?err=%s" % _q("这台设备没挂在任何客户端下"),
+                                status_code=303)
+    busy = _anyone_running()
+    if busy:
+        return RedirectResponse("/devices?hl=%d&err=%s"
+                                % (cid, _q("现在不能发现角色：%s" % busy["why"])),
+                                status_code=303)
+    extra = {"serial": d["serial"],
+             "account_id": d.get("account_id"),
+             "allow_tap": "1" if form.get("allow_tap") else "",
+             "mark_missing": "1"}
+    return _device_post(request, cid, "discover_roles", extra=extra,
+                        note="后台要求读取 %s 上的角色" % d["serial"],
+                        back="/devices?hl=%d" % cid)
+
+
+@router.post("/accounts/{aid}/discover")
+async def account_discover(request: Request, aid: int):
+    """针对**账号**发起角色发现（不指定设备，用这台客户端当前能连上的设备）。
+
+    和 /devices/{did}/discover 的区别：那个指定设备，这个只指定账号 ——
+    适用于「账号刚加完、还没把设备和账号绑起来」的时候。
+    """
+    require_admin(request)
+    form = await request.form()
+    cid = int(str(form.get("client_id") or "0") or 0)
+    acc = db.account_get(aid)
+    if not acc:
+        return RedirectResponse("/accounts?err=%s" % _q("账号不存在"), status_code=303)
+    if not cid:
+        return RedirectResponse("/accounts?hl=%d&err=%s"
+                                % (aid, _q("请选一台客户端来执行发现")), status_code=303)
+    # 优先点名「这台客户端下指派了这个账号的设备」的 serial
+    serial = ""
+    for d in db.device_list(client_id=cid):
+        if d.get("account_id") and int(d["account_id"]) == aid:
+            serial = d["serial"]
+            break
+    extra = {"account_id": aid,
+             "allow_tap": "1" if form.get("allow_tap") else "",
+             "mark_missing": "1"}
+    if serial:
+        extra["serial"] = serial
+    p = db.client_request_probe(cid, kind="discover_roles",
+                                by=current_user(request) or "?",
+                                note="后台为账号「%s」发起角色发现" % acc["label"],
+                                extra=extra)
+    pushed = realtime.notify_client(cid, "command", probe=p.get("id"))
+    db.event("info", "console", "为账号「%s」下发角色发现到客户端 #%d%s"
+             % (acc["label"], cid, "（实时推送）" if pushed else ""))
+    return RedirectResponse("/accounts?hl=%d&ok=%s"
+                            % (aid, _q("已下发角色发现%s"
+                                       % ("（实时通道已送达）" if pushed
+                                          else "，等客户端心跳（最多 %d 秒）"
+                                               % settings.HEARTBEAT_INTERVAL))),
+                            status_code=303)
+
+
+@router.get("/api/devices")
+def api_devices(request: Request):
+    """给设备页自动刷新用：在线状态 + 最近一次指令结果，轻量。"""
+    require_admin(request)
+    return JSONResponse({
+        "heartbeat_interval": settings.HEARTBEAT_INTERVAL,
+        "offline_after": settings.CLIENT_OFFLINE_AFTER,
+        "clients": [{
+            "id": c["id"], "name": c.get("name"), "host": c.get("host"),
+            "online": c["online"], "realtime": realtime.is_connected(c.get("uid") or ""),
+            "state": (c.get("status") or {}).get("state"),
+            "busy": bool((c.get("status") or {}).get("busy")),
+            "probe": c.get("probe") or {},
+        } for c in db.client_list()],
+        "devices": [{
+            "id": d["id"], "client_id": d.get("client_id"), "serial": d.get("serial"),
+            "kind": d.get("kind"), "name": d.get("name"), "online": bool(d.get("online")),
+            "enabled": bool(d.get("enabled")), "force_size": bool(d.get("force_size")),
+            "account_id": d.get("account_id"), "role_id": d.get("role_id"),
+            "screen_w": d.get("screen_w"), "screen_h": d.get("screen_h"),
+        } for d in db.device_list()],
+    })
 
 
 # ------------------------------------------------------------------ 设置

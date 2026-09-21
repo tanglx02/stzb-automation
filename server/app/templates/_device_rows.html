@@ -1,0 +1,138 @@
+{# 一行台的设备。调用处必须先 {% set rows = ... %} —— 设备页里按「属于哪台电脑」分组渲染。
+   行内同时管三件事：指派账号角色（含关系联动）、横屏覆盖、角色发现。 #}
+{% for d in rows %}
+<div class="panel cli">
+  <div class="cli-head">
+    <span class="dot {% if d.online %}on{% else %}off{% endif %}"></span>
+    <span class="cli-name">{{ d.name or d.serial }}</span>
+    <span class="pill info">{{ d.kind_label }}</span>
+    {% if d.online %}<span class="pill ok">在线</span>
+    {% else %}<span class="pill gray">离线</span>{% endif %}
+    {% if not d.enabled %}<span class="pill skip">已停用</span>{% endif %}
+    {% if d.kind == 'phone' %}
+      {% if d.force_size %}<span class="pill ok">已覆盖横屏</span>
+      {% else %}<span class="pill fail">未覆盖横屏</span>{% endif %}
+    {% endif %}
+    {% if d._account %}
+      <span class="pill info">→ {{ d._account.label }}</span>
+    {% else %}<span class="pill gray">未指派账号</span>{% endif %}
+    <span class="spacer"></span>
+    <span class="hint mono">#{{ d.id }}</span>
+  </div>
+
+  <div class="row">
+    <div class="kv"><div class="k">ADB serial</div><div class="v mono">{{ d.serial }}</div></div>
+    <div class="kv"><div class="k">屏幕</div><div class="v">
+      {% if d.native_w %}物理 {{ d.native_w }}×{{ d.native_h }}{% else %}未上报{% endif %}
+      {% if d.screen_w %}<div class="hint">当前 {{ d.screen_w }}×{{ d.screen_h }}</div>{% endif %}
+    </div></div>
+    <div class="kv"><div class="k">实例号（模拟器多开用）</div><div class="v">
+      {{ d.vmindex }}{% if d.kind != 'emulator' %}<span class="hint">（实体机无意义）</span>{% endif %}
+    </div></div>
+    <div class="kv"><div class="k">最近上报</div><div class="v">{{ d.last_seen or '—' }}</div></div>
+  </div>
+
+  {% if d.note %}<p class="hint">备注：{{ d.note }}</p>{% endif %}
+
+  {# ---- 指派账号 / 角色 ---- #}
+  <h3>指派账号 / 角色</h3>
+  <form method="post" action="/devices/{{ d.id }}/assign">
+    <div class="grid2">
+      <label class="f">
+        <span class="name">游戏账号</span>
+        <select name="account_id" data-cli-role-filter="dev-{{ d.id }}">
+          <option value="">（不指派）</option>
+          {% for a in accounts %}
+          <option value="{{ a.id }}" data-roles="{{ a.roles|map(attribute='id')|join(',') }}"
+                  {% if d.account_id == a.id %}selected{% endif %}
+                  {% if not a.enabled %}disabled{% endif %}>
+            {{ a.label }}{% if a.masked %}（{{ a.masked }}）{% endif %}
+            {% if a.owner_label %} · {{ a.owner_label }}{% endif %}
+            {% if not a.enabled %} · 已停用{% endif %}
+          </option>
+          {% endfor %}
+        </select>
+      </label>
+      <label class="f">
+        <span class="name">角色</span>
+        <select name="role_id" id="roles-dev-{{ d.id }}">
+          <option value="">（不限，进游戏后停留在当前角色）</option>
+          {% for r in role_list %}
+          <option value="{{ r.id }}" data-acc="{{ r.account_id }}"
+                  {% if d.role_id == r.id %}selected{% endif %}
+                  {% if not r.enabled %}disabled{% endif %}>
+            {{ r.name }}{% if r.seen_at %} · 见过{% endif %}{% if r.missing_at and r.seen_at and r.missing_at > r.seen_at %} · 最近没找到{% endif %}
+          </option>
+          {% endfor %}
+        </select>
+        <div class="hint">只列出所选账号名下的角色。切换角色免密，只按角色名定位。</div>
+      </label>
+    </div>
+    <div class="actions"><button class="primary" type="submit">保存指派</button></div>
+  </form>
+
+  {# ---- 横屏覆盖 / 角色发现 ---- #}
+  <h3>操作</h3>
+  <div class="actions" style="margin-top:0">
+    {% if d.kind == 'phone' %}
+    <form method="post" action="/devices/{{ d.id }}/force-size" class="inline">
+      <button class="primary" type="submit"
+              {% if running or not d.online %}disabled title="{% if running %}有任务在跑{% else %}设备离线{% endif %}"{% endif %}>
+        覆盖成横屏 1920×1080</button>
+    </form>
+    <form method="post" action="/devices/{{ d.id }}/restore-size" class="inline"
+          data-confirm="恢复设备原生分辨率？如果这台手机还要拔下来自己用，应该恢复；继续跑任务的话不要恢复。">
+      <button type="submit" {% if not d.online %}disabled{% endif %}>恢复原生分辨率</button>
+    </form>
+    {% else %}
+    <span class="hint" style="align-self:center">模拟器天生就是 1920×1080，不需要横屏覆盖。</span>
+    {% endif %}
+
+    <form method="post" action="/devices/{{ d.id }}/discover" class="inline-form">
+      <label class="mini-cb">
+        <input type="checkbox" name="allow_tap" value="1">
+        允许点一次「点击换区」
+      </label>
+      <button type="submit" {% if running or not d.online %}disabled{% endif %}>发现角色</button>
+    </form>
+    <span class="hint" style="align-self:center">
+      读游戏里的角色名并写回后端。不勾就是<b>纯只读</b>（推荐先这样跑一次）；
+      勾上才允许点一次「点击换区」把「选择角色」对话框调出来 ——
+      那个列表框只有在<b>同一个区服下有多个角色</b>时才会弹。
+    </span>
+  </div>
+
+  <details class="more">
+    <summary>编辑 / 删除</summary>
+    <form method="post" action="/devices/{{ d.id }}/update">
+      <input type="hidden" name="_has_enabled" value="1">
+      <div class="grid2">
+        <label class="f"><span class="name">名字</span>
+          <input type="text" name="name" value="{{ d.name or '' }}"></label>
+        <label class="f"><span class="name">类型</span>
+          <select name="kind">
+            <option value="phone" {% if d.kind == 'phone' %}selected{% endif %}>实体手机（USB）</option>
+            <option value="emulator" {% if d.kind == 'emulator' %}selected{% endif %}>安卓模拟器</option>
+          </select></label>
+      </div>
+      <div class="grid2">
+        <label class="f"><span class="name">实例号 vmindex（模拟器多开用）</span>
+          <input type="number" name="vmindex" value="{{ d.vmindex }}"></label>
+        <label class="f"><span class="name">备注</span>
+          <input type="text" name="note" value="{{ d.note or '' }}"></label>
+      </div>
+      <label class="f cbrow">
+        <input type="checkbox" name="enabled" value="1" {% if d.enabled %}checked{% endif %}>
+        <span class="name">启用（停用后不会被派任务）</span>
+      </label>
+      <div class="actions"><button type="submit">保存</button></div>
+    </form>
+    <form method="post" action="/devices/{{ d.id }}/delete"
+          data-confirm="只删后台这条设备登记记录，设备本身不受影响。它下次被扫描时还能重新添加。确定删除？">
+      <div class="actions"><button class="danger" type="submit">删除这条设备记录</button></div>
+    </form>
+    <p class="hint">删掉设备记录<b>不会</b>恢复实体机的分辨率覆盖。如果你要拔手机，
+      请先点上面的「恢复原生分辨率」。</p>
+  </details>
+</div>
+{% endfor %}

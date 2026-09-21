@@ -34,6 +34,15 @@
           <span class="badge nav-badge">{{ nav_badge.roles_attention }}</span>{% endif %}</a>
 
       <div class="nav-group">设备</div>
+      {# 「设备管理」只给管理员：这一页全是「对整台主机的操作」（启停模拟器、
+         给手机做分辨率覆盖），放开等于谁都能把别人正在跑的任务打断。
+         普通用户看得到「客户端」页（机器在不在、跑的是谁），看不到这一页。 #}
+      {% if is_admin %}
+      <a href="/devices" class="{% if nav=='devices' %}on{% endif %}">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round"><rect x="7" y="2.5" width="10" height="19" rx="2"/><path d="M11 5.5h2"/><circle cx="12" cy="18.5" r="1.1"/></svg>
+        设备管理</a>
+      {% endif %}
       <a href="/clients" class="{% if nav=='clients' %}on{% endif %}">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
              stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="4" width="19" height="12.5" rx="2"/><path d="M8.5 20.5h7M12 16.5v4"/></svg>

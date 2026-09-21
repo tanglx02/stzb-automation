@@ -103,6 +103,39 @@ CREATE TABLE IF NOT EXISTS clients (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_clients_uid ON clients(uid);
 
+CREATE TABLE IF NOT EXISTS devices (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    -- 归属的客户端进程（一台跑 agent.py 的电脑）。一台电脑可挂多个设备。
+    client_id     INTEGER REFERENCES clients(id) ON DELETE CASCADE,
+    -- 设备类型：emulator（安卓模拟器）/ phone（USB 连的实体手机）
+    kind          TEXT NOT NULL DEFAULT 'emulator',
+    -- ADB 序列号。这是**设备在第一现场的唯一身份**：
+    --   模拟器形如 127.0.0.1:7555 / emulator-5554
+    --   实体机形如 340436524100AJ8
+    serial        TEXT NOT NULL,
+    name          TEXT,                        -- 人给起的名字（「MuMu 主号机」「备用红米」）
+    -- 模拟器多开用的实例号（MuMu 的 vmindex）；实体机恒为 0，仅作展示
+    vmindex       INTEGER NOT NULL DEFAULT 0,
+    -- 指派：这台设备负责哪个游戏账号下的哪个角色
+    account_id    INTEGER,
+    role_id       INTEGER,
+    note          TEXT,
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    -- 设备在线状态（由客户端上报，不由后端探测）
+    online        INTEGER NOT NULL DEFAULT 0,
+    -- 最近一次上报的屏幕尺寸与是否已做横屏覆盖（实体机需要 wm size 覆盖成 1920x1080）
+    screen_w      INTEGER,
+    screen_h      INTEGER,
+    native_w      INTEGER,                     -- 物理分辨率（恢复/判断用）
+    native_h      INTEGER,
+    force_size    INTEGER NOT NULL DEFAULT 0,  -- 1 = 已下发 wm size 覆盖
+    last_seen     TEXT,
+    created_at    TEXT,
+    updated_at    TEXT
+);
+-- ⚠ serial 理论上可能重复（同一台机器上 adb 端口冲突），所以**不建唯一索引**，
+--   靠 (client_id, serial) 在应用层判重。
+
 CREATE TABLE IF NOT EXISTS game_accounts (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     -- ★ 归属：谁登记的这个游戏账号。
@@ -134,6 +167,15 @@ CREATE TABLE IF NOT EXISTS game_roles (
     note        TEXT,
     sort_order  INTEGER NOT NULL DEFAULT 0,
     enabled     INTEGER NOT NULL DEFAULT 1,
+    -- ★ 角色自动发现的痕迹（2026-09-21 用户需求）：
+    --   seen_at    = 最近一次「客户端在游戏里真的读到了这个角色」
+    --   missing_at = 最近一次「客户端进游戏了但没读到它」（角色被删/改名/换区）
+    --   discover_count = 累计被发现次数，用来区分「偶然读到」和「稳定存在」
+    --   这两个时间戳是「以游戏为准」的：后端登记的名单可能过期（合服改名、
+    --   角色被删），而游戏里的才是事实。missing 只标不删 —— 删角色属于人工决定。
+    seen_at     TEXT,
+    missing_at  TEXT,
+    discover_count INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT,
     updated_at  TEXT
 );
@@ -297,6 +339,33 @@ _MIGRATIONS = {
     },
     "game_accounts": {
         "owner_id": "INTEGER",                 # 多用户：账号归谁
+        # ★ 游戏账号密码（scrypt 哈希，与用户口令同一套 security.hash_secret）。
+        #   为什么要存：这是用户明确要求的「第一次添加账号时输入密码」。
+        #   存的是**哈希**不是明文，所以后端也无法回读 —— 它的用途是
+        #   「账号掉了要重新人工登录时，能核对密码对不对」，而不是自动登录。
+        #   永不返回给前端（api 层只回 has_password 布尔）。
+        "pwd_hash": "TEXT",
+        "pwd_hint": "TEXT",                    # 密码提示（可选，用户自己填，明文）
+    },
+    "devices": {
+        "client_id": "INTEGER",
+        "kind": "TEXT",
+        "vmindex": "INTEGER",
+        "account_id": "INTEGER",
+        "role_id": "INTEGER",
+        "online": "INTEGER",
+        "screen_w": "INTEGER",
+        "screen_h": "INTEGER",
+        "native_w": "INTEGER",
+        "native_h": "INTEGER",
+        "force_size": "INTEGER",
+        "last_seen": "TEXT",
+    },
+    "game_roles": {
+        # 老库的 game_roles 没有这三列（角色自动发现是 2026-09-21 加的）
+        "seen_at": "TEXT",
+        "missing_at": "TEXT",
+        "discover_count": "INTEGER NOT NULL DEFAULT 0",
     },
     # users 表本身不需要迁移：老库没有它，SCHEMA 里的 CREATE TABLE IF NOT EXISTS
     # 会直接建出来；老数据（账号全是管理员的）表现为 owner_id 为 NULL。
@@ -331,6 +400,10 @@ def _indexes(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_req_owner ON run_requests(owner_id, id)",
         "CREATE INDEX IF NOT EXISTS idx_req_client ON run_requests(client_id, status)",
         "CREATE INDEX IF NOT EXISTS idx_accounts_owner ON game_accounts(owner_id)",
+        # devices 是本次新增的表；它的索引同样走这里，避免老库上前向引用。
+        "CREATE INDEX IF NOT EXISTS idx_devices_client ON devices(client_id)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_serial ON devices(serial)",
+        "CREATE INDEX IF NOT EXISTS idx_devices_account ON devices(account_id)",
     ):
         try:
             conn.execute(stmt)
@@ -1029,6 +1102,167 @@ def client_delete(cid: int) -> bool:
         return cur.rowcount > 0
 
 
+# ============================================================ 设备（devices）
+#
+# 为什么要单开一张表、而不是继续往 clients 上加列（2026-09-21）：
+#
+#   clients 记录的是「一台跑 agent.py 的电脑」—— 它的 uid 来自 state/client.json，
+#   一台电脑只有一个。而**设备**是 USB 插着的那台手机 / 开着的那个模拟器，
+#   一台电脑可以同时挂好几个（MuMu 多开 + 一台实体机 + 备机）。
+#   两者是 1:N 关系，硬塞进 clients 会把「电脑」和「设备」两个概念搅在一起：
+#   心跳是电脑发的（一个 uid），但「指派哪个账号跑」是设备级的。
+#
+#   所以拆开：clients = 电脑（心跳/在线状态）；devices = 具体设备（账号/角色指派）。
+
+DEVICE_KINDS = {
+    "emulator": "安卓模拟器",
+    "phone": "实体手机（USB）",
+}
+
+
+def _row_device(row: sqlite3.Row) -> Optional[Dict[str, Any]]:
+    if row is None:
+        return None
+    d = dict(row)
+    d["online"] = bool(d.get("online"))
+    d["enabled"] = bool(d.get("enabled"))
+    d["force_size"] = bool(d.get("force_size"))
+    d["kind_label"] = DEVICE_KINDS.get(d.get("kind") or "", d.get("kind") or "")
+    return d
+
+
+def device_list(client_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    with tx() as c:
+        if client_id is None:
+            rows = c.execute(
+                "SELECT * FROM devices ORDER BY enabled DESC, kind, id").fetchall()
+        else:
+            rows = c.execute(
+                "SELECT * FROM devices WHERE client_id=? ORDER BY enabled DESC, kind, id",
+                (int(client_id),)).fetchall()
+    return [_row_device(r) for r in rows]      # type: ignore[misc]
+
+
+def device_get(did: int) -> Optional[Dict[str, Any]]:
+    with tx() as c:
+        row = c.execute("SELECT * FROM devices WHERE id=?", (int(did),)).fetchone()
+    return _row_device(row)
+
+
+def device_by_serial(serial: str, client_id: Optional[int] = None
+                     ) -> Optional[Dict[str, Any]]:
+    """按 serial 找设备。给了 client_id 就限定在那台电脑下 —— 不同电脑上
+    出现同一个 serial（都用 127.0.0.1:7555）是完全正常的，必须限定范围。"""
+    s = (serial or "").strip()
+    if not s:
+        return None
+    with tx() as c:
+        if client_id is None:
+            row = c.execute("SELECT * FROM devices WHERE serial=? ORDER BY id",
+                            (s,)).fetchone()
+        else:
+            row = c.execute("SELECT * FROM devices WHERE serial=? AND client_id=?",
+                            (s, int(client_id))).fetchone()
+    return _row_device(row)
+
+
+def device_create(serial: str, kind: str = "emulator", *,
+                  client_id: Optional[int] = None, name: str = "",
+                  vmindex: int = 0, note: str = "",
+                  account_id: Optional[int] = None,
+                  role_id: Optional[int] = None) -> int:
+    """登记一个设备。**幂等**：同一台电脑下同一个 serial 已存在就直接返回它的 id。
+
+    幂等很重要：扫描 ADB 后用户可能连点两次「添加」，页面上不该出现两行。
+    """
+    s = (serial or "").strip()
+    if not s:
+        raise ValueError("serial 不能为空")
+    kind = kind if kind in DEVICE_KINDS else "emulator"
+    ts = now()
+    with tx() as c:
+        if client_id is not None:
+            old = c.execute("SELECT id FROM devices WHERE serial=? AND client_id=?",
+                            (s, int(client_id))).fetchone()
+            if old is not None:
+                return int(old["id"])
+        cur = c.execute(
+            "INSERT INTO devices(client_id,kind,serial,name,vmindex,account_id,role_id,"
+            "note,enabled,online,force_size,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,1,0,0,?,?)",
+            (client_id, kind, s, (name or "").strip()[:60], int(vmindex or 0),
+             account_id, role_id, (note or "").strip()[:200], ts, ts))
+        return int(cur.lastrowid)
+
+
+def device_update(did: int, **fields: Any) -> None:
+    allowed = ("name", "kind", "note", "enabled", "account_id", "role_id",
+               "vmindex", "client_id", "online", "screen_w", "screen_h",
+               "native_w", "native_h", "force_size", "last_seen", "serial")
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k in ("enabled", "online", "force_size"):
+            v = 1 if v else 0
+        sets.append("%s=?" % k)
+        vals.append(v)
+    if not sets:
+        return
+    sets.append("updated_at=?")
+    vals.append(now())
+    vals.append(int(did))
+    with tx() as c:
+        c.execute("UPDATE devices SET %s WHERE id=?" % ",".join(sets), vals)
+
+
+def device_delete(did: int) -> bool:
+    with tx() as c:
+        cur = c.execute("DELETE FROM devices WHERE id=?", (int(did),))
+        return cur.rowcount > 0
+
+
+def device_set_account(did: int, account_id: Optional[int],
+                       role_id: Optional[int]) -> None:
+    """给设备指派账号/角色。role_id 必须真属于该账号，否则清空角色。
+
+    这条校验是**防串号**的：设备上跑错账号 = 在别人的号上花资源。
+    """
+    rid = role_id
+    if account_id is None:
+        rid = None
+    elif rid is not None:
+        r = role_get(int(rid))
+        if not r or int(r["account_id"]) != int(account_id):
+            rid = None
+    with tx() as c:
+        c.execute("UPDATE devices SET account_id=?, role_id=?, updated_at=? WHERE id=?",
+                  (account_id, rid, now(), int(did)))
+
+
+def device_mark_offline(client_id: int, serials: Optional[Iterable[str]] = None
+                        ) -> None:
+    """把某台电脑下「本轮没出现在扫描结果里」的设备标为离线。
+
+    为什么要主动标离线：设备被拔掉/关掉后不会通知后端，只能靠每次扫描时
+    「这次没看到你」来推断。给了 serials 就只把不在这个集合里的标离线。
+    """
+    with tx() as c:
+        if serials is None:
+            c.execute("UPDATE devices SET online=0, updated_at=? WHERE client_id=?",
+                      (now(), int(client_id)))
+        else:
+            keep = [str(s) for s in serials]
+            if not keep:
+                c.execute("UPDATE devices SET online=0, updated_at=? WHERE client_id=?",
+                          (now(), int(client_id)))
+                return
+            marks = ",".join("?" * len(keep))
+            c.execute("UPDATE devices SET online=0, updated_at=? "
+                      "WHERE client_id=? AND serial NOT IN (%s)" % marks,
+                      [now(), int(client_id)] + keep)
+
+
 def client_set_probe(cid: int, payload: Optional[Dict[str, Any]]) -> None:
     with tx() as c:
         c.execute("UPDATE clients SET probe_json=?, updated_at=? WHERE id=?",
@@ -1049,6 +1283,17 @@ PROBE_KINDS = {
     "probe": "探测当前界面（截屏 + 识别文字）",
     "switch": "强制重新切换账号 / 角色",
     "run": "强制立刻跑一轮任务",
+    # ---- 设备管理（2026-09-21 新增）----
+    "adb_scan": "扫描本机 ADB 在线设备（模拟器 + 实体机）",
+    "start_emulator": "启动模拟器",
+    "stop_emulator": "关闭模拟器",
+    # ★ 角色自动发现：让客户端连上设备、进游戏，把当前账号下的角色名读出来上报。
+    #   「第一次登录后自动保存角色到后端」就靠它，同时它也负责
+    #   「角色在游戏里找不到了 → 重新发现并修正后端记录」。
+    "discover_roles": "读取当前账号在游戏里的角色并上报",
+    # 实体机把屏幕强制覆盖成 1920x1080（否则坐标全偏）。这是**必要的准备动作**。
+    "force_size": "把实体机屏幕覆盖成 1920x1080",
+    "restore_size": "恢复实体机的原生分辨率",
 }
 
 
@@ -1192,6 +1437,7 @@ def account_list(with_roles: bool = True,
     for a in out:
         a["owner_label"] = (a.get("owner_display") or "").strip() \
             or a.get("owner_name") or ""
+        _scrub_account(a)
     if with_roles:
         bucket: Dict[int, List[Dict[str, Any]]] = {}
         for r in roles:
@@ -1199,6 +1445,19 @@ def account_list(with_roles: bool = True,
         for a in out:
             a["roles"] = bucket.get(int(a["id"]), [])
     return out
+
+
+def _scrub_account(a: Dict[str, Any]) -> Dict[str, Any]:
+    """把账号里的密码哈希摘掉，换成一个布尔。
+
+    ★ 铁律：`pwd_hash` **绝不出 db 层**。模板、JSON 接口、日志全都不该看到它。
+    `pwd_hint`（用户自己写的明文提示，不是密码）保留，供界面显示「密码提示」。
+    """
+    h = a.pop("pwd_hash", None)
+    a["has_password"] = bool(h)
+    if not a.get("pwd_hint"):
+        a["pwd_hint"] = ""
+    return a
 
 
 def account_get(aid: int, with_roles: bool = True) -> Optional[Dict[str, Any]]:
@@ -1210,18 +1469,52 @@ def account_get(aid: int, with_roles: bool = True) -> Optional[Dict[str, Any]]:
                           "ORDER BY sort_order, id", (aid,)).fetchall()
     d = dict(row)
     d["roles"] = [dict(r) for r in roles] if with_roles else []
-    return d
+    return _scrub_account(d)
+
+
+def account_set_password(aid: int, pwd: str, hint: str = "") -> None:
+    """设置账号密码。传空串 = 清空密码（表示「本机已登录过，无需再记」）。
+
+    ⚠ 存的是 scrypt 哈希（复用 security.hash_secret），**不是明文**。
+      所以这里的语义是「凭据台账」：能核对密码对不对，
+      **不能**用它自动登录网易页面（登录走游戏的常用账号列表）。
+    """
+    from . import security
+    ts = now()
+    p = (pwd or "").strip()
+    with tx() as c:
+        c.execute("UPDATE game_accounts SET pwd_hash=?, pwd_hint=?, updated_at=? WHERE id=?",
+                  (security.hash_secret(p) if p else None,
+                   (hint or "").strip()[:60], ts, int(aid)))
+
+
+def account_check_password(aid: int, pwd: str) -> bool:
+    """核对账号密码。没有设过密码时返回 False（不是 True —— 不能默认放行）。"""
+    from . import security
+    with tx() as c:
+        row = c.execute("SELECT pwd_hash FROM game_accounts WHERE id=?",
+                        (int(aid),)).fetchone()
+    h = (row["pwd_hash"] if row else None) or ""
+    if not h:
+        return False
+    return security.verify_secret(pwd or "", h)
 
 
 def account_create(label: str, login_name: str = "", masked: str = "",
                    tag: str = "", note: str = "",
-                   owner_id: Optional[int] = None) -> int:
+                   owner_id: Optional[int] = None,
+                   password: str = "", pwd_hint: str = "") -> int:
     """新建账号。owner_id 就是归属：普通用户建的就是他自己的。
 
     sort_order 按「同一归属内」往下排，而不是全局 —— 否则每个用户的
     账号列表都会从管理员的最大值开始，看着像空了几十行。
+
+    password 是**可选**的：用户要求「第一次添加账号时要输密码」，
+    但密码只作凭据台账（哈希入库），不用于自动登录。
     """
+    from . import security
     ts = now()
+    p = (password or "").strip()
     with tx() as c:
         if owner_id is None:
             nxt = c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n "
@@ -1232,9 +1525,12 @@ def account_create(label: str, login_name: str = "", masked: str = "",
                             (owner_id,)).fetchone()["n"]
         cur = c.execute(
             "INSERT INTO game_accounts(owner_id,label,login_name,masked,tag,note,sort_order,"
-            "enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,1,?,?)",
+            "enabled,pwd_hash,pwd_hint,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,1,?,?,?,?)",
             (owner_id, label.strip()[:60] or "未命名账号", login_name.strip()[:120],
-             masked.strip()[:40], tag.strip()[:40], note.strip()[:400], int(nxt), ts, ts))
+             masked.strip()[:40], tag.strip()[:40], note.strip()[:400], int(nxt),
+             security.hash_secret(p) if p else None,
+             (pwd_hint or "").strip()[:60], ts, ts))
         return int(cur.lastrowid)
 
 
@@ -1257,11 +1553,12 @@ def account_update(aid: int, **fields: Any) -> None:
 
 
 def account_delete(aid: int) -> None:
-    """删账号：连带删角色；指向它的客户端指派要清空，否则会指向不存在的行。"""
+    """删账号：连带删角色；指向它的客户端/设备指派要清空，否则会指向不存在的行。"""
     with tx() as c:
         c.execute("DELETE FROM game_roles WHERE account_id=?", (aid,))
         c.execute("DELETE FROM game_accounts WHERE id=?", (aid,))
         c.execute("UPDATE clients SET account_id=NULL, role_id=NULL WHERE account_id=?", (aid,))
+        c.execute("UPDATE devices SET account_id=NULL, role_id=NULL WHERE account_id=?", (aid,))
 
 
 def role_list(account_id: Optional[int] = None,
@@ -1384,6 +1681,116 @@ def role_find_by_name(name: str, owner_id: Optional[int] = None,
         # 多个角色只差区服前缀 → 无法确定是哪一个，拒绝猜测
         return None
     return dict(hits[0])
+
+
+def _seen_at_of(row: Any) -> str:
+    """从「既可能是 sqlite3.Row、也可能是 dict」的行里取 seen_at。
+
+    这两个类型在本模块里是混着用的（查询结果直接是 Row，本次新插入的造 dict），
+    而 Row 只支持 `row["k"]`，不支持 `.get()`。所有对**混合来源**的行取值都
+    必须走这个函数，别直接写 `.get()` —— 那正是 2026-09-21 真机撞到的那个
+    AttributeError 的来源。
+    """
+    try:
+        return str(row["seen_at"] or "")
+    except (KeyError, IndexError, TypeError):
+        return ""
+
+
+def role_sync_discovered(account_id: int, names: Iterable[str],
+                         *, owner_id: Optional[int] = None,
+                         mark_missing: bool = True) -> Dict[str, Any]:
+    """把「客户端在游戏里读到的角色名」写回后端（★ 角色自动发现的核心）。
+
+    这条路径要同时满足用户提的三件事：
+
+      ① 「模拟器或手机第一次登录游戏后，角色自动保存到后端」
+         → 游戏里读到的名字，后端没有就**建**一条（added）。
+      ② 「以后登录时游戏里找不到对应角色了，就重新失败并添加到后端」
+         → 后端有、这次没读到的，记 `missing_at`（missing），**但不删** ——
+           删角色是不可逆的人工决定，系统只负责标出「这个角色在游戏里找不到了」，
+           界面上给它一个红标，让人自己判断是改名了还是真没了。
+      ③ 「以后登录时游戏里找不到对应角色了就重新失败并添加」的另一半：
+         角色改名后新名字会被当成新角色 added 进来，同时老名字被标 missing。
+         所以这里**必须同时**返回 added/missing 两份名单，让界面能提示用户核对。
+
+    只认名字（`role_key` 归一化后比较）：区服会随合服变化，名字才稳定 ——
+    这条规矩和 `role_find_by_name` / 客户端切换逻辑保持一致，别在这里破例。
+
+    mark_missing=False 用于「只读到当前主城那一个角色」的场景：
+    这时没读到的角色多半只是因为它不在当前界面上，不代表它不存在，
+    标 missing 会造成大面积误报。
+
+    返回 {added:[...], seen:[...], missing:[...], total:n}
+    """
+    aid = int(account_id)
+    want: List[str] = []
+    seen_key = set()
+    for raw in names:
+        s = str(raw or "").strip()[:60]
+        if not s:
+            continue
+        k = role_key(s)
+        if not k or k in seen_key:
+            continue
+        seen_key.add(k)
+        want.append(s)
+
+    ts = now()
+    added: List[str] = []
+    seen: List[str] = []
+    missing: List[str] = []
+    with tx() as c:
+        acc = c.execute("SELECT id FROM game_accounts WHERE id=?", (aid,)).fetchone()
+        if acc is None:
+            raise ValueError("账号 #%d 不存在" % aid)
+        rows = c.execute("SELECT id,name,seen_at FROM game_roles WHERE account_id=?",
+                         (aid,)).fetchall()
+        existing = {role_key(r["name"]): r for r in rows}
+        nxt = c.execute("SELECT COALESCE(MAX(sort_order),0)+1 AS n FROM game_roles "
+                        "WHERE account_id=?", (aid,)).fetchone()["n"]
+
+        for name in want:
+            k = role_key(name)
+            hit = existing.get(k)
+            if hit is not None:
+                c.execute("UPDATE game_roles SET seen_at=?, missing_at=NULL, "
+                          "discover_count=COALESCE(discover_count,0)+1, updated_at=? "
+                          "WHERE id=?", (ts, ts, int(hit["id"])))
+                seen.append(hit["name"])
+                continue
+            cur = c.execute(
+                "INSERT INTO game_roles(account_id,name,tab,task_plan,sort_order,"
+                "enabled,seen_at,missing_at,discover_count,created_at,updated_at) "
+                "VALUES(?,?,?,?,?,1,?,NULL,1,?,?)",
+                (aid, name, "已有角色", "", int(nxt), ts, ts, ts))
+            nxt += 1
+            added.append(name)
+            existing[k] = {"id": int(cur.lastrowid), "name": name, "seen_at": ts}
+
+        if mark_missing:
+            for k, r in existing.items():
+                if k in seen_key:
+                    continue
+                # 只有「以前确实见到过」的角色才标 missing。从没见到的
+                # （比如手工登记但从没登录过的）不标 —— 那不叫找不到，叫还没见过。
+                #
+                # ⚠ 这里必须用 _seen_at_of 取值，不能写 r.get("seen_at")：
+                #   `existing` 里同时装着两种东西 —— 既存角色是 sqlite3.Row
+                #   （第 1735 行直接塞了 fetchall 的原始行），本次新插入的才是
+                #   普通 dict。Row **没有** .get()，一调就抛
+                #   AttributeError("'sqlite3.Row' object has no attribute 'get'")。
+                #   而这个异常正好只在「账号下已有一个以前读到过、这次没读到的
+                #   角色」时才触发 —— 也就是**第二次以后**的登录才发现，
+                #   首次接入（库里还是空的时候）永远是好的。2026-09-21 真机实测
+                #   撞到：单测/首跑全绿，角色一多就静默不落库。
+                if not _seen_at_of(r):
+                    continue
+                c.execute("UPDATE game_roles SET missing_at=?, updated_at=? WHERE id=?",
+                          (ts, ts, int(r["id"])))
+                missing.append(r["name"])
+    return {"added": added, "seen": seen, "missing": missing,
+            "total": len(want), "account_id": aid}
 
 
 def role_daily_overview(days: int = 7, owner_id: Optional[int] = None,

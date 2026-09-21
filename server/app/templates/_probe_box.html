@@ -1,0 +1,61 @@
+{# 最近一次指令的结果框。设备页与账号页共用 —— `c.probe` 是 clients 表里的 probe_json。
+   ★ 只用 include 不用宏，是为了让它跟调用处的循环变量（c）解耦：
+     两个页面的数据形状完全一样，重复写两份迟早会分叉。 #}
+{% if c.probe and c.probe.status %}
+<div class="probe {% if c.probe.status == 'done' %}ok{% elif c.probe.status == 'failed' %}bad{% else %}pending{% endif %}">
+  <div class="probe-head">
+    <b>{{ c.probe.kind }}</b>
+    <span class="pill {% if c.probe.status == 'done' %}ok{% elif c.probe.status == 'failed' %}fail{% else %}skip{% endif %}">
+      {% if c.probe.status == 'done' %}已完成
+      {% elif c.probe.status == 'failed' %}失败
+      {% elif c.probe.status == 'pending' %}{% if c.realtime %}已推送，等待执行{% else %}等待客户端心跳{% endif %}
+      {% else %}执行中{% endif %}
+    </span>
+    <span class="hint">{{ c.probe.requested_at }}{% if c.probe.requested_by %} · {{ c.probe.requested_by }}{% endif %}</span>
+    <span class="spacer"></span>
+  </div>
+  {% if c.probe.message %}<div class="probe-msg">{{ c.probe.message }}</div>{% endif %}
+
+  {# ---- 角色发现的结果 ---- #}
+  {% if c.probe.kind == 'discover_roles' and c.probe.result %}
+  {% set res = c.probe.result %}
+  {% if res.roles %}
+  <div class="task-chips" style="margin-top:8px">
+    {% for n in res.roles %}<span class="chip ok">{{ n }}</span>{% endfor %}
+  </div>
+  {% endif %}
+  {% if res.source %}
+  <div class="hint">名单来源：{% if res.source == 'role_dialog' %}游戏「选择角色」对话框（最可靠）
+    {% elif res.source == 'home' %}主城界面上的当前角色{% else %}{{ res.source }}{% endif %}
+    {% if res.mode == 'readonly' %} · 只读模式，没有点击任何按钮{% endif %}
+    {% if res.masked %} · 当前账号 {{ res.masked }}{% endif %}
+  </div>
+  {% endif %}
+  {% endif %}
+
+  {# ---- 设备扫描的结果 ---- #}
+  {% if c.probe.kind == 'adb_scan' and c.probe.result and c.probe.result.adb %}
+  <div class="hint">ADB：<code>{{ c.probe.result.adb }}</code>
+    {% if c.probe.result.emulator %}
+      · 模拟器：{% if c.probe.result.emulator.running %}运行中{% else %}未运行{% endif %}
+    {% endif %}
+  </div>
+  {% endif %}
+
+  {# ---- 横屏覆盖的结果 ---- #}
+  {% if c.probe.kind in ('force_size','restore_size') and c.probe.result %}
+  <div class="hint">
+    物理 {{ c.probe.result.native_w }}×{{ c.probe.result.native_h }}
+    · 当前 Override {{ c.probe.result.override or '无' }}
+  </div>
+  {% endif %}
+
+  {% if c.probe.result and c.probe.result.screen and c.probe.result.screen.lines %}
+  <details class="more" style="margin-top:8px;border-top:none;padding-top:0">
+    <summary>当时的界面文字（{{ c.probe.result.screen.text_count }} 行）</summary>
+    <pre class="probe-lines">{% for ln in c.probe.result.screen.lines %}{{ ln }}
+{% endfor %}</pre>
+  </details>
+  {% endif %}
+</div>
+{% endif %}

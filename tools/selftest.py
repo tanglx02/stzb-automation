@@ -9,6 +9,7 @@
 跑法：python tools/selftest.py
 """
 import os
+import shutil
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -823,15 +824,27 @@ def test_emulator():
           MuMu(manager=r"C:\no\such\MuMuManager.exe",
                logger=lambda s: None).available() is False)
 
-    # adb 侧：候选顺序优先，认不出就用任意在线设备；gbk 解码不影响这里的 utf-8 输出
+    # adb 侧：候选顺序优先；候选之外只认「形状像模拟器」的（见下一条）
     m = MuMu(manager="x", logger=lambda s: None,
              serial_candidates=["127.0.0.1:7555", "127.0.0.1:16384", "emulator-5554"])
     m.adb_serials = lambda: ["emulator-5554", "127.0.0.1:7555"]
     check("多个在线设备时按候选顺序取（实测 7555 和 emulator-5554 是同一台）",
           m.adb_online() == "127.0.0.1:7555")
 
+    # ★ 2026-09-21：退路必须**排除 USB 实体机**。原来这里是「返回任意一个在线设备」，
+    #   结果插着手机时 start_emulator 会把手机的 serial 当成模拟器报给后端
+    #   （实测 340436524100AJ8），后端以为「模拟器已就绪」，其实根本没起来。
     m.adb_serials = lambda: ["192.168.1.9:5555"]
-    check("只有陌生设备时也先用着", m.adb_online() == "192.168.1.9:5555")
+    check("陌生设备但形状像模拟器（host:port）→ 仍可先用着",
+          m.adb_online() == "192.168.1.9:5555")
+
+    m.adb_serials = lambda: ["340436524100AJ8"]
+    check("★ USB 实体机的 serial 不能被当成模拟器（实测踩过的坑）",
+          m.adb_online() is None)
+
+    m.adb_serials = lambda: ["340436524100AJ8", "emulator-5554"]
+    check("实体机 + 模拟器同时在 → 只认模拟器那个",
+          m.adb_online() == "emulator-5554")
 
     m.adb_serials = lambda: []
     check("一台都没有时返回 None", m.adb_online() is None)
@@ -1303,10 +1316,27 @@ def test_run_mode():
     check("run_daily.py 里已无 MODE_STANDALONE", "MODE_STANDALONE" not in src)
 
     # 10) 出厂 config.json 是「未绑定」—— 拷到别的机器不配任何东西也能直接跑
+    #
+    # ★ 为什么读 config.example.json 而不是 config.json（2026-09-21 修）：
+    #   这条断言测的是「**出厂**配置」这个事实，而本机 config.json 早就绑上了
+    #   自己的后端（cloud.base_url/token 都填齐了）—— 拿它去断言「未绑定」
+    #   必然失败，和在别人机器上跑的结果还不一样，是个环境相关的假失败。
+    #   出厂形态的权威来源是 config.example.json（随仓库发布的模板）。
     from stzb.config import load as _load
-    cfg = _load()
-    m = rd.resolve_mode(cfg, offline=False, log=lg)
+    ex_path = os.path.join(ROOT, "config.example.json")
+    check("config.example.json 存在（出厂模板）", os.path.exists(ex_path))
+    m = rd.resolve_mode(_load(ex_path), offline=False, log=lg)
     check("★ 出厂配置判定为未绑定（开箱即可照常跑任务）", m == rd.MODE_UNBOUND, m)
+
+    # 10b) 本机 config.json 若已绑定，也必须是「填齐才托管」那种绑定（不是靠 enabled 开关）
+    cfg = _load()
+    cc = cfg.get("cloud") or {}
+    if str(cc.get("base_url") or "").strip() and str(cc.get("token") or "").strip():
+        check("本机 config.json 已绑定后端 → resolve_mode 报托管",
+              rd.resolve_mode(cfg, offline=False, log=lg) == rd.MODE_MANAGED)
+    else:
+        check("本机 config.json 未绑定 → resolve_mode 报未绑定",
+              rd.resolve_mode(cfg, offline=False, log=lg) == rd.MODE_UNBOUND)
 
     # 11) 本机必备段在默认值里都有兜底（config.json 丢了也能跑）
     for sec in ("device", "emulator", "cloud", "logging", "safety", "tasks"):
@@ -1327,15 +1357,36 @@ def test_run_mode():
         check("--status 应在 90 秒内返回（不该去连后端）", False, "超时")
 
     # 13) 环境变量注入必须是「不带 enabled 也能生效」的（enabled 已废弃）
-    env2 = dict(os.environ)
-    env2.pop("STZB_CLOUD_BASE_URL", None)
-    env2.pop("STZB_CLOUD_TOKEN", None)
-    out = subprocess.run([sys.executable, os.path.join(ROOT, "run_daily.py"), "--status"],
-                         capture_output=True, text=True, errors="ignore",
-                         env=env2, timeout=90)
-    txt = (out.stdout or "") + (out.stderr or "")
-    check("★ 没有环境变量时 --status 报「未绑定」",
-          "未绑定" in txt, txt[-260:])
+    #
+    # ★ 这里要造一个**未绑定**的配置来看 --status 怎么报 —— 但本机 config.json
+    #   已经绑上自己的后端了（也在 .gitignore 里、不会提交），拿它跑这条必然失败。
+    #   所以临时把 config.json 换成出厂模板（base_url/token 都空），看完再还原。
+    #   不这么做的话，「本机已绑定」和「断言未绑定」是互相矛盾的，只能靠改本机配置
+    #   来过测试 —— 那是把环境状态写进测试，不是测试代码。
+    cfg_real = os.path.join(ROOT, "config.json")
+    cfg_bak = cfg_real + ".selftest.bak"
+    had_real = os.path.exists(cfg_real)
+    try:
+        if had_real:
+            shutil.copy2(cfg_real, cfg_bak)
+        shutil.copy2(os.path.join(ROOT, "config.example.json"), cfg_real)
+        env2 = dict(os.environ)
+        env2.pop("STZB_CLOUD_BASE_URL", None)
+        env2.pop("STZB_CLOUD_TOKEN", None)
+        out = subprocess.run([sys.executable, os.path.join(ROOT, "run_daily.py"), "--status"],
+                             capture_output=True, text=True, errors="ignore",
+                             env=env2, timeout=90)
+        txt = (out.stdout or "") + (out.stderr or "")
+        check("★ 没有环境变量 + 出厂配置时 --status 报「未绑定」",
+              "未绑定" in txt, txt[-260:])
+    finally:
+        if had_real:
+            shutil.move(cfg_bak, cfg_real)
+        else:
+            try:
+                os.remove(cfg_real)
+            except OSError:
+                pass
 
 
 def test_screenshot_retry():

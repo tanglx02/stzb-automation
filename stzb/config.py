@@ -112,7 +112,29 @@ class Config(dict):
         return dict.get(self, dotted, default)
 
 
-def load(path: str = CONFIG_PATH) -> Config:
+def load(path: Optional[str] = None) -> Config:
+    """加载配置。`path=None`（默认）时**取此刻的** `CONFIG_PATH`。
+
+    ★ 为什么默认值不写成 `path: str = CONFIG_PATH`（2026-09-21 修的真 bug）：
+
+      那种写法把默认值在**函数定义那一刻**就绑死了。于是任何
+      「运行期把 `cfgmod.CONFIG_PATH` 指到临时目录」的隔离手段都会**静默失效** ——
+      写配置时用的是新的 CONFIG_PATH（写进了临时目录），读配置时用的却是
+      定义时捕获的老路径（读的还是真实的 config.json）。
+
+      实测症状（tools/config.py 的后端菜单）：测试把 CONFIG_PATH 指到空目录，
+      菜单里「解除绑定」本该显示「本来就没绑后端」，实际显示「后端托管」——
+      因为它读到的是本机真实的、已绑定的 config.json。
+
+      这个隔离缝隙不只是测试问题：`tools/config.py` 的 `project_root()` 正是
+      跟着 CONFIG_PATH 走的，磁盘清理这种**破坏性操作**就靠它来避免误删真实
+      logs/。默认值写死等于给这条安全线开了个后门。
+
+      改成 None + 运行时取，语义完全一样（不传就还是用 CONFIG_PATH），
+      但隔离手段立刻生效。
+    """
+    if path is None:
+        path = CONFIG_PATH
     raw: Dict[str, Any] = {}
     if os.path.exists(path):
         try:

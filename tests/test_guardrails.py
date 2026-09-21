@@ -438,6 +438,23 @@ def test_password_rules_are_single_source():
     return ok
 
 
+def _route_has_admin(src, path):
+    """返回 POST <path> 那个路由函数体里是否出现 require_admin。
+
+    用「装饰器到下一个装饰器」切块，避免把上一个函数的 require_admin
+    误算给下一个函数（跨函数误判正是这类源码级检查最容易翻车的地方）。
+    """
+    import re as _re
+    pat = '@router.post("%s"' % path
+    idx = src.replace("'", '"').find(pat)
+    if idx < 0:
+        return False
+    rest = src[idx:]
+    nxt = rest.find("\n@router.", 1)
+    body = rest if nxt < 0 else rest[:nxt]
+    return "require_admin" in body
+
+
 def test_admin_routes_are_guarded():
     """所有「主机级」POST 路由必须挂 require_admin。
 
@@ -456,8 +473,19 @@ def test_admin_routes_are_guarded():
     from app import routes_ui as R, db
 
     src = inspect.getsource(R)
-    # 主机级前缀：客户端调度 / 配置 / 设置 / 用户管理 / 事件
-    GUARDED = ("/clients", "/config", "/settings", "/users")
+    # 主机级前缀：客户端调度 / 配置 / 设置 / 用户管理 / 设备管理
+    #
+    # 为什么 /devices 必须在这里（2026-09-21 补）：
+    #   设备管理是**主机级**能力——它对着某台电脑下发 ADB 指令（启停模拟器、
+    #   覆盖分辨率、读角色），谁拿到谁就能操作别人的机器。但当初加设备路由时
+    #   忘了把 /devices 写进这张表，于是这十几条路由处在**护栏盲区**里：
+    #   全程靠人工核对权限，一旦哪天新增一条忘了挂 require_admin，
+    #   本测试一声不吭地放行。设备路由已经全挂对了，这里只是把盲区补掉。
+    #
+    # 注意 /accounts/* **不**进这张表：账号是本用户私有资产，走 owner_id 隔离，
+    #   普通用户改自己的账号属正常操作。唯一的例外是 /accounts/{aid}/discover
+    #   （要下发到客户端去读角色，属主机级），它单独在下面 DEVICE_OPS 里钉住。
+    GUARDED = ("/clients", "/config", "/settings", "/users", "/devices")
     # 拆出每个 @router.<verb>("<path>") 到下一个装饰器之间的函数体
     chunks = _re.split(r"\n@router\.", src)
     problems = []
@@ -490,6 +518,27 @@ def test_admin_routes_are_guarded():
         pat = '@router.%s("%s"' % ("post", path)
         if pat not in src.replace("'", '"'):
             print("   · 提示：没找到 %s（路径可能改了，请同步本测试）" % path)
+
+    # 设备指令路由：一条漏挂 require_admin 就等于把「操作别人电脑」开放给所有人。
+    # 前缀扫描（GUARDED）能覆盖大部分，但 /accounts/{aid}/discover 不在任何主机级
+    # 前缀下，必须单独钉死；顺带把设备页所有写操作列成显式清单，
+    # 这样以后新增设备路由时，测试会因为「清单里没有」而提醒同步。
+    DEVICE_OPS = [
+        "/devices/scan", "/devices/add",
+        "/devices/{did}/update", "/devices/{did}/assign", "/devices/{did}/delete",
+        "/devices/emulator/start", "/devices/emulator/stop",
+        "/devices/{did}/force-size", "/devices/{did}/restore-size",
+        "/devices/{did}/discover", "/accounts/{aid}/discover",
+    ]
+    for path in DEVICE_OPS:
+        pat = '@router.post("%s"' % path
+        if pat not in src.replace("'", '"'):
+            print("   · 提示：没找到设备路由 %s（可能改了名，请同步本测试）" % path)
+            continue
+        if not _route_has_admin(src, path):
+            print("   ✗ POST %-30s 缺 require_admin（可越权操作他人设备）" % path)
+            ok = False
+
     print("   %s" % ("✓ 通过了" if ok else "✗ 失败"))
     return ok
 

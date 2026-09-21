@@ -215,10 +215,50 @@ with TestClient(app) as c:
     if st.status_code != 200:
         print("  !! 页面 500 了")
 
-    print("\n== 页面可访问性 ==")
-    for p in ("/clients", "/accounts", "/", "/jobs", "/runs", "/roles", "/settings",
-              "/events", "/config", "/users", "/password"):
-        print("  %-12s %s" % (p, c.get(p).status_code))
+    print("\n== 页面可访问性（有任一非 200 就报错） ==")
+    # /devices 是设备管理页（管理员）；它是主机级页面，漏测会等到线上才发现白屏
+    pages = ("/clients", "/accounts", "/", "/jobs", "/runs", "/roles", "/settings",
+             "/events", "/config", "/users", "/password", "/devices")
+    bad_pages = []
+    for p in pages:
+        code = c.get(p).status_code
+        print("  %-12s %s" % (p, code))
+        if code != 200:
+            bad_pages.append((p, code))
+    print("  页面全部 200:" if not bad_pages else "  !! 非 200 页面：%s" % bad_pages)
+
+    print("\n== 新增：设备管理接口与账号密码 ==")
+    dev = c.get("/api/devices")
+    print("  GET /api/devices ->", dev.status_code,
+          "| 键:", sorted(dev.json().keys()) if dev.status_code == 200 else "-")
+    # 没连设备时也应该返回合法的空结构，而不是 500（页面靠它渲染）
+    if dev.status_code == 200:
+        j = dev.json()
+        print("  结构合法:", "✓" if ("devices" in j and "clients" in j) else j)
+
+    # 账号密码：设 → 校验 → 弱口令拒绝 → 清空，全链路走一遍
+    # （只存哈希、不回显明文；弱口令必须「不生效」，不能只看状态码）
+    ok_pw = c.post("/accounts/%d/password" % aid,
+                   data={"password": "smoke_pw_123"}, follow_redirects=False)
+    print("  设密码 ->", ok_pw.status_code)
+    a = db.account_get(aid)
+    print("  库里标记 has_password:", a.get("has_password"),
+          "| 无明文泄露:", "pwd_hash" not in a)
+    print("  哈希可校验（对）:", db.account_check_password(aid, "smoke_pw_123"))
+    print("  哈希可校验（错）:", db.account_check_password(aid, "smoke_pw_124"))
+
+    # 弱口令：请求后必须仍是「原来那个密码」，不能把已设的密码冲掉
+    c.post("/accounts/%d/password" % aid,
+           data={"password": "123"}, follow_redirects=False)
+    print("  弱口令尝试后旧密码仍有效:", db.account_check_password(aid, "smoke_pw_123"),
+          "| 弱口令未生效:", not db.account_check_password(aid, "123"))
+
+    clr = c.post("/accounts/%d/password" % aid,
+                 data={"clear": "1"}, follow_redirects=False)
+    print("  清密码 ->", clr.status_code, "| has_password:",
+          db.account_get(aid).get("has_password"),
+          "| 旧密码已失效:", not db.account_check_password(aid, "smoke_pw_123"))
+
     print("\n== 在线统计 ==", db.client_online_count())
 
 shutil.rmtree(BASE, ignore_errors=True)

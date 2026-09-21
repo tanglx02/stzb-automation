@@ -373,8 +373,130 @@ def probe_result(request: Request, body: ProbeResultIn,
                  % (cli.get("name") or uid, "：%s" % msg[len(BUSY_PREFIX):].strip()
                     if msg[len(BUSY_PREFIX):].strip() else ""))
         return {"ok": True, "requeued": bool(back)}
+
+    sync = _apply_probe_result(cli, body, msg)
     db.client_probe_finish(int(cli["id"]), bool(body.ok), msg, body.data)
-    return {"ok": True, "requeued": False}
+    return {"ok": True, "requeued": False, "sync": sync}
+
+
+# ---- 指令结果的「副作用」处理 ----
+#
+# ★ 设计要点：指令结果不只是「显示一下」，有些结果必须**写回数据层**，
+#   否则用户要的东西就落不了地。最典型的是两件：
+#     · adb_scan     → 把扫到的设备登记/更新到 devices 表（后台才能管理设备）
+#     · discover_roles → 把读到的角色名写进 game_roles（角色自动发现）
+#   这两件都发生在**客户端回报结果的那一刻**，不是发指令的那一刻 ——
+#   因为发指令的时候我们还不知道结果。
+
+def _apply_probe_result(cli: Dict[str, Any], body: ProbeResultIn,
+                        msg: str) -> Dict[str, Any]:
+    """把客户端的指令结果落到数据层。返回给客户端看的摘要（失败无所谓，不阻塞回报）。
+
+    任何一步出错都只记事件、不抛异常 —— 结果已经拿到了，显示给用户是第一位的，
+    数据没同步上最多是「下次扫描再来一遍」，比整条回报 500 好得多。
+    """
+    cmd = db._loads((cli or {}).get("probe_json"), {}) or {}
+    kind = cmd.get("kind") or ""
+    data = body.data or {}
+    out: Dict[str, Any] = {"kind": kind}
+    cid = int(cli["id"])
+    try:
+        if kind == "adb_scan":
+            out.update(_sync_scanned_devices(cid, data))
+        elif kind == "discover_roles":
+            out.update(_sync_discovered_roles(cid, cmd, data))
+    except Exception as e:                       # noqa: BLE001
+        db.event("warn", "probe", "指令结果落库失败（%s）：%r" % (kind, e))
+        out["error"] = str(e)[:200]
+    return out
+
+
+def _sync_scanned_devices(cid: int, data: Dict[str, Any]) -> Dict[str, Any]:
+    """把 adb_scan 的结果写进 devices 表。
+
+    规则：
+      · 扫描到但没登记过的 → **不自动建库**，只报给界面让用户点「添加」。
+        理由是「自动建」会在每次扫描后往库里塞一堆没人认领的行（比如同事插的
+        另一台手机），而设备是要指派账号的，多出来的脏行很容易被误指派。
+      · 扫描到且**已登记**的 → 刷新在线状态、屏幕尺寸、force_size 标记。
+      · 已登记但这次没扫到的 → 标离线（拔线/关机不会通知后端）。
+    """
+    devs = data.get("devices") or []
+    serials: List[str] = []
+    for d in devs:
+        s = str((d or {}).get("serial") or "").strip()
+        if not s:
+            continue
+        serials.append(s)
+        row = db.device_by_serial(s, client_id=cid)
+        if not row:
+            continue
+        db.device_update(
+            int(row["id"]),
+            online=1 if (d or {}).get("online") else 0,
+            screen_w=int((d or {}).get("screen_w") or 0) or None,
+            screen_h=int((d or {}).get("screen_h") or 0) or None,
+            native_w=int((d or {}).get("native_w") or 0) or None,
+            native_h=int((d or {}).get("native_h") or 0) or None,
+            force_size=1 if str((d or {}).get("override") or "") == "1080x1920" else 0,
+            last_seen=db.now(),
+        )
+    known = db.device_list(client_id=cid)
+    db.device_mark_offline(cid, serials)
+    known_serials = {str(r["serial"]) for r in known}
+    new = [d for d in devs
+           if str((d or {}).get("serial") or "") not in known_serials]
+    return {"scanned": len(devs), "known": len(known_serials & set(serials)),
+            "new": len(new),
+            "new_serials": [str(d.get("serial")) for d in new]}
+
+
+def _sync_discovered_roles(cid: int, cmd: Dict[str, Any],
+                           data: Dict[str, Any]) -> Dict[str, Any]:
+    """把 discover_roles 的结果写进 game_roles（★ 用户需求「角色自动保存到后端」）。
+
+    账号从哪来？按优先级：
+      ① 指令的 extra.account_id —— 后台点「发现角色」时明确针对的那个账号（最准）
+      ② 这条指令所在的设备（devices.account_id）—— 设备上指派了哪个账号就是哪个
+      ③ 客户端回报的脱敏账号，在本机已登记账号里反查
+    都没有就只回报「读到了什么」，不落库（宁可让用户明确指定，也不猜着往谁头上写）。
+    """
+    extra = cmd.get("extra") or {}
+    aid = extra.get("account_id")
+    acc = db.account_get(int(aid)) if aid else None
+    if not acc:
+        # 退到「这台客户端下哪台设备指派了账号」
+        for d in db.device_list(client_id=cid):
+            if d.get("account_id"):
+                acc = db.account_get(int(d["account_id"]))
+                if acc:
+                    break
+    if not acc:
+        masked = str(data.get("masked") or "").strip()
+        if masked:
+            for a in db.account_list(with_roles=False):
+                if str(a.get("masked") or "").strip() == masked:
+                    acc = db.account_get(int(a["id"]))
+                    break
+    names = [str(n) for n in (data.get("roles") or []) if str(n or "").strip()]
+    if not acc:
+        return {"roles": len(names),
+                "note": "没确定是哪个账号，角色名单未写库（请指定账号或先给设备指派账号）"}
+
+    mark_missing = bool(extra.get("mark_missing", True))
+    r = db.role_sync_discovered(int(acc["id"]), names, mark_missing=mark_missing)
+    # 顺便把「最近读到的角色」记到设备上，界面能看到「这台设备在玩谁」
+    if names:
+        for d in db.device_list(client_id=cid):
+            if d.get("account_id") and int(d["account_id"]) == int(acc["id"]):
+                db.device_update(int(d["id"]), last_seen=db.now())
+    db.event("info", "probe",
+             "角色自动发现（账号「%s」）：新增 %d、确认 %d、未见 %d"
+             % (acc["label"], len(r["added"]), len(r["seen"]), len(r["missing"])))
+    out = dict(r)
+    out["account_id"] = int(acc["id"])
+    out["account_label"] = acc["label"]
+    return out
 
 
 # ------------------------------------------------------------------ 配置

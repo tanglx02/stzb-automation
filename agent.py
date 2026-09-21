@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from typing import Any, Dict, List, Optional
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, ROOT)
@@ -81,9 +82,7 @@ class Logger:
 def _apply_cloud_env(cfg) -> None:
     cloud = cfg.setdefault("cloud", {})
     for env, key, cast in (("STZB_CLOUD_BASE_URL", "base_url", str),
-                           ("STZB_CLOUD_TOKEN", "token", str),
-                           ("STZB_CLOUD_ENABLED", "enabled",
-                            lambda v: str(v).strip().lower() in ("1", "true", "yes", "on"))):
+                           ("STZB_CLOUD_TOKEN", "token", str)):
         v = os.environ.get(env)
         if v not in (None, ""):
             cloud[key] = cast(v)
@@ -114,15 +113,17 @@ def main() -> int:
     log("  客户端标识 : %s" % identity.uid)
     log("  机器名     : %s" % identity.host)
 
-    if not cloud.get("enabled"):
-        log("!! config.json 里 cloud.enabled 不是 true，代理没事可做。")
-        log("   想让后台看到这台机器在线，请：")
-        log("     1. 把 cloud.enabled 改成 true")
-        log("     2. 填好 cloud.base_url（后台地址）和 cloud.token（采集端令牌）")
-        log("   后台地址与令牌在控制台的「设置」页能看到。")
-        return 1
+    # ★ 绑定判据只看 base_url + token 齐不齐，**不看 `cloud.enabled`**。
+    #   那个开关 2026-09-20 随「独立模式」一起移除了；老配置里可能还残留
+    #   `enabled`，但一律忽略（run_daily.py 里也是同一口径，此处曾经漏改，
+    #   后果是 config.json 没有（或 enabled=false）时代理直接退出、
+    #   后台永远看不到这台机器在线 —— 会在页面上表现得像"客户端掉线了"，
+    #   极难定位，所以两处必须保持同一套判据。）
     if not str(cloud.get("base_url") or "").strip() or not str(cloud.get("token") or "").strip():
         log("!! cloud.base_url 或 cloud.token 没填全，代理没事可做。")
+        log("   想让后台看到这台机器在线，请在 config_tool.bat 的「后端托管」里")
+        log("   绑定 / 更换服务器（会先验证连通再写入）。也可用环境变量临时覆盖：")
+        log("     STZB_CLOUD_BASE_URL / STZB_CLOUD_TOKEN")
         return 1
 
     try:
@@ -160,8 +161,28 @@ def main() -> int:
 
     ui_holder: dict = {"ui": None, "tried": 0.0}
 
-    def make_ui():
-        """按需连一次 ADB 并造 Ui。连不上就返回 None（代理自己不该因此挂掉）。"""
+    def make_ui(serial: str = ""):
+        """按需连一次 ADB 并造 Ui。连不上就返回 None（代理自己不该因此挂掉）。
+
+        `serial` 非空 = 后台点名要操作**这一台**设备（多设备场景的关键）：
+        此时不走缓存、不去猜候选端口，直接连它。
+        """
+        if serial:
+            try:
+                dev = Device(adb=cfg.get("device.adb") or DEFAULT_ADB,
+                             serial=serial, serial_candidates=[serial],
+                             shot_dir=SHOT_DIR)
+                if not dev.connect(retries=2, wait=1.0, serial=serial):
+                    log("  ! 连不上后台指定的设备：%s" % serial)
+                    return None
+                box.patch_device(emulator_running=True, adb_serial=dev.serial,
+                                 game_running=dev.game_running(
+                                     cfg.get("device.package") or GAME_PKG))
+                return Ui(dev, cfg, logger=log, dry_run=True)
+            except Exception as e:
+                log("  ! 按 serial 建 Ui 失败：%r" % (e,))
+                return None
+
         now = time.time()
         if ui_holder["ui"] is not None:
             return ui_holder["ui"]
@@ -183,6 +204,144 @@ def main() -> int:
             log("  ! 创建 Ui 失败：%r" % (e,))
             return None
 
+    # ---------------------------------------------------------------- 设备类指令
+    #
+    # 这一组是 2026-09-21 用户需求「后台管理客户端设备」落地的地方。
+    # 共同点：**都不需要 ui 对象**（要么是 adb 级操作，要么是启停进程），
+    # 所以必须在 `ui = make_ui()` 之前分派 —— 否则「模拟器没开」这个
+    # 最需要被处理的场景反而会先因为「连不上 ui」而失败。
+
+    def _dev_adb() -> str:
+        return cfg.get("device.adb") or DEFAULT_ADB
+
+    def _dev_manager() -> str:
+        from stzb.emulator import DEFAULT_MANAGER
+        return cfg.get("emulator.manager") or DEFAULT_MANAGER
+
+    def _dev_vmindex() -> int:
+        try:
+            return int(cfg.get("emulator.vmindex") or 0)
+        except Exception:
+            return 0
+
+    def _handle_scan(cmd):
+        if run_in_progress(ROOT):
+            return False, (BUSY_PREFIX + "本机正在跑任务，暂不扫描设备（避免打断）"), \
+                {"deferred": True}
+        from stzb.devices import scan_devices, emulator_status
+        devices = scan_devices(_dev_adb(), deep=True, logger=log)
+        emu = emulator_status(_dev_manager(), _dev_vmindex(), logger=log)
+        # 顺带把「当前配置里写着的候选/本机 client」报回去，方便后端建关联
+        payload = {"devices": devices, "emulator": emu,
+                   "adb": _dev_adb(),
+                   "serial_candidates": list(
+                       cfg.get("device.serial_candidates") or []),
+                   "package": cfg.get("device.package") or GAME_PKG}
+        box.patch_device(emulator_running=bool(emu.get("running")),
+                         adb_serial=(devices[0]["serial"] if devices else None))
+        online = [d for d in devices if d.get("online")]
+        return True, "扫描到 %d 台设备（在线 %d：%s）" % (
+            len(devices), len(online),
+            "、".join(d["serial"] for d in online) or "无"), payload
+
+    def _handle_start_emulator(cmd):
+        from stzb.devices import start_emulator
+        if run_in_progress(ROOT):
+            return False, (BUSY_PREFIX + "本机正在跑任务，不重复启动模拟器"), \
+                {"deferred": True}
+        r = start_emulator(_dev_manager(), _dev_vmindex(),
+                           package=cfg.get("device.package") or GAME_PKG,
+                           adb=_dev_adb(),
+                           serial_candidates=cfg.get("device.serial_candidates"),
+                           timeout=float(cfg.get("emulator.startup_timeout") or 300),
+                           logger=log)
+        if r.get("ok"):
+            box.patch_device(emulator_running=True,
+                             adb_serial=r.get("serial") or None)
+            ui_holder["ui"] = None              # 新起来的实例要重新连
+            ui_holder["tried"] = 0.0
+        return bool(r.get("ok")), r.get("message") or "启动模拟器", r
+
+    def _handle_stop_emulator(cmd):
+        from stzb.devices import stop_emulator
+        if run_in_progress(ROOT):
+            return False, (BUSY_PREFIX + "本机正在跑任务，不能关模拟器"), \
+                {"deferred": True}
+        r = stop_emulator(_dev_manager(), _dev_vmindex(), logger=log)
+        if r.get("ok"):
+            box.patch_device(emulator_running=False)
+            ui_holder["ui"] = None
+        return bool(r.get("ok")), r.get("message") or "关闭模拟器", r
+
+    def _handle_force_size(cmd):
+        from stzb.devices import force_landscape
+        extra = cmd.get("extra") or {}
+        serial = (extra.get("serial") or "").strip()
+        if not serial:
+            return False, "指令没带 serial（不知道该覆盖哪台设备）", {}
+        r = force_landscape(_dev_adb(), serial, logger=log)
+        return bool(r.get("ok")), r.get("message") or "分辨率覆盖", r
+
+    def _handle_restore_size(cmd):
+        from stzb.devices import restore_size
+        extra = cmd.get("extra") or {}
+        serial = (extra.get("serial") or "").strip()
+        if not serial:
+            return False, "指令没带 serial", {}
+        r = restore_size(_dev_adb(), serial, logger=log)
+        return bool(r.get("ok")), r.get("message") or "恢复分辨率", r
+
+    def _handle_discover_roles(cmd):
+        """★ 角色自动发现：连设备 → 读游戏里的角色名 → 上报后端。
+
+        这是「第一次登录后把角色自动保存到后端」的实现，也负责
+        「游戏里找不到角色了 → 重新发现并修正后端记录」。
+
+        真正的读取逻辑在 `stzb.account.discover_roles()`：那里默认**只读**
+        （绝不点击界面），后端要它点一次「点击换区」时才会通过
+        `extra.allow_tap` 传进来 —— 开放点是明确的、由人按下按钮触发的，
+        而不是「代理自己看着办」。
+        """
+        if run_in_progress(ROOT):
+            return False, (BUSY_PREFIX + "本机正在跑任务，代理不与它抢游戏界面，"
+                                         "已放回队列等本轮结束"), {"deferred": True}
+        extra = cmd.get("extra") or {}
+        serial = (extra.get("serial") or "").strip()
+        allow_tap = bool(extra.get("allow_tap"))
+        ui = make_ui(serial) if serial else make_ui()
+        if ui is None:
+            msg = ("连不上设备（%s）" % serial) if serial else \
+                "连不上模拟器/ADB（模拟器可能没开）"
+            return False, msg, {}
+
+        from stzb.account import discover_roles
+        r = discover_roles(ui, allow_tap=allow_tap, log=log)
+
+        names = r.get("roles") or []
+        if names:
+            box.patch_current(masked=r.get("masked") or None, role=names[0])
+            src = {"role_dialog": "「选择角色」对话框",
+                   "home": "主城界面"}.get(r.get("source") or "", "界面")
+            msg = "从%s读到 %d 个角色：%s" % (src, len(names), "、".join(names))
+        else:
+            msg = r.get("note") or "没读到任何角色"
+
+        payload = {
+            "roles": names,
+            "role": r.get("current") or "",
+            "masked": r.get("masked") or "",
+            "source": r.get("source") or "",
+            "mode": r.get("mode") or "",
+            "on_login": bool(r.get("on_login")),
+            "on_home": bool(r.get("on_home")),
+            "serial": serial or ui.dev.serial,
+        }
+        try:
+            payload["screen"] = describe_screen(ui, limit=12)
+        except Exception:
+            pass
+        return bool(names), msg, payload
+
     on_assignment_called: dict = {}
 
     def on_assignment(assignment, switch_needed, reason):
@@ -202,6 +361,22 @@ def main() -> int:
 
         if args.no_probe:
             return False, "本机代理以 --no-probe 启动，不执行探测", {}
+
+        # ★ 设备类指令在**连 ui 之前**分派：它们要么是 adb 级操作、
+        #   要么是启停进程，本来就不需要 ui；而且「模拟器没开」
+        #   正是最该被 start_emulator 救回来的场景，不能先卡在连 ui 上。
+        if kind == "adb_scan":
+            return _handle_scan(cmd)
+        if kind == "start_emulator":
+            return _handle_start_emulator(cmd)
+        if kind == "stop_emulator":
+            return _handle_stop_emulator(cmd)
+        if kind == "force_size":
+            return _handle_force_size(cmd)
+        if kind == "restore_size":
+            return _handle_restore_size(cmd)
+        if kind == "discover_roles":
+            return _handle_discover_roles(cmd)
 
         ui = make_ui()
         if ui is None:

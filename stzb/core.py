@@ -365,8 +365,35 @@ class Device:
                 found.append(parts[0])
         return found
 
-    def connect(self, retries: int = 3, wait: float = 1.5) -> bool:
-        """确保设备在线。MuMu 的 adb 端口可能变（7555/16384/5555），逐个试。"""
+    def connect(self, retries: int = 3, wait: float = 1.5,
+                serial: Optional[str] = None) -> bool:
+        """确保设备在线。MuMu 的 adb 端口可能变（7555/16384/5555），逐个试。
+
+        `serial` 非空时**直接连它**（后端点名的那台设备，如 USB 实体机
+        `340436524100AJ8`）—— 这才是「多设备」的正确用法：
+        别去猜，就用后台指定的那台。连不上就如实失败，**不要退回其他设备**
+        （在别的设备上跑 = 在别人的号上花资源，比失败严重得多）。
+        """
+        want = (serial or "").strip()
+        if want:
+            for i in range(max(1, retries)):
+                online = self._online_serials()
+                if want in online:
+                    self.serial = want
+                    return True
+                # 可能是本地端口形式的模拟器，主动 connect 一下
+                if not want.startswith("emulator"):
+                    try:
+                        self.adb_global("connect", want, timeout=8)
+                    except Exception:
+                        pass
+                    online = self._online_serials()
+                    if want in online:
+                        self.serial = want
+                        return True
+                time.sleep(wait)
+            return False
+
         for i in range(retries):
             # 1) 先看有没有已经连上的候选
             online = self._online_serials()

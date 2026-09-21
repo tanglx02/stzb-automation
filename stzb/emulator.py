@@ -21,11 +21,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from typing import Callable, Dict, List, Optional, Sequence
 
 DEFAULT_MANAGER = r"C:\Program Files\Netease\MuMu\nx_main\MuMuManager.exe"
+
+# 模拟器的 serial 形态：本地端口（127.0.0.1:7555）或 emulator-5554。
+# 用途见 adb_online()：用来把「USB 实体机」挡在模拟器那条路之外。
+_EMU_SERIAL_RE = re.compile(r"^(?:127\.0\.0\.1:\d+|localhost:\d+|emulator-\d+)$", re.I)
+
+# 放宽版：**任何**「传输端点」形态（host:port / emulator-N）都算。
+# 为什么要比 _EMU_SERIAL_RE 宽：MuMu 的 adb 端口本来是 127.0.0.1:7555，但用户
+# 完全可能改了 adb 监听地址（局域网连自己的模拟器），这时 serial 会是
+# 192.168.x.x:5555 —— 它仍然是模拟器，不该被当成「陌生实体机」拒掉。
+# 判据的核心是**形状**：USB 实体机的 serial（340436524100AJ8）里永远没有冒号。
+_EMU_SHAPE_RE = re.compile(r"^(?:emulator-\d+|[A-Za-z0-9._-]+:\d+)$", re.I)
 
 # player_state 到达这个值表示 Android 启动完成
 STATE_READY = "start_finished"
@@ -115,15 +127,29 @@ class MuMu:
         return found
 
     def adb_online(self) -> Optional[str]:
-        """返回第一个已连上的候选序列号（认不出就返回任意一个在线设备）。"""
+        """返回已连上的候选序列号。
+
+        ★ 退路被收窄过（2026-09-21 实测踩坑）：原来最后会「返回任意一个在线设备」，
+          于是**插着 USB 实体机时**这个方法会返回手机的 serial（340436524100AJ8），
+          调用方（如 start_emulator / run_daily --status）就会以为「模拟器已就绪」，
+          实际模拟器根本没起来 —— 是那台手机在冒充。
+
+          所以现在的规则是：候选全不在线时，**只**接受形状像模拟器的 serial
+          （见 `_EMU_SHAPE_RE`：`emulator-N` 或 `host:port`），绝不让 USB 实体机
+          替模拟器背锅。实体机是设备管理里**另一条**路径（后台点名走 extra.serial），
+          跟「模拟器起没起来」是两件事，不能混。
+        """
         online = self.adb_serials()
         for c in self.serial_candidates:
             if c in online:
                 return c
-        return online[0] if online else None
+        for s in online:
+            if _EMU_SHAPE_RE.match(s):
+                return s
+        return None
 
     def ensure_adb(self) -> Optional[str]:
-        """主动 connect 各候选端口，返回可用序列号。"""
+        """主动 connect 各候选端口，返回可用序列号（语义同 adb_online）。"""
         s = self.adb_online()
         if s:
             return s

@@ -1064,6 +1064,139 @@ def ensure_target(ui, assignment: Dict[str, Any], *,
                         swapped=True, masked=masked, role=role)
 
 
+# ================================================================== 角色自动发现
+#
+# ★ 2026-09-21 用户需求：「模拟器或手机第一次登录游戏后，角色自动保存到后端；
+#   以后登录时游戏里找不到对应角色了就重新失败并添加到后端」。
+#
+# 游戏里能可靠读到「这个账号下有哪些角色」的地方只有一个：登录页点「点击换区」
+# 之后弹出来的**「选择角色」对话框**（见上面那段实测说明）。
+#
+# 所以这里做两档，默认是最保守的那一档：
+#
+#   · 只读档（allow_tap=False，默认）
+#       当前屏幕上有什么就读什么。若正好停在「选择角色」对话框（比如刚手动
+#       切过角色），就能一次读全；否则只能读主城那一个角色名。
+#       **绝不点击任何按钮** —— 这是刚接入一台新设备时的安全默认。
+#
+#   · 点击档（allow_tap=True）
+#       额外点一次「点击换区」把对话框调出来再读，读完**不点确定**。
+#
+# 为什么敢点「点击换区」：它只是打开一个面板/对话框，不提交任何东西。
+# 真正会「切角色」的是「点条目 + 点确定」，这两个我们都不碰 ——
+# 所以点击档也不会改变账号/角色的当前状态，是纯读取。
+#
+# ⚠ 一区服多角色时对话框才会弹。单角色区服点「点击换区」只会进「选择服务器」
+#   面板，读不到角色名，这时退回「主城那一个」的兜底（够用：本来也只有一个）。
+ROLE_DISCOVER_TAP_WAIT = 2.6        # 点完「点击换区」后等界面起来的秒数
+
+
+def discover_roles(ui, *, allow_tap: bool = False,
+                   log: Optional[Callable[[str], None]] = None) -> Dict[str, Any]:
+    """读当前账号在游戏里的角色名（角色自动发现的**采集侧**实现）。
+
+    返回::
+
+        {ok, mode, source, roles:[名字...], current, masked,
+         on_login, on_home, allow_tap, note}
+
+    `mode` ∈ {readonly, tap}；`source` ∈ {role_dialog, home, ""} ——
+    前端据此告诉用户「这份名单有多可信」（对话框读到的比主城那个可信得多）。
+    """
+    say = log or ui.log
+    items, _ = ui.ocr("disc_roles")
+
+    # 游戏偶尔弹「势力调查」之类的遮挡弹窗，先关掉再读，否则读到的全是弹窗文字
+    try:
+        if guard_survey(ui, items):
+            items, _ = ui.ocr("disc_after_survey")
+    except Exception:
+        pass
+
+    masked = None
+    try:
+        masked, _ = current_account(ui)
+    except Exception as e:
+        say("  ! 读当前账号失败：%r" % (e,))
+
+    on_login = _has(items, *KW_START_GAME) or _has(items, *KW_AREA_ENTRY)
+    on_home = False
+    try:
+        on_home = bool(ui.is_home(items))
+    except Exception:
+        pass
+
+    def _read_dialog(cur_items) -> List[str]:
+        try:
+            if not is_role_dialog(ui, cur_items):
+                return []
+            return list_role_dialog(ui, cur_items)
+        except Exception as e:
+            say("  ! 读「选择角色」对话框失败：%r" % (e,))
+            return []
+
+    names = _read_dialog(items)
+    source = "role_dialog" if names else ""
+    mode = "readonly"
+
+    # 不在对话框上，但停在登录页 → 点「点击换区」把对话框调出来（仅点击档）
+    if not names and allow_tap and on_login:
+        mode = "tap"
+        say("  · 在登录页，点「点击换区」以调出「选择角色」对话框…")
+        try:
+            _open_server_panel(ui)
+            time.sleep(ROLE_DISCOVER_TAP_WAIT)
+            items2, _ = ui.ocr("disc_after_area")
+            names = _read_dialog(items2)
+            if names:
+                source = "role_dialog"
+                items = items2
+            else:
+                say("  · 「点击换区」后没看到「选择角色」对话框"
+                    "（这个区服下可能只有一个角色）")
+        except Exception as e:
+            say("  ! 调出「选择角色」对话框失败：%r" % (e,))
+
+    cur = None
+    if names:
+        # 对话框里读到了，顺手再读主城那个角色（可能确实不在列表里，比如刚建的）
+        try:
+            cur = current_role(ui, items)
+        except Exception:
+            cur = None
+    else:
+        # 兜底：当前主城界面上的那一个角色名
+        try:
+            cur = current_role(ui, items)
+        except Exception as e:
+            say("  ! 读当前角色失败：%r" % (e,))
+        if cur:
+            names = [cur]
+            source = "home"
+
+    # 归一化 + 去重（保序）：同一角色在对话框与主城里可能各出现一次
+    uniq: List[str] = []
+    seen = set()
+    for raw in names:
+        n = _clean_role_name(raw)
+        k = norm(_norm_vert(n))
+        if n and k and k not in seen:
+            seen.add(k)
+            uniq.append(n)
+
+    note = ""
+    if not uniq:
+        if not (on_login or on_home):
+            note = ("当前既不在登录页也不在主城 —— 请先把设备带到游戏登录页再试")
+        else:
+            note = ("界面是对的（%s），但没读出角色名："
+                    "登录页若是**单角色**区服，「点击换区」里没有角色列表，"
+                    "需要先手动进一次游戏再读" % ("登录页" if on_login else "主城"))
+    return {"ok": bool(uniq), "mode": mode, "source": source, "roles": uniq,
+            "current": cur, "masked": masked, "on_login": on_login,
+            "on_home": on_home, "allow_tap": bool(allow_tap), "note": note}
+
+
 # ================================================================== 探测
 
 def describe_screen(ui, limit: int = 24) -> Dict[str, Any]:

@@ -457,6 +457,58 @@ with TestClient(app) as c:
 
 
 # ------------------------------------------------------------ 老库迁移
+print("\n== 17. 角色自动发现的 missing 标记（真机撞到的回归） ==")
+# 为什么单列成一条（2026-09-21 真机实测撞到）：
+#   `db.role_sync_discovered` 在标 missing 时写了 `r.get("seen_at")`，而
+#   `existing` 字典里装的是 sqlite3.Row —— **Row 没有 .get()**，一调就抛
+#   AttributeError("'sqlite3.Row' object has no attribute 'get'")。
+#   该异常只在「账号下已有一个『以前读到过、这次没读到』的角色」时才触发，
+#   也就是**第二次以后的登录**才暴露：首次接入库里是空的，走 mark_missing
+#   那个循环时一个候选都没有，永远绿。所以它是「越用越坏」的那类 bug——
+#   单测、首跑、演示全过，角色一多起来就静默不落库（用户看到的现象正是
+#   「后台发现角色读不回来」）。
+#
+# 下面这个用例把三条判据一次钉死：
+#   ① 游戏里读到的  → seen_at 刷新 + discover_count 递增
+#   ② 曾见过、这次没读到 → 标 missing_at（**不删**）
+#   ③ 从没见过的    → 不标 missing（不然手工登记的会被大面积误报）
+try:
+    _r17 = db.role_sync_discovered(zs_aid, ["云魇丨奈子"])
+except Exception as _e:                      # noqa: BLE001
+    _r17 = {}
+    check("首次发现不应抛异常", False, repr(_e))
+check("首次发现：新角色入库", _r17.get("added") == ["云魇丨奈子"], str(_r17))
+check("首次发现：无 missing（库里本来是空的）", _r17.get("missing") == [], str(_r17))
+
+# 造一个「以前读到过」的角色（seen_at 非空）：模拟「上次登录时还在」
+db.role_create(zs_aid, "执剑丨青山")
+with db.connect() as _cn:
+    _cn.execute("UPDATE game_roles SET seen_at='2026-09-20T10:00:00' "
+                "WHERE account_id=? AND name='执剑丨青山'", (zs_aid,))
+    _cn.commit()
+# 再放一个「从没见过」的（seen_at 留空）：模拟手工登记但没登录过
+db.role_create(zs_aid, "鸡波长")
+
+try:
+    _r17b = db.role_sync_discovered(zs_aid, ["云魇丨奈子"])
+    _ok17 = True
+    _err17 = ""
+except Exception as _e:                      # noqa: BLE001
+    _ok17 = False
+    _err17 = repr(_e)
+    _r17b = {}
+
+check("再次发现不抛 AttributeError（Row.get 那个坑）", _ok17, _err17)
+if _ok17:
+    check("读到的角色 → 确认为 seen", "云魇丨奈子" in _r17b.get("seen", []), str(_r17b))
+    check("曾见过+这次没读到 → 标 missing", "执剑丨青山" in _r17b.get("missing", []),
+          str(_r17b))
+    check("从没见过 → 不标 missing", "鸡波长" not in _r17b.get("missing", []),
+          str(_r17b))
+    # 只标不删：角色行必须还在（删角色是不可逆的人工决定）
+    _names17 = {r["name"] for r in db.role_list(zs_aid)}
+    check("missing 角色只标不删", "执剑丨青山" in _names17, str(sorted(_names17)))
+
 print("\n== 16. 老库迁移：kv admin_user/admin_pwd_hash → users 表 ==")
 BASE2 = tempfile.mkdtemp(prefix="stzb_migrate_")
 os.environ["STZB_DATA_DIR"] = BASE2

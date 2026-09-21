@@ -1,0 +1,229 @@
+{% extends "base.html" %}
+{% block title %}设备管理 · {{ app_name }}{% endblock %}
+{% block body %}
+
+<h1>设备管理</h1>
+<div class="sub">
+  一台电脑（<a href="/clients">客户端</a>）上可以挂好几个「设备」：开着的安卓模拟器、
+  USB 插着的实体手机。<b>账号和角色是指派到设备上的</b> —— 因为真正在跑游戏的是设备，
+  不是那台电脑。后台的所有设备操作都不是后端直接做，而是<b>给那台客户端下发指令</b>：
+  它执行完把结果报回来，所以按钮点完的反馈是「已下发」，结果会出现在下面的设备块里。
+</div>
+
+{% if ok %}<div class="banner ok">{{ ok }}</div>{% endif %}
+{% if err %}<div class="banner err">{{ err }}</div>{% endif %}
+
+{% if running %}
+<div class="banner warn">
+  <b>现在有任务在跑：</b>{{ running.why }}。<br>
+  启停模拟器、读角色这类操作<b>会抢掉正在跑的任务的游戏界面</b>（任务那边以为还在主城，
+  实际已经被顶掉，一轮就废了），所以这几个按钮在跑任务期间会被拦住。
+  等这一轮跑完再操作即可。
+</div>
+{% else %}
+<div class="banner ok" style="background:var(--panel-2);color:var(--text-2);border-color:var(--line)">
+  <b>当前空闲</b> —— 没有任务在跑，可以放心启动模拟器、给设备做横屏覆盖、读角色。
+</div>
+{% endif %}
+
+<div class="note">
+  <b>新增设备的完整流程（按页面从上往下点一遍就行）：</b>
+  <ol style="margin:8px 0 0;padding-left:20px">
+    <li>在要挂设备的那台电脑上<b>先启动客户端</b>（<code>agent.py</code>），让它的心跳上来。</li>
+    <li>如果是实体手机：用 USB 插好，手机上<b>点「允许 USB 调试」</b>（没授权前 adb 看不到它）。</li>
+    <li>在对应电脑的块里点 <b>「扫描 ADB 设备」</b>，等结果回来。</li>
+    <li>扫到的设备会出现在<b>「扫到但还没登记」</b>列表里，点它的 <b>「添加」</b> 入库。</li>
+    <li>实体机接着点 <b>「覆盖成横屏」</b>（不覆盖就没法跑 —— 见下面的说明）。</li>
+    <li>给它 <b>指派账号 / 角色</b>，再点 <b>「发现角色」</b> 把游戏里的角色名读回后端。</li>
+  </ol>
+</div>
+
+<!-- ==================== 远程启停模拟器 ==================== -->
+<h2>模拟器（远程启停）</h2>
+<div class="note">
+  模拟器是「其中一种设备」。这里的按钮会调用那台电脑上的 MuMuManager：
+  <code>启动</code> = 起虚拟机 + 顺带把游戏拉起来 + 等到 Android 真的就绪；
+  <code>关闭</code> = 正常关机。<b>已启动过不会重复启动</b>，可以放心点。
+</div>
+
+{% for c in clients %}
+<div class="panel">
+  <div class="cli-head">
+    <span class="dot {% if c.online %}on{% else %}off{% endif %}"></span>
+    <span class="cli-name">{{ c.name or c.host or c.uid }}</span>
+    <span class="pill {% if c.online %}ok{% else %}gray{% endif %}">
+      {% if c.online %}在线{% else %}离线{% endif %}</span>
+    <span class="chip rt {% if c.realtime %}on{% else %}off{% endif %}">
+      {% if c.realtime %}实时{% else %}心跳{% endif %}</span>
+    {% if c._emu %}
+      <span class="pill {% if c._emu.running %}info{% else %}gray{% endif %}">
+        模拟器{% if c._emu.running %}运行中{% if c._emu.ready %}·就绪{% endif %}{% else %}未运行{% endif %}</span>
+    {% endif %}
+    <span class="spacer"></span>
+    <form method="post" action="/devices/scan" class="inline">
+      <input type="hidden" name="client_id" value="{{ c.id }}">
+      <button type="submit">扫描 ADB 设备</button>
+    </form>
+    <form method="post" action="/devices/emulator/start" class="inline">
+      <input type="hidden" name="client_id" value="{{ c.id }}">
+      <button class="primary" type="submit"
+              {% if running or not c.online %}disabled title="{% if running %}有任务在跑{% else %}客户端离线{% endif %}"{% endif %}>
+        启动模拟器</button>
+    </form>
+    <form method="post" action="/devices/emulator/stop" class="inline"
+          data-confirm="确定关闭这台机器上的模拟器？正在跑的任务会被中断。">
+      <input type="hidden" name="client_id" value="{{ c.id }}">
+      <button type="submit"
+              {% if running or not c.online %}disabled{% endif %}>关闭模拟器</button>
+    </form>
+  </div>
+  <div class="hint">
+    {% if c._emu %}
+      MuMuManager：{% if c._emu.available %}可用{% else %}找不到{% endif %}
+      {% if c._emu.vmindex is not none %}· 实例 vmindex={{ c._emu.vmindex }}{% endif %}
+      {% if c._emu.message %}· {{ c._emu.message }}{% endif %}
+    {% else %}
+      还没扫描过设备 —— 点右边的「扫描 ADB 设备」看看这台机器上有什么。
+    {% endif %}
+  </div>
+
+  {% if c._scan_new %}
+  <h3>扫到但还没登记（点「添加」入库）</h3>
+  <div class="table-wrap"><table class="tight">
+    <thead><tr><th>serial</th><th>类型</th><th>型号</th><th>分辨率</th><th>状态</th>
+      <th style="width:260px">添加到这台电脑下</th></tr></thead>
+    <tbody>
+    {% for d in c._scan_new %}
+    <tr>
+      <td class="mono">{{ d.serial }}</td>
+      <td>{{ d.kind_label }}</td>
+      <td>{{ d.model or '—' }} {% if d.brand %}<span class="hint">{{ d.brand }}</span>{% endif %}</td>
+      <td class="hint">
+        物理 {{ d.native_w }}×{{ d.native_h }}
+        {% if d.override %}<br>已覆盖 {{ d.override }}{% endif %}
+      </td>
+      <td>
+        {% if d.online %}<span class="pill ok">在线</span>
+        {% else %}<span class="pill gray">{{ d.state }}</span>{% endif %}
+        {% if d.usable %}<span class="pill info">可直接跑</span>
+        {% elif d.needs_landscape %}<span class="pill fail">需覆盖横屏</span>{% endif %}
+      </td>
+      <td>
+        <form method="post" action="/devices/add" class="inline-form">
+          <input type="hidden" name="client_id" value="{{ c.id }}">
+          <input type="hidden" name="serial" value="{{ d.serial }}">
+          <input type="hidden" name="kind" value="{{ d.kind }}">
+          <input type="hidden" name="screen_w" value="{{ d.screen_w }}">
+          <input type="hidden" name="screen_h" value="{{ d.screen_h }}">
+          <input type="hidden" name="native_w" value="{{ d.native_w }}">
+          <input type="hidden" name="native_h" value="{{ d.native_h }}">
+          <input type="hidden" name="override" value="{{ d.override }}">
+          <input type="text" name="name" class="mini" style="width:110px"
+                 placeholder="名字（选填）">
+          <button class="primary" type="submit">添加</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table></div>
+  {% endif %}
+
+  {% if c.probe and c.probe.kind in ('adb_scan','start_emulator','stop_emulator') %}
+    {% include "_probe_box.html" %}
+  {% endif %}
+</div>
+{% endfor %}
+
+{% if not clients %}
+<div class="panel empty">
+  还没有任何客户端上报过心跳 —— 没有客户端就没法远程操作设备（后端碰不到 ADB）。<br>
+  在要跑任务的那台机器上启动 <code>agent.py</code>，它的心跳上来后这里就会出现。
+</div>
+{% endif %}
+
+<!-- ==================== 已登记设备 ==================== -->
+<h2>已登记的设备</h2>
+
+{% if devices or orphan %}
+{% for c in clients %}
+  {% if c._devices %}
+  <h3 style="margin-top:22px">{{ c.name or c.host or c.uid }} 下的设备</h3>
+  {% set rows = c._devices %}
+  {% include "_device_rows.html" %}
+  {% endif %}
+{% endfor %}
+
+  {% if orphan %}
+  <h3 style="margin-top:22px">没有归属的设备</h3>
+  <div class="hint">这些设备原来挂在一台已经删掉的客户端记录下。它们不会再被操作，
+    想看就重新扫描添加，不要了就删掉。</div>
+  {% set rows = orphan %}
+  {% include "_device_rows.html" %}
+  {% endif %}
+{% else %}
+<div class="panel empty">
+  还没有登记任何设备。用上面的「扫描 ADB 设备」扫出来后点「添加」，
+  或者用下面这个表单手动填一个。
+</div>
+{% endif %}
+
+<details class="more" style="margin-top:16px">
+  <summary>手动添加设备（不想扫描、或设备现在没插着）</summary>
+  <form method="post" action="/devices/add">
+    <div class="grid2">
+      <label class="f">
+        <span class="name">挂在哪台客户端下</span>
+        <select name="client_id" required>
+          <option value="">（请选择）</option>
+          {% for c in clients %}
+          <option value="{{ c.id }}">{{ c.name or c.host or c.uid }}{% if not c.online %} · 离线{% endif %}</option>
+          {% endfor %}
+        </select>
+        <div class="hint">设备是「那台电脑上的东西」，所以必须挂在某台客户端下。</div>
+      </label>
+      <label class="f">
+        <span class="name">设备类型</span>
+        <select name="kind">
+          <option value="phone">实体手机（USB）</option>
+          <option value="emulator">安卓模拟器</option>
+        </select>
+        <div class="hint">类型会影响「要不要强制横屏覆盖」：实体机必须覆盖，模拟器不用。</div>
+      </label>
+    </div>
+    <div class="grid2">
+      <label class="f">
+        <span class="name">ADB serial</span>
+        <input type="text" name="serial" placeholder="例如 340436524100AJ8 或 127.0.0.1:7555" required>
+        <div class="hint">实体机是一长串字母数字；模拟器是 <code>127.0.0.1:7555</code> 这种。
+          serial 是设备的第一现场身份，别写错。</div>
+      </label>
+      <label class="f">
+        <span class="name">名字（选填）</span>
+        <input type="text" name="name" placeholder="例如：MuMu 主号机 / 备用红米">
+      </label>
+    </div>
+    <label class="f">
+      <span class="name">备注（选填）</span>
+      <input type="text" name="note" placeholder="例如：插在客厅那台的 USB3 口上">
+    </label>
+    <div class="actions"><button class="primary" type="submit">添加设备</button></div>
+  </form>
+</details>
+
+<div class="note" style="margin-top:22px">
+  <b>关于「实体机必须覆盖横屏」——这是实测结论，不是保险起见：</b>
+  <ul>
+    <li>手机原生竖屏是 <b>1080×2400</b>，进游戏横过来之后截图是 <b>2400×1080</b>。</li>
+    <li>而本项目的<b>所有点击坐标都是写死的 1920×1080</b>（模拟器就是这个尺寸）。</li>
+    <li>实测下发 <code>adb shell wm size 1080x1920</code> 覆盖后，截图变成 <b>1920×1080</b>，
+      游戏 UI 与模拟器<b>逐像素一致</b> —— 验证方式是 OCR 找到「批阅」按钮在 (1229,888)，
+      与代码常量 <code>BTN_JUNQING</code> 完全相同。</li>
+    <li>⚠ 覆盖<b>会改你手机的逻辑分辨率</b>（整个系统都会变横屏），拔线前点一下
+      <b>「恢复原生」</b>，否则手机桌面会一直是横的。重启手机也能恢复。</li>
+    <li>覆盖是「竖屏基准」写法：写 <code>1080x1920</code> 而不是 <code>1920x1080</code> ——
+      系统旋转时宽高会互换，写反了会得到一张 1920 宽的竖图。</li>
+  </ul>
+</div>
+
+{% endblock %}

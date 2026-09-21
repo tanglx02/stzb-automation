@@ -35,10 +35,13 @@
       区服/赛季那两栏只是给你自己看的备注。</li>
     <li><b>换账号 —— 免密但有限制</b>：走「用户中心 → 切换账号」会进网易统一登录页，
       能直接点的是<b>「常用」列表里已经登录过的账号</b>。
-      所以约定是：<b>每个要自动切换的账号，至少在这台机器的模拟器里手动登录过一次</b>。
-      系统不保存任何密码。</li>
+      所以约定是：<b>每个要自动切换的账号，至少在这台机器的模拟器里手动登录过一次</b>。</li>
     <li>「脱敏账号」这一栏按游戏登录页显示的样子填（如 <code>159****4508</code>），
       客户端就是拿它跟当前登录页上的文字比对，判断「账号对不对」。</li>
+    <li><b>关于「账号密码」这一栏</b>（下面每张卡片里可以设）：它<b>不参与自动登录</b> ——
+      自动切换用的是上面那条「常用账号列表」的路子。存密码的用途只有一个：
+      账号掉了、要人工重新登录时，能核对「我记的密码对不对」。所以它只存
+      <b>scrypt 哈希</b>，后端也读不回明文。<b>不填完全不影响跑任务。</b></li>
   </ul>
 </div>
 
@@ -70,12 +73,27 @@
     </div>
     <div class="grid2">
       <label class="f">
-        <span class="name">完整账号（选填，仅用于你自己对账）</span>
-        <input type="text" name="login_name" placeholder="例如：手机号或邮箱（只你自己看）">
+        <span class="name">完整账号（手机号 / 邮箱）</span>
+        <input type="text" name="login_name" placeholder="例如：手机号或邮箱">
+        <div class="hint">只你自己（和管理员）看得到，用于对账。</div>
       </label>
       <label class="f">
         <span class="name">分组（选填）</span>
         <input type="text" name="tag" placeholder="例如：一组 / 测试服">
+      </label>
+    </div>
+    <div class="grid2">
+      <label class="f">
+        <span class="name">账号密码</span>
+        <input type="password" name="password" autocomplete="new-password"
+               placeholder="第一次添加请填上，方便账号掉了核对">
+        <div class="hint">只存<b>哈希</b>，后端也读不回来 —— 它的用途是「账号掉了要人工
+          重登时核对密码对不对」，<b>不是</b>自动登录（登录走游戏的常用账号列表，免密）。</div>
+      </label>
+      <label class="f">
+        <span class="name">密码提示（选填）</span>
+        <input type="text" name="pwd_hint" placeholder="例如：尾号4508那个">
+        <div class="hint">这是<b>明文</b>的备忘，和密码本身无关，会显示在账号卡片上。</div>
       </label>
     </div>
     <label class="f">
@@ -83,6 +101,11 @@
       <input type="text" name="note" placeholder="例如：主力账号，别乱切">
     </label>
     <div class="actions"><button class="primary" type="submit">添加账号</button></div>
+    {% if is_admin %}
+    <p class="hint">加完之后：到 <a href="/devices">设备管理</a> 启动模拟器 / 添加实体手机，
+      给设备指派这个账号，再点「发现角色」—— 客户端会去游戏里把角色名读回来自动登记。
+      <b>如果现在有任务在跑，请等它跑完再操作</b>，否则会打断那一轮。</p>
+    {% endif %}
   </div>
 </form>
 
@@ -96,16 +119,22 @@
 {% endif %}
 
 {% for a in accounts %}
-<div class="panel acc {% if hl == a.id %}hl{% endif %}">
+<div class="panel acc {% if hl == a.id %}hl{% endif %}" id="a{{ a.id }}">
   <div class="acc-head">
     <span class="acc-name">{{ a.label }}</span>
     {% if a.masked %}<span class="mono">{{ a.masked }}</span>{% endif %}
     {% if a.tag %}<span class="pill gray">{{ a.tag }}</span>{% endif %}
     {% if not a.enabled %}<span class="pill skip">已停用</span>{% endif %}
+    {% if a.has_password %}<span class="pill ok" title="已设密码（只存哈希）">已设密码</span>
+      {% if a.pwd_hint %}<span class="hint">提示：{{ a.pwd_hint }}</span>{% endif %}
+    {% else %}<span class="pill gray" title="没设密码 —— 不影响跑任务，只是账号掉了没法核对">未设密码</span>{% endif %}
     <span class="hint">{{ a.roles|length }} 个角色</span>
     {% if is_admin %}
       {% if a.owner_label %}<span class="pill info">归属：{{ a.owner_label }}</span>
       {% else %}<span class="pill gray">公共（无归属）</span>{% endif %}
+    {% endif %}
+    {% if a._holders %}
+    <span class="pill info">被 {{ a._holders|length }} 台设备使用</span>
     {% endif %}
     {% if users.get(a.id) %}
     <span class="pill ok">被 {{ users[a.id]|length }} 台客户端使用</span>
@@ -129,6 +158,20 @@
           </form>
           {% if r.server or r.season %}
             <div class="hint">{{ r.server }}{% if r.season %} · {{ r.season }}{% endif %}（仅备注）</div>
+          {% endif %}
+          {# ★ 角色自动发现的痕迹。系统只标不删 —— 删角色是不可逆的人工决定，
+             而「游戏里找不到」可能只是改名了（新名字会在下次发现时自动建一条）。 #}
+          {% if r.seen_at %}
+            <div class="hint">游戏里见过 · {{ r.seen_at }}
+              {%- if r.discover_count %}（共 {{ r.discover_count }} 次）{% endif %}</div>
+          {% else %}
+            <div class="hint">还没在游戏里读到过（手工登记，或还没点过「发现角色」）</div>
+          {% endif %}
+          {% if r._stale %}
+            <div class="hint" style="color:var(--fail)">
+              最近一次发现<b>没找到它</b>（{{ r.missing_at }}）—— 可能被改名、删号或换区了。
+              下次进游戏时点「发现角色」会重新核对；若它真的没了，你可以手动删掉这一行。
+            </div>
           {% endif %}
         </td>
         <td><span class="plan-tag {% if r.plan.mode == 'paused' %}off{% endif %}">{{ r.plan_text }}</span></td>
@@ -165,6 +208,62 @@
     <span class="hint">区服 / 赛季等细节，以及这个角色跑哪些任务，都在
       <a href="/roles">角色执行</a> 页配置</span>
   </form>
+
+  {% if is_admin %}
+  {# ---- 角色自动发现：让客户端去游戏里读角色名，回报后自动写库 ---- #}
+  <form method="post" action="/accounts/{{ a.id }}/discover" class="role-add">
+    <span class="name">发现角色</span>
+    <select name="client_id" required style="min-width:180px">
+      <option value="">（选一台客户端去执行）</option>
+      {% for c in clients %}
+      <option value="{{ c.id }}">{{ c.name or c.host or c.uid }}{% if not c.online %} · 离线{% endif %}</option>
+      {% endfor %}
+    </select>
+    <label class="mini-cb">
+      <input type="checkbox" name="allow_tap" value="1">
+      允许点一次「点击换区」
+    </label>
+    <button class="primary" type="submit" {% if running %}disabled{% endif %}>去游戏里读角色</button>
+    {% if running %}
+    <span class="hint" style="color:var(--fail)">现在有任务在跑（{{ running.why }}），等它跑完再点</span>
+    {% else %}
+    <span class="hint">
+      读回来之后：<b>游戏里有、后端没有</b>的会自动建一条；<b>后端有、这次没读到</b>的会被标出
+      「最近没找到」（只标不删）。默认<b>纯只读</b>；勾上才允许点一次「点击换区」
+      （那个「选择角色」列表框只在同一区服下有多个角色时才弹）。
+    </span>
+    {% endif %}
+  </form>
+  {% endif %}
+
+  <details class="more">
+    <summary>账号密码（可选，只存哈希）</summary>
+    <div class="note" style="margin:10px 0 0">
+      这里存的是<b>凭据台账</b>，不是自动登录用的：
+      <ul>
+        <li>后端只保存 <b>scrypt 哈希</b>，<b>永远读不回明文</b> —— 设完请自己另外记好。</li>
+        <li>用途是「账号掉了要人工重新登录时，能核对密码对不对」。</li>
+        <li>日常切换账号走的是游戏的<b>「常用账号列表」</b>（免密），
+          所以<b>没设密码完全不影响跑任务</b>。</li>
+      </ul>
+    </div>
+    <form method="post" action="/accounts/{{ a.id }}/password">
+      <div class="grid2">
+        <label class="f"><span class="name">新密码</span>
+          <input type="password" name="password" autocomplete="new-password"
+                 placeholder="留空则不改"></label>
+        <label class="f"><span class="name">密码提示（明文，选填）</span>
+          <input type="text" name="pwd_hint" value="{{ a.pwd_hint or '' }}"></label>
+      </div>
+      <div class="actions">
+        <button type="submit">保存密码</button>
+        {% if a.has_password %}
+        <button class="lnk danger" type="submit" name="clear" value="1"
+                data-confirm="确定清空这个账号的密码记录？清空后无法再核对密码。">清空密码</button>
+        {% endif %}
+      </div>
+    </form>
+  </details>
 
   <details class="more">
     <summary>编辑账号信息</summary>
